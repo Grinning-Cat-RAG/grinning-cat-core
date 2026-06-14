@@ -23,6 +23,11 @@ def get_supported_env_variables():
         "CAT_HISTORY_EXPIRATION": None,  # in minutes
         "CAT_CRYPTO_KEY": "grinning_cat",
         "CAT_CRYPTO_SALT": "grinning_cat_salt",
+        # ContextPress configuration
+        "CAT_CP_MODEL": "gpt-4o-mini",
+        "CAT_CP_MAX_INPUT_TOKENS": "6000",
+        "CAT_CP_RESERVE_OUTPUT_TOKENS": "800",
+        "CAT_CP_COMPRESSION": "extractive",
     }
 
 

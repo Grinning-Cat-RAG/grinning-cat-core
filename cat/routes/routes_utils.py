@@ -235,6 +235,11 @@ def create_dict_parser(param_name: str, description: str | None = None):
 
 async def startup_app(app):
     from cat.looking_glass import BillTheLizard
+    # Initialize ContextPress service (optional, requires contpress package)
+    from cat.services.contextpress_service import ContextPressService
+
+    cp_service = ContextPressService()
+    app.state.contextpress = cp_service
 
     set_llm_cache(InMemoryCache())
     utils.pod_id()
@@ -251,6 +256,13 @@ async def shutdown_app(app):
     # shutdown Manager
     await app.state.lizard.shutdown()
     del app.state.lizard
+    # cleanup ContextPress service if present
+    try:
+        if getattr(app.state, "contextpress", None):
+            app.state.contextpress.close()
+            del app.state.contextpress
+    except Exception:
+        pass
 
     await get_async_db().aclose()
 

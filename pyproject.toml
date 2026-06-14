@@ -44,6 +44,7 @@ dependencies = [
     "scalar-fastapi",
     "scikit-learn",
     "tiktoken",
+    "contpress",
     "tomli",
     "uvicorn[standard]",
     "websockets",
