@@ -38,7 +38,14 @@ cat/plugins/*
 # plugins readme can stay
 !cat/plugins/how-to-write-a-plugin.md
 
+# per-plugin dependency lock artifacts: compiled fresh on every install
+cat/core_plugins/*/uv.lock
+cat/core_plugins/*/.requirements_hash
+cat/core_plugins/*/.install.lock
+
 # cache embedder
 local_cache/*
 
 compose*.yml*
+**/.pod_id
+**/.welcome

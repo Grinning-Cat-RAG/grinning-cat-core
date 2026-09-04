@@ -36,7 +36,8 @@ test:  ## Run tests.
 
 install: ## Update the local virtual environment with the latest requirements.
 	@uv sync --link-mode=copy --frozen --no-install-project --no-upgrade --no-cache
-	@find $(PWD)/cat/core_plugins -name requirements.txt -exec uv pip install --link-mode=copy --no-cache --no-upgrade -r {} \;
+	@python3 scripts/install_plugin_requirements.py
+	@python3 scripts/hash_plugin_requirements.py
 	@uv cache clean
 	@pip cache purge
 

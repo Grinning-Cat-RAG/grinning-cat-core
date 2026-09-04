@@ -26,11 +26,13 @@ WORKDIR /app
 
 COPY ./pyproject.toml ./uv.lock ./LICENSE ./
 COPY ./cat/core_plugins ./cat/core_plugins
+COPY ./scripts ./scripts
 
 ### INSTALL DEPENDENCIES (CORE + CORE PLUGINS) ###
 RUN pip install -U pip uv && \
     uv sync --frozen --no-install-project --no-upgrade --no-cache --no-dev --python /usr/local/bin/python3.13 && \
-    find ./cat/core_plugins -name requirements.txt | sed 's/^/-r /' | xargs uv pip install --no-cache --no-upgrade && \
+    python3 scripts/install_plugin_requirements.py && \
+    python3 scripts/hash_plugin_requirements.py && \
     rm -rf *.egg-info /root/.cache/pip /tmp/* /var/tmp/* && \
     uv cache clean && \
     find ./ -type d -name __pycache__ -exec rm -rf {} +
