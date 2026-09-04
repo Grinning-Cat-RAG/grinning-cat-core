@@ -707,7 +707,6 @@ async def test_ingest_file_survives_restart_via_resume(cheshire_cat, monkeypatch
     import time
     from unittest.mock import AsyncMock
 
-    from cat.core_plugins.ingestion_status import plugin as ingestion_plugin
     from cat.core_plugins.efficient_ingestion import resume as ingestion_resume
     from cat.core_plugins.ingestion_status.registry import get_status, status_key
     from cat.db import crud

@@ -1,8 +1,5 @@
-import pytest
-
 from cat.db import crud
 from cat.db.database import get_async_db
-from tests.utils import agent_id
 
 
 async def test_destroy_purges_ingestion_status_keys(cheshire_cat):

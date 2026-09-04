@@ -176,8 +176,6 @@ async def test_ingestion_status_is_untoggling_and_forced_active(lizard):
     assert "ingestion_status" in active_plugins
 
     # registered hooks are active
-    from cat.core_plugins.ingestion_status.plugin import rabbithole_ingestion_start
-
     hook_plugins = {h.plugin_id for h in plugin_manager.hooks.get("rabbithole_ingestion_start", [])}
     assert "ingestion_status" in hook_plugins
 

@@ -4,7 +4,7 @@ import os
 import tempfile
 import uuid
 from io import BytesIO
-from typing import Dict, List, Set
+from typing import List, Set
 
 from cat.auth.permissions import AuthUserInfo
 from cat.db.cruds import (

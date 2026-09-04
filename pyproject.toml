@@ -6,8 +6,8 @@ requires-python = ">=3.11,<3.14"
 license-files = ["LICENSE"]
 authors = [
     { name = "Matteo Cacciola" },
-    { name = "Piero Savastano" },
-    { name = "Cheshire Cat AI Contributors" },
+    { name = "Andrea Sterbini" },
+    { name = "Grinning Cat AI Contributors" },
 ]
 dependencies = [
     "aiofiles",
@@ -24,6 +24,7 @@ dependencies = [
     "httpx",
     "httpx-ws",
     "langchain",
+    "langchain-text-splitters>=1.1.2",
     "lxml",
     "loguru",
     "perflint",
@@ -86,7 +87,10 @@ load-plugins = "pylint_actions, perflint"
 packages = ["cat"]
 
 [tool.ruff]
-extend-ignore = ["E722", "F821", "E741"]
+line-length = 120
+
+[tool.ruff.lint]
+extend-ignore = ["E722", "F821", "E741", "UP006", "UP007", "UP035"]
 
 [tool.uv]
 package = true
