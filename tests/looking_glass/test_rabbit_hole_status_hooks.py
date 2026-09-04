@@ -99,11 +99,15 @@ async def test_ingestion_start_fires_before_store_file(monkeypatch):
         self.cat = cat
         self.stray = None
 
-    async def fake_file_to_docs(self, file, filename, content_type=None):
-        return "test.txt", b"file bytes", "text/plain", [Document(page_content="hello")], None, False
+    async def fake_resolve_source_bytes(self, file, filename, content_type=None):
+        return "test.txt", b"file bytes", "text/plain", False
+
+    async def fake_parse_to_docs(self, source, file_bytes, content_type):
+        return [Document(page_content="hello")], []
 
     monkeypatch.setattr(RabbitHole, "setup", fake_setup)
-    monkeypatch.setattr(RabbitHole, "_file_to_docs", fake_file_to_docs)
+    monkeypatch.setattr(RabbitHole, "_resolve_source_bytes", fake_resolve_source_bytes)
+    monkeypatch.setattr(RabbitHole, "_parse_to_docs", fake_parse_to_docs)
 
     metadata = {"author": "alice"}
     await rh.ingest_file(cat=cat, file=b"file bytes", metadata=metadata, filename="test.txt")
@@ -157,11 +161,11 @@ async def test_ingestion_error_fires_and_notify_still_runs(monkeypatch):
         self.cat = cat
         self.stray = stray
 
-    async def failing_file_to_docs(self, file, filename, content_type=None):
+    async def failing_resolve_source_bytes(self, file, filename, content_type=None):
         raise Exception("boom during parse")
 
     monkeypatch.setattr(RabbitHole, "setup", fake_setup)
-    monkeypatch.setattr(RabbitHole, "_file_to_docs", failing_file_to_docs)
+    monkeypatch.setattr(RabbitHole, "_resolve_source_bytes", failing_resolve_source_bytes)
 
     await rh.ingest_file(cat=cat, file=b"file bytes", metadata={}, filename="broken.txt")
 
@@ -186,15 +190,19 @@ async def test_ingestion_error_uses_resolved_source(monkeypatch):
         self.cat = cat
         self.stray = None
 
-    async def failing_file_to_docs(self, file, filename, content_type=None):
+    async def fake_resolve_source_bytes(self, file, filename, content_type=None):
         # source resolved, but the store step fails afterwards
-        return "http://example.com/doc", b"file bytes", "text/html", [Document(page_content="hello")], None, True
+        return "http://example.com/doc", b"file bytes", "text/html", True
+
+    async def fake_parse_to_docs(self, source, file_bytes, content_type):
+        return [Document(page_content="hello")], []
 
     async def failing_store(self, docs, source, file_hash=None, metadata=None, images=None, source_bytes=None):
         raise Exception("store failed")
 
     monkeypatch.setattr(RabbitHole, "setup", fake_setup)
-    monkeypatch.setattr(RabbitHole, "_file_to_docs", failing_file_to_docs)
+    monkeypatch.setattr(RabbitHole, "_resolve_source_bytes", fake_resolve_source_bytes)
+    monkeypatch.setattr(RabbitHole, "_parse_to_docs", fake_parse_to_docs)
     monkeypatch.setattr(RabbitHole, "store_documents", failing_store)
 
     await rh.ingest_file(cat=cat, file="http://example.com/doc", metadata={})
@@ -285,11 +293,15 @@ async def test_raising_hook_does_not_crash_pipeline(monkeypatch):
         self.cat = cat
         self.stray = None
 
-    async def fake_file_to_docs(self, file, filename, content_type=None):
-        return "test.txt", b"file bytes", "text/plain", [Document(page_content="hello")], None, False
+    async def fake_resolve_source_bytes(self, file, filename, content_type=None):
+        return "test.txt", b"file bytes", "text/plain", False
+
+    async def fake_parse_to_docs(self, source, file_bytes, content_type):
+        return [Document(page_content="hello")], []
 
     monkeypatch.setattr(RabbitHole, "setup", fake_setup)
-    monkeypatch.setattr(RabbitHole, "_file_to_docs", fake_file_to_docs)
+    monkeypatch.setattr(RabbitHole, "_resolve_source_bytes", fake_resolve_source_bytes)
+    monkeypatch.setattr(RabbitHole, "_parse_to_docs", fake_parse_to_docs)
 
     # must not raise even though the start hook handler raises
     await rh.ingest_file(cat=cat, file=b"file bytes", metadata={}, filename="test.txt")

@@ -411,9 +411,18 @@ async def reembed_sources(
         else:
             cat, scope, chat_id = await _resolve_callers(ccat, chat_id)
             if cat is None:
+                # the chat this episodic source belongs to no longer exists (or
+                # never had a persisted conversation, e.g. a chat-scoped upload
+                # with no chat message ever sent): the source is orphaned, so
+                # clean it up instead of leaving stale points untouched forever
+                # (mirrors the chat-existence check in the chunk-reuse path below).
                 log.warning(
-                    f"Stray cat with id {chat_id} not found. Skipping file {source.path}/{source.name}"
+                    f"Stray cat with id {chat_id} not found. Cleaning up {source.path}/{source.name}"
                 )
+                await ccat.vector_memory_handler.delete_tenant_points(
+                    str(collection_name), metadata={"source": source_name}
+                )
+                await _set_status(ccat, source_name, IngestionStatus.COMPLETED, chat_id=chat_id)
                 continue
 
         # ---- decide the start phase from the status doc ----

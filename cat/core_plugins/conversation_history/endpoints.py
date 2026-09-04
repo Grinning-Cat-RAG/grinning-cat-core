@@ -96,7 +96,7 @@ async def get_conversation_history(
     info: AuthorizedInfo = check_permissions(AuthResource.MEMORY, AuthPermission.READ),
 ) -> GetConversationHistoryResponse:
     """Get the specified user's conversation history from working memory"""
-    stray_cat = await info.cheshire_cat._find_stray_cat(chat_id)
+    stray_cat = info.stray_cat
     if stray_cat is None:
         raise CustomNotFoundException(f"Conversation '{chat_id}' not found")
     return GetConversationHistoryResponse(history=stray_cat.working_memory.history)

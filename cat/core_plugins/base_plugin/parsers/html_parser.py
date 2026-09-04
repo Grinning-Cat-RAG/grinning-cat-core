@@ -25,4 +25,8 @@ class BS4HTMLParser(BaseBlobParser):
         soup = BeautifulSoup(content, self._features)
         text = soup.get_text(self._get_text_separator).strip()
 
-        yield Document(page_content=text, metadata={})
+        metadata = {}
+        if soup.title and soup.title.string and soup.title.string.strip():
+            metadata["title"] = soup.title.string.strip()
+
+        yield Document(page_content=text, metadata=metadata)
