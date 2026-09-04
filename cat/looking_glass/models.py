@@ -33,6 +33,9 @@ class AgenticWorkflowTask(BaseModel):
     context: List[Document] | None = Field(default_factory=list)
     history: List[BaseMessage] | None = Field(default_factory=list)
     tools: List[StructuredTool] | None = Field(default_factory=list)
+    # Full LangChain content parts of shape {"type": "image_url", "image_url": {"url": "<data-uri>"}}
+    # (OpenAI Chat Completions vision shape) for multimodal recall, by default [].
+    images: List[Dict[str, Any]] = Field(default_factory=list)
 
     def __init__(self, **data: Any):
         super().__init__(**data)

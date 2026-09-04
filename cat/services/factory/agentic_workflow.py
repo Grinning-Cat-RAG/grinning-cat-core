@@ -1,13 +1,13 @@
 import re
 from abc import ABC, abstractmethod
 from typing import Type, List, Dict, Tuple
-from langchain_classic.agents import create_tool_calling_agent, AgentExecutor
+from langchain.agents import create_agent
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.language_models import BaseLanguageModel
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_core.prompts import (
     ChatPromptTemplate,
     HumanMessagePromptTemplate,
-    MessagesPlaceholder,
     SystemMessagePromptTemplate,
 )
 from langchain_core.runnables import RunnableConfig
@@ -49,17 +49,28 @@ class BaseAgenticWorkflowHandler(ABC):
         return cleaned.strip()
 
     @staticmethod
-    def _extract_info(action) -> Tuple[Tuple[str | None, Dict, Dict] | None, str | None]:
-        if not isinstance(action, tuple) or len(action) < 2:
-            return None, str(action)
+    def _extract_steps(messages: List) -> List[Tuple[Tuple[str | None, Dict, Dict] | None, str | None]]:
+        """Rebuild ``intermediate_steps`` from the agent message history.
 
-        # Extract the main fields from the first element of the tuple
-        tool = getattr(action[0], "tool")
-        tool_input = getattr(action[0], "tool_input", {})
-        usage_metadata = getattr(action[0], "usage_metadata", {})
+        Every AIMessage with ``tool_calls`` produces one step
+        ``((tool_name, tool_input, usage_metadata), tool_output)``; the matching
+        ToolMessage is looked up by its ``tool_call_id``.
+        """
+        tool_results = {
+            msg.tool_call_id: str(msg.content)
+            for msg in messages
+            if isinstance(msg, ToolMessage) and getattr(msg, "tool_call_id", None)
+        }
+        tooled_messages = [msg for msg in messages if isinstance(msg, AIMessage) and getattr(msg, "tool_calls", None)]
 
-        # Create a tuple with the extracted information
-        return (tool, tool_input, usage_metadata), action[1]
+        return [
+            (
+                (tc.get("name"), tc.get("args", {}), getattr(msg, "usage_metadata", {}) or {}),
+                tool_results.get(tc.get("id"))
+            )
+            for msg in tooled_messages
+            for tc in msg.tool_calls
+        ]
 
     async def run(
         self, task: AgenticWorkflowTask, llm: BaseLanguageModel, callbacks: List[BaseCallbackHandler] = None  # type: ignore[assignment]
@@ -86,6 +97,13 @@ class BaseAgenticWorkflowHandler(ABC):
             *self._task.history,  # type: ignore[misc, union-attr]
             HumanMessagePromptTemplate.from_template(template=task.user_prompt),
         ])
+
+        # Attach recalled multimodal images (full image_url content parts) as a
+        # concrete HumanMessage so both the no-tool and tool-binding paths carry them.
+        if task.images:
+            prompt = ChatPromptTemplate.from_messages(
+                prompt.messages + [HumanMessage(content=task.images)]
+            )
 
         # Intrinsic detection of tool binding support
         self._can_bind_tools = task.tools and hasattr(llm, "bind_tools")  # type: ignore[assignment]
@@ -142,29 +160,55 @@ class CoreAgenticWorkflow(BaseAgenticWorkflowHandler):
         return AgenticWorkflowOutput(output=self._clean_response(output))
 
     async def _run_tool_binding(self, prompt: ChatPromptTemplate) -> AgenticWorkflowOutput:
-        # Deepcopy the prompt to avoid modifying the original
-        prompt = ChatPromptTemplate.from_messages(
-            prompt.messages + [MessagesPlaceholder(variable_name="agent_scratchpad")]
-        )
+        task = self._task
+        variables = task.prompt_variables or {}  # type: ignore[union-attr]
 
-        # Create the agent with the proper prompt structure
-        agent = create_tool_calling_agent(llm=self._llm, tools=self._task.tools, prompt=prompt)  # type: ignore[union-attr]
-        # Create the agent executor
-        agent_executor = AgentExecutor.from_agent_and_tools(
-            agent=agent,
-            tools=self._task.tools,  # type: ignore[union-attr]
-            callbacks=self._callbacks,
-            return_intermediate_steps=True,
-            verbose=True,
-            handle_parsing_errors=True,  # Add error handling
+        # Format the system prompt with the task variables (e.g. the recalled context)
+        system_prompt = None
+        if task.system_prompt:
+            system_prompt = task.system_prompt
+            try:
+                system_prompt = task.system_prompt.format(**variables)
+            except (KeyError, AttributeError):
+                pass  # keep the raw template if it cannot be formatted
+
+        # Build the message history exactly like the legacy agent worked:
+        # history first, then the optional multimodal images, then the user prompt
+        messages = list(task.history or [])  # type: ignore[union-attr]
+
+        if task.images:
+            messages.append(HumanMessage(content=task.images))
+
+        user_prompt = task.user_prompt
+        try:
+            user_prompt = task.user_prompt.format(**variables)
+        except (KeyError, AttributeError):
+            pass  # keep the raw template if it cannot be formatted
+        messages.append(HumanMessage(content=user_prompt))
+
+        # Create the agent (langchain v1 `create_agent`, replaces the legacy
+        # `langchain_classic.create_tool_calling_agent` + `AgentExecutor`)
+        agent = create_agent(
+            model=self._llm,  # type: ignore[arg-type]
+            tools=task.tools or [],
+            system_prompt=system_prompt,
         )
         # Run the agent
-        langchain_msg = await agent_executor.ainvoke(
-            self._task.prompt_variables or {}, config=RunnableConfig(callbacks=self._callbacks)  # type: ignore[union-attr]
+        langchain_msg = await agent.ainvoke(
+            {"messages": messages}, config=RunnableConfig(callbacks=self._callbacks)
         )
 
-        cleaned_output = self._clean_response(langchain_msg.get("output", "")).strip()
-        extracted_steps = [self._extract_info(step) for step in langchain_msg.get("intermediate_steps", [])]
+        # Extract the final answer: the last AIMessage content
+        final_messages = langchain_msg.get("messages", [])
+        final_content = ""
+        for msg in reversed(final_messages):
+            if isinstance(msg, HumanMessage):
+                continue
+            final_content = getattr(msg, "content", str(msg))
+            break
+
+        cleaned_output = self._clean_response(final_content).strip()
+        extracted_steps = self._extract_steps(final_messages)
         return AgenticWorkflowOutput(output=cleaned_output, intermediate_steps=extracted_steps)
 
 

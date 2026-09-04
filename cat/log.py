@@ -176,26 +176,30 @@ class CatLogEngine:
     def welcome(self):
         from cat.utils import get_base_path, get_base_url
 
-        cat_docs_address = os.path.join(get_base_url().strip("/"), "docs")
-        if os.path.exists(".welcome"):
+        # Atomically claim the one-shot welcome banner. `O_CREAT | O_EXCL` means
+        # only the first process (e.g. the first uvicorn worker) prints the
+        # banner and creates the flag; concurrent workers hit FileExistsError
+        # and return. The check-then-write version raced under `--workers N`.
+        try:
+            fd = os.open(".welcome", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        except FileExistsError:
             return
 
-        print("\n\n")
         try:
-            with open(get_base_path() + "welcome.txt", "r") as f:
-                print(f.read())
-                time.sleep(0.01)
-        except FileNotFoundError:
-            self.warning("welcome.txt not found. Skipping welcome message.")
+            cat_docs_address = os.path.join(get_base_url().strip("/"), "docs")
+            print("\n\n")
+            try:
+                with open(get_base_path() + "welcome.txt", "r") as f:
+                    print(f.read())
+                    time.sleep(0.01)
+            except FileNotFoundError:
+                self.warning("welcome.txt not found. Skipping welcome message.")
 
-        print("\n=============== ^._.^ ===============\n")
-        print(f"Cat REST API:   {cat_docs_address}")
-        print("======================================")
-
-        with open(".welcome", "w") as f:
-            f.write("")
-
-        # self.log_examples() # You can uncomment this for testing purposes
+            print("\n=============== ^._.^ ===============\n")
+            print(f"Cat REST API:   {cat_docs_address}")
+            print("======================================")
+        finally:
+            os.close(fd)  # keep the flag file (content is irrelevant)
 
     def log_examples(self):
         """Log examples for the log engine."""

@@ -5,19 +5,21 @@ from fastapi import FastAPI
 from cat.auth.auth_utils import DEFAULT_ADMIN_USERNAME, hash_password
 from cat.auth.permissions import get_full_permissions
 from cat.db import crud
-from cat.db.cruds import settings as crud_settings, plugins as crud_plugins, users as crud_users
-from cat.db.database import DEFAULT_SYSTEM_KEY, DEFAULT_CONVERSATIONS_KEY
+from cat.db.cruds import plugins as crud_plugins
+from cat.db.cruds import settings as crud_settings
+from cat.db.cruds import users as crud_users
+from cat.db.database import DEFAULT_CONVERSATIONS_KEY, DEFAULT_SYSTEM_KEY
 from cat.db.models import Setting
 from cat.env import get_env
 from cat.log import log
 from cat.looking_glass.cheshire_cat import CheshireCat
 from cat.looking_glass.mad_hatter.mad_hatter import MadHatter
 from cat.looking_glass.mad_hatter.registry import PluginRegistry
-from cat.mixins import OrchestratorMixin, NonCopyableMixin
+from cat.mixins import NonCopyableMixin, OrchestratorMixin
 from cat.rabbit_hole import RabbitHole
 from cat.services.factory.auth_handler import CoreAuthHandler
 from cat.services.websocket_manager import WebSocketManager
-from cat.utils import singleton, safe_deepcopy, sanitize_permissions
+from cat.utils import safe_deepcopy, sanitize_permissions, singleton
 
 
 @singleton
@@ -222,7 +224,15 @@ class BillTheLizard(OrchestratorMixin, NonCopyableMixin):
         return cloned_ccat  # type: ignore[return-value]
 
     async def embed_all_in_cheshire_cats(self) -> None:
-        """Re-embeds all the stored files and procedures in all the Cheshire Cats using the current embedder."""
+        """Re-embeds all the stored files and procedures in all the Cheshire Cats using the current embedder.
+
+        Upstream-parity implementation with one fix: the upstream version runs
+        ``embed_with_limit`` inside the per-agent initialization loop, i.e. the
+        whole re-embed pass is executed once PER AGENT (N passes for N agents).
+        Here every database is initialized first (serialized), then the
+        re-embeds run exactly once under the concurrency cap.
+        """
+
         async def embed_with_limit(entry_):
             async with semaphore:
                 # re-embed all the stored files
@@ -252,15 +262,15 @@ class BillTheLizard(OrchestratorMixin, NonCopyableMixin):
                     "stored_sources": await ccat.get_stored_sources_with_metadata(),
                 })
 
-            # now, I have to re-initialize all the vector databases in a serialized way, outside threads to avoid
+            # re-initialize all the vector databases in a serialized way, outside threads to avoid
             # race conditions
             for entry in stored_files_by_ccat:
                 await entry["ccat"].vector_memory_handler.initialize(embedder_name, embedder_size)
 
-                # finally, I can re-embed all the stored files in an asynchronous way
-                # limit concurrent embeddings to avoid overwhelming resources
-                semaphore = asyncio.Semaphore(5)  # Max 5 concurrent
-                await asyncio.gather(*[embed_with_limit(entry) for entry in stored_files_by_ccat])
+            # finally, re-embed all the stored files in an asynchronous way
+            # limit concurrent embeddings to avoid overwhelming resources
+            semaphore = asyncio.Semaphore(5)  # Max 5 concurrent
+            await asyncio.gather(*[embed_with_limit(entry) for entry in stored_files_by_ccat])
 
             success = True
         except Exception as e:
@@ -298,7 +308,7 @@ class BillTheLizard(OrchestratorMixin, NonCopyableMixin):
             return plugin_id
         except Exception as e:
             log.error(f"Could not install plugin from {plugin_path}: {e}")
-            raise e
+            raise
 
     async def uninstall_plugin(self, plugin_id: str, dispatch_event: bool = True):
         try:
@@ -309,7 +319,7 @@ class BillTheLizard(OrchestratorMixin, NonCopyableMixin):
             await self.plugin_manager.uninstall_plugin(plugin_id)
         except Exception as e:
             log.error(f"Could not uninstall plugin {plugin_id}: {e}")
-            raise e
+            raise
         finally:
             if dispatch_event:
                 await self.plugin_manager.execute_hook(

@@ -1,0 +1,10 @@
+{
+    "name": "Multimodal Ingestion",
+    "description": "Owns the multimodal image lifecycle: extracts the images produced by multimodal parsers during ingestion (before chunking), embeds and saves them and stores them as image points, and attaches the recalled images to the LLM prompt on chat turns when the active embedder is multimodal and the LLM is vision-capable.",
+    "author_name": "Andrea Sterbini",
+    "plugin_url": "https://github.com/DEH-RAG/grinning-cat-core",
+    "tags": "core, default, multimodal, images, ingestion, recall, vision",
+    "thumb": "",
+    "version": "0.0.1",
+    "dependencies": []
+}

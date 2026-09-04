@@ -7,10 +7,10 @@ from typing import Dict, List, Any, Type
 from fastapi import Query, BackgroundTasks
 from langchain_core.caches import InMemoryCache
 from langchain_core.globals import set_llm_cache
-from pydantic import BaseModel, model_serializer
+from pydantic import BaseModel
 
 from cat import utils
-from cat.auth.permissions import AuthPermission
+from cat.auth.permissions import AuthPermission, AuthResource
 from cat.db.database import get_async_db
 from cat.env import get_env_float
 from cat.exceptions import CustomValidationException, CustomUnauthorizedException
@@ -19,7 +19,7 @@ from cat.looking_glass.mad_hatter.plugin import Plugin
 from cat.looking_glass.mad_hatter.registry import PluginRegistry
 from cat.looking_glass.models import PluginManifest
 from cat.services.redis_search import RedisSearchService
-from cat.utils import safe_deepcopy
+from cat.utils import SUFFIX_TO_CRYPT, safe_deepcopy
 
 
 class Plugins(BaseModel):
@@ -62,30 +62,9 @@ class UpsertSettingResponse(BaseModel):
     name: str
     value: Dict
 
-    @model_serializer
-    def serialize_model(self) -> Dict[str, Any]:
-        """Custom serializer that will be used by FastAPI"""
-        value = self.value.copy()  # Create a copy to avoid modifying the original value
-        value = {
-            k: "********" if isinstance(v, str) and any(suffix in k for suffix in ["_key", "_secret"]) else v
-            for k, v in value.items()
-        }
-
-        return {
-            "name": self.name,
-            "value": value
-        }
-
 
 class GetSettingResponse(UpsertSettingResponse):
     scheme: Dict[str, Any] | None = None
-
-    @model_serializer
-    def serialize_model(self) -> Dict[str, Any]:
-        """Custom serializer that will be used by FastAPI"""
-        serialized = super().serialize_model()
-        serialized["scheme"] = self.scheme
-        return serialized
 
 
 class GetSettingsResponse(BaseModel):
@@ -95,6 +74,30 @@ class GetSettingsResponse(BaseModel):
 
 class PluginsSettingsResponse(BaseModel):
     settings: List[GetSettingResponse]
+
+
+def has_write_permission(permissions: Dict[str, List[str]] | None, resource: AuthResource) -> bool:
+    """True if the caller may WRITE the given resource (and can therefore see real secret values)."""
+    if not permissions:
+        return False
+    return str(AuthPermission.WRITE) in [str(p) for p in permissions.get(str(resource), [])]
+
+
+def mask_secret_values(value: Any, reveal: bool) -> Any:
+    """Return ``value`` as-is for settings writers; otherwise mask secret-bearing string values.
+
+    A value is masked when its key ends with a known secret suffix (``SUFFIX_TO_CRYPT``,
+    the same rule used to encrypt values at rest) and the value is a non-empty string.
+    This mirrors the upstream behaviour of hiding ``*_key``/``*_secret``/``*_password``
+    values, but only towards callers that lack WRITE permission on the settings resource,
+    so read-modify-write clients (SDK, ADMIN, RITA) keep the real values.
+    """
+    if reveal or not isinstance(value, dict):
+        return value
+    return {
+        k: "********" if isinstance(v, str) and v and any(suffix in k for suffix in SUFFIX_TO_CRYPT) else v
+        for k, v in value.items()
+    }
 
 
 class GetPluginDetailsResponse(BaseModel):
@@ -183,7 +186,7 @@ async def get_available_plugins(
     )
 
 
-async def get_plugins_settings(plugin_manager: MadHatter, agent_id: str) -> PluginsSettingsResponse:
+async def get_plugins_settings(plugin_manager: MadHatter, agent_id: str, reveal: bool = True) -> PluginsSettingsResponse:
     settings = []
 
     # plugins are managed by the MadHatter class (and its inherits)
@@ -194,7 +197,11 @@ async def get_plugins_settings(plugin_manager: MadHatter, agent_id: str) -> Plug
             if plugin_schema["properties"] == {}:
                 plugin_schema = {}
             settings.append(
-                GetSettingResponse(name=plugin.id, value=plugin_settings, scheme=plugin_schema)
+                GetSettingResponse(
+                    name=plugin.id,
+                    value=mask_secret_values(plugin_settings, reveal),
+                    scheme=plugin_schema,
+                )
             )
         except Exception as e:
             raise CustomValidationException(
@@ -205,7 +212,7 @@ async def get_plugins_settings(plugin_manager: MadHatter, agent_id: str) -> Plug
     return PluginsSettingsResponse(settings=settings)
 
 
-async def get_plugin_settings(plugin_manager: MadHatter, plugin_id: str, agent_id: str) -> GetSettingResponse:
+async def get_plugin_settings(plugin_manager: MadHatter, plugin_id: str, agent_id: str, reveal: bool = True) -> GetSettingResponse:
     """Returns the settings of a specific plugin"""
     settings = await plugin_manager.plugins[plugin_id].load_settings(agent_id)
     scheme = plugin_manager.plugins[plugin_id].settings_schema()
@@ -213,7 +220,7 @@ async def get_plugin_settings(plugin_manager: MadHatter, plugin_id: str, agent_i
     if scheme["properties"] == {}:
         scheme = {}
 
-    return GetSettingResponse(name=plugin_id, value=settings, scheme=scheme)
+    return GetSettingResponse(name=plugin_id, value=mask_secret_values(settings, reveal), scheme=scheme)
 
 
 def create_dict_parser(param_name: str, description: str | None = None):

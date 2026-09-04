@@ -4,13 +4,13 @@ import os
 import tempfile
 import uuid
 from io import BytesIO
-from typing import Dict, List
+from typing import Dict, List, Set
 
 from cat.auth.permissions import AuthUserInfo
 from cat.db.cruds import (
-    settings as crud_settings,
     conversations as crud_conversations,
     plugins as crud_plugins,
+    settings as crud_settings,
     users as crud_users,
 )
 from cat.log import log
@@ -21,7 +21,7 @@ from cat.looking_glass.stray_cat import StrayCat
 from cat.mixins import BotMixin, NonCopyableMixin
 from cat.services.factory.file_manager import BaseFileManager
 from cat.services.factory.vector_db import BaseVectorDatabaseHandler
-from cat.services.memory.models import VectorMemoryType, PointStruct
+from cat.services.memory.models import PointStruct, VectorMemoryType
 from cat.utils import guess_file_type, is_url
 
 
@@ -108,20 +108,28 @@ class CheshireCat(BotMixin, NonCopyableMixin):
         # remove the folder from storage
         self.file_manager.remove_folder(self._id)
 
-        await self.shutdown()
-
         await crud_settings.destroy_all(self._id)
         await crud_conversations.destroy_all(self._id)
         await crud_plugins.destroy_all(self._id)
         await crud_users.destroy_all(self._id)
 
-    async def get_stored_sources_with_metadata(self) -> Dict[VectorMemoryType, List[StoredSourceWithMetadata]]:
+        # notify plugins the agent has been destroyed (before shutdown tears down
+        # the plugin manager), so plugin-owned namespaces can be cleaned up —
+        # e.g. ingestion_status drops its agents:<id>:ingestion:* registry rows
+        if self.plugin_manager is not None:
+            await self.plugin_manager.execute_hook(
+                "after_cheshire_cat_destroy", self._id, caller=self,
+            )
+
+        await self.shutdown()
+
+    async def get_stored_sources_with_metadata(self) -> dict[VectorMemoryType, list[StoredSourceWithMetadata]]:
         """Get all stored files with their metadata."""
         results = {
             VectorMemoryType.DECLARATIVE: set(),
             VectorMemoryType.EPISODIC: set(),
         }
-        for collection_name in results.keys():
+        for collection_name in results:
             points, _ = await self.vector_memory_handler.get_all_tenant_points(str(collection_name), with_vectors=False)
             for point in points:
                 metadata = point.payload.get("metadata", {})  # type: ignore[union-attr]
@@ -151,6 +159,22 @@ class CheshireCat(BotMixin, NonCopyableMixin):
 
         return {k: list(v) for k, v in results.items()}
 
+    async def _run_in_ingestion_executor(self, func, *args):
+        """Run a heavy ingestion callable via the dedicated ingestion lane.
+
+        Dispatches through the ``run_in_ingestion_executor`` hook (the
+        efficient_ingestion plugin provides the dedicated pool); falls back to
+        the default executor when no plugin provides it (upstream parity).
+        """
+        task = func if not args else (lambda: func(*args))
+        result = await self.plugin_manager.execute_hook(
+            "run_in_ingestion_executor", None, task, caller=self,
+        )
+        if result is None:
+            result = await asyncio.to_thread(task)
+        return result
+
+
     async def embed_procedures(self, pt: CatProcedureType | None = None):
         # Collect all texts up-front so we can embed them in one batch call
         # instead of N individual embed_query calls.
@@ -166,9 +190,24 @@ class CheshireCat(BotMixin, NonCopyableMixin):
         # Single batched embed call — much cheaper than N × embed_query, and offloaded
         # to a thread so the event loop is not blocked by the (synchronous) embedder.
         embedder = await self.embedder()
-        vectors = await asyncio.to_thread(
+        vectors = await self._run_in_ingestion_executor(
             embedder.embed_documents, [document.page_content for document in documents]
         )
+
+        # Guard: the embedder must produce vectors whose dimension matches the one used to
+        # (re)create the vector collections (embedder.size from embed_query). A silent factory
+        # fallback to a different embedder (e.g. DumbEmbedder) emits a different dimension and
+        # Qdrant rejects it with an opaque "Vector dimension error" — failing loudly here makes
+        # the real cause obvious instead of surfacing as an unhelpful Qdrant upsert error.
+        expected_dim = embedder.size
+        wrong_dims = {len(v) for v in vectors if len(v) != expected_dim}
+        if wrong_dims:
+            raise ValueError(
+                f"Embedder `{embedder.name}` produced vectors of dimension {sorted(wrong_dims)} "
+                f"but collection `{VectorMemoryType.PROCEDURAL!s}` expects {expected_dim}. "
+                f"This usually means the configured embedder failed to instantiate and the factory "
+                f"silently fell back to a different one. Check the ServiceFactory logs for the real error."
+            )
 
         points = [
             PointStruct(
@@ -297,9 +336,15 @@ class CheshireCat(BotMixin, NonCopyableMixin):
         if not user:
             return None
 
-        return await StrayCat.from_cat(cat=self, user_data=AuthUserInfo(**user), stray_id=chat_id)
+        user_info = AuthUserInfo(
+            id=user["id"],
+            name=user["username"],
+            permissions=user.get("permissions"),
+            extra={k: v for k, v in user.items() if k not in AuthUserInfo.known_keys()},
+        )
+        return await StrayCat.from_cat(cat=self, user_data=user_info, stray_id=chat_id)
 
-    def has_custom_endpoint(self, path: str, methods: set[str] | List[str] | None = None):
+    def has_custom_endpoint(self, path: str, methods: Set[str] | List[str] | None = None):
         """
         Check if an endpoint with the given path and methods exists in the active plugins.
 
@@ -319,7 +364,7 @@ class CheshireCat(BotMixin, NonCopyableMixin):
         return False
 
     def plugin_exists(self, plugin_id: str):
-        return plugin_id in self.plugin_manager.plugins.keys()
+        return plugin_id in self.plugin_manager.plugins
 
     async def clone_from(self, ccat: "CheshireCat"):
         embedder = await self.embedder()

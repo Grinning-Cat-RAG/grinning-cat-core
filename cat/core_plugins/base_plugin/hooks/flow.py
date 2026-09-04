@@ -8,6 +8,19 @@ from typing import Dict, List
 from cat import hook, UserMessage, RecallSettings, BillTheLizard, CheshireCat
 from cat.core_plugins.base_plugin.registry import CheshireCatPluginRegistry
 from cat.looking_glass.callbacks import WebSocketCallbackManager
+from cat.looking_glass.models import AgenticWorkflowTask
+
+
+@hook(priority=0)
+def before_agentic_workflow(task: AgenticWorkflowTask, cat) -> AgenticWorkflowTask:
+    """Hook to enrich or modify the agentic workflow task before it runs.
+
+    Fired by ``StrayCat.__call__`` right before ``self._agentic_workflow.run``.
+    The ``multimodal_ingestion`` plugin uses it to attach the recalled
+    multimodal images (``task.images``) so a vision-capable LLM can see them.
+    No-op default: returns the task unchanged.
+    """
+    return task
 
 
 @hook(priority=0)
@@ -252,6 +265,24 @@ def after_cheshire_cat_creation(cat: CheshireCat, lizard: BillTheLizard) -> None
     Args:
         cat: The newly created CheshireCat instance.
         lizard: The BillTheLizard instance to be used in post-processing.
+    """
+    pass
+
+
+@hook(priority=0)
+def after_cheshire_cat_destroy(agent_id: str, cat) -> None:
+    """
+    Hook triggered after a CheshireCat instance has been destroyed.
+
+    Fired by ``CheshireCat.destroy()`` once every agent-scoped resource
+    (memories, file storage, settings, conversations, plugins, users) has been
+    removed, but before the cat's plugin manager is torn down, so plugins can
+    still run cleanup on their own namespaces (e.g. dropping per-agent status
+    rows owned by the plugin). No-op default.
+
+    Args:
+        agent_id: The id of the destroyed agent.
+        cat: The CheshireCat instance being destroyed (still usable for cleanup).
     """
     pass
 

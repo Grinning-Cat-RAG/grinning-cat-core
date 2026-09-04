@@ -1,7 +1,7 @@
 import pytest
 from langchain_core.language_models import BaseLanguageModel
-from langchain_community.document_loaders.parsers.pdf import PyMuPDFParser
 
+from cat.core_plugins.base_plugin.parsers import PyMuPDFParser
 from cat.db.database import DEFAULT_SYSTEM_KEY
 from cat.looking_glass import MadHatter
 from cat.services.factory.chunker import BaseChunker

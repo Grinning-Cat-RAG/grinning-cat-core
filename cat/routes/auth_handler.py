@@ -3,7 +3,7 @@ from fastapi import APIRouter, Body
 
 from cat.auth.connection import AuthorizedInfo
 from cat.auth.permissions import AuthPermission, AuthResource, check_permissions
-from cat.routes.routes_utils import GetSettingsResponse, GetSettingResponse, UpsertSettingResponse
+from cat.routes.routes_utils import GetSettingsResponse, GetSettingResponse, UpsertSettingResponse, has_write_permission
 from cat.services.service_factory import ServiceFactory
 
 
@@ -23,7 +23,7 @@ async def get_auth_handler_settings(
         setting_category="auth_handler",
         schema_name="authorizatorName",
     )
-    return await sf.get_factory_settings()
+    return await sf.get_factory_settings(reveal=has_write_permission(info.user.permissions, AuthResource.AUTH_HANDLER))
 
 
 @router.get("/settings/{auth_handler_name}", response_model=GetSettingResponse)
@@ -40,7 +40,7 @@ async def get_auth_handler_setting(
         setting_category="auth_handler",
         schema_name="authorizatorName",
     )
-    return await sf.get_factory_setting(auth_handler_name)
+    return await sf.get_factory_setting(auth_handler_name, reveal=has_write_permission(info.user.permissions, AuthResource.AUTH_HANDLER))
 
 
 @router.put("/settings/{auth_handler_name}", response_model=UpsertSettingResponse)

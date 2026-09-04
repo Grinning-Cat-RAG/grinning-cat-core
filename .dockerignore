@@ -1,6 +1,50 @@
+# --- Bytecode / build caches ---
 __pycache__
+*.pyc
+*.pyo
+*.egg-info
+.venv/
+venv/
+**/.venv
+**/venv
+**/__pycache__
+**/.ruff_cache
+**/.pytest_cache
+**/.mypy_cache
 
+# --- VCS / repo metadata — never ship into the build context ---
+.git
+.gitignore
+.gitattributes
+.github
+
+# --- Runtime-generated / transient state ---
 **/long_term_memory
 **/local_vector_memory
-**/venv
+**/.install.lock
+**/.requirements_hash
 **/dormouse
+.pod_id
+.welcome
+
+# --- Local tooling / editor / agent state ---
+.omo
+.opencode
+.vscode
+.idea
+
+# --- Secrets & env — keep out of the build context entirely ---
+.env
+.env.*
+!.env.example
+
+# --- Docs & tests not required to build the image ---
+docs
+tests
+README.md
+
+# --- Container / build tooling files ---
+Dockerfile
+Dockerfile:*
+compose.yml
+Makefile

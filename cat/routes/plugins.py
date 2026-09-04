@@ -17,6 +17,7 @@ from cat.routes.routes_utils import (
     get_available_plugins,
     get_plugins_settings,
     get_plugin_settings,
+    has_write_permission,
     InstallPluginResponse,
     GetPluginDetailsResponse,
     DeletePluginResponse,
@@ -70,7 +71,8 @@ async def get_cheshirecat_plugins_settings(
 ) -> PluginsSettingsResponse:
     """Returns the settings of all the plugins"""
     ccat = info.cheshire_cat
-    return await get_plugins_settings(ccat.plugin_manager, ccat.agent_key)  # type: ignore[union-attr]
+    reveal = has_write_permission(info.user.permissions, AuthResource.PLUGIN)
+    return await get_plugins_settings(ccat.plugin_manager, ccat.agent_key, reveal=reveal)  # type: ignore[union-attr]
 
 
 @router.get("/settings/{plugin_id}", response_model=GetSettingResponse)
@@ -85,7 +87,8 @@ async def get_cheshirecat_plugin_settings(
     if not ccat.plugin_exists(plugin_id):  # type: ignore[union-attr]
         raise CustomNotFoundException("Plugin not found")
 
-    return await get_plugin_settings(ccat.plugin_manager, plugin_id, ccat.agent_key)  # type: ignore[union-attr]
+    reveal = has_write_permission(info.user.permissions, AuthResource.PLUGIN)
+    return await get_plugin_settings(ccat.plugin_manager, plugin_id, ccat.agent_key, reveal=reveal)  # type: ignore[union-attr]
 
 
 @router.put("/settings/{plugin_id}", response_model=GetSettingResponse)
@@ -206,7 +209,8 @@ async def get_lizard_plugins_settings(
 ) -> PluginsSettingsResponse:
     """Returns the default settings of all the plugins"""
     lizard = info.lizard
-    return await get_plugins_settings(lizard.plugin_manager, lizard.agent_key)   # type: ignore[arg-type]
+    reveal = has_write_permission(info.user.permissions, AuthResource.SYSTEM)
+    return await get_plugins_settings(lizard.plugin_manager, lizard.agent_key, reveal=reveal)   # type: ignore[arg-type]
 
 
 @router.get("/system/settings/{plugin_id}", response_model=GetSettingResponse)
@@ -220,7 +224,8 @@ async def get_lizard_plugin_settings(
     if not plugin_manager.plugin_exists(plugin_id):
         raise CustomNotFoundException("Plugin not found")
 
-    return await get_plugin_settings(plugin_manager, plugin_id, lizard.agent_key)   # type: ignore[arg-type]
+    reveal = has_write_permission(info.user.permissions, AuthResource.SYSTEM)
+    return await get_plugin_settings(plugin_manager, plugin_id, lizard.agent_key, reveal=reveal)   # type: ignore[arg-type]
 
 
 @router.get("/system/details/{plugin_id}", response_model=GetPluginDetailsResponse)

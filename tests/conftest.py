@@ -1,36 +1,46 @@
-from inspect import iscoroutinefunction
-from uuid import uuid4
-import pytest
 import os
 import shutil
+import time
 import warnings
+from inspect import iscoroutinefunction
+from uuid import uuid4
+
+import pytest
 from asgi_lifespan import LifespanManager
-from httpx import AsyncClient, ASGITransport
+from httpx import ASGITransport, AsyncClient
 from pydantic import PydanticDeprecatedSince20
 from qdrant_client import AsyncQdrantClient
-import time
 
+from cat import utils
 from cat.auth import auth_utils
 from cat.auth.permissions import AuthUserInfo, get_base_permissions
 from cat.env import get_env, get_env_int
 from cat.looking_glass import StrayCat
 from cat.looking_glass.mad_hatter.plugin import Plugin
-from cat.startup import create_app
-from cat.services.memory.messages import UserMessage
 from cat.services.factory.vector_db import QdrantHandler
-import cat.utils as utils
-
+from cat.services.memory.messages import UserMessage
+from cat.startup import create_app
 from tests.utils import (
     agent_id,
     api_key,
-    jwt_secret,
     create_mock_plugin_zip,
-    mock_plugin_path,
     fake_timestamp,
+    jwt_secret,
+    mock_plugin_path,
 )
 
 pytest_plugins = ["pytest"]
 
+# ---------------------------------------------------------------------------
+# TEST-DATA SAFETY (MANDATORY — see AGENTS.md "Safety rules")
+# Force the whole test suite onto a dedicated, isolated Redis DB **before** the
+# Database singleton can ever be created. This must be an env variable, not
+# only a mock: a `Database` already bound to the real env (default
+# CAT_REDIS_DB=0 == production) would make `flushdb()` wipe real agent data.
+# Incident: get_sync_db().flushdb() hit db0 in CAT. [scope:DEH-RAG-wide]
+# ---------------------------------------------------------------------------
+TEST_REDIS_DB = "1"
+os.environ["CAT_REDIS_DB"] = TEST_REDIS_DB
 # substitute classes' methods where necessary for testing purposes
 def mock_classes(monkeypatch, memory_client):
     # Mock the entire __init__ method to set _client to memory client, and the close method to do nothing
@@ -47,7 +57,7 @@ def mock_classes(monkeypatch, memory_client):
         return {
             "host": get_env("CAT_REDIS_HOST"),
             "port": get_env_int("CAT_REDIS_PORT"),
-            "db": "1",
+            "db": TEST_REDIS_DB,
             "encoding": "utf-8",
             "decode_responses": True,
         }
@@ -94,8 +104,22 @@ async def clean_up():
             else:
                 os.remove(tbr)
 
-    # flush redis database
-    get_sync_db().flushdb()
+    # flush only the dedicated test database — NEVER the production one (db=0).
+    # A hard guard: if the client is bound to any non-test DB, refuse to flush
+    # rather than risk destroying real data (see AGENTS.md "Safety rules").
+    db = get_sync_db()
+
+    # connection_kwargs['db'] reflects the actual db the client was initialized
+    # with; falling back to env for safety. If it is not the dedicated test db,
+    # abort instead of flushing whatever it points at.
+    bound_db = db.connection_pool.connection_kwargs.get("db", os.environ.get("CAT_REDIS_DB"))
+    if str(bound_db) != TEST_REDIS_DB:
+        raise RuntimeError(
+            f"Refusing to flushdb(): bound to Redis db={bound_db!r}, expected test db={TEST_REDIS_DB!r}. "
+            "The Database singleton is probably pointing at production. Aborting to prevent data loss."
+        )
+
+    db.flushdb()
 
 
 @pytest.fixture(scope="function")

@@ -1,13 +1,22 @@
 from abc import ABC, abstractmethod
+from typing import Self
+
 from fastapi import Request, WebSocket, WebSocketException
 from fastapi.requests import HTTPConnection
-from pydantic import BaseModel, ConfigDict, model_validator, SkipValidation
-from typing_extensions import Self
+from pydantic import BaseModel, ConfigDict, SkipValidation, model_validator
 
-from cat.auth.auth_utils import extract_agent_id_from_request, extract_chat_id_from_request
+from cat.auth.auth_utils import (
+    extract_agent_id_from_request,
+    extract_chat_id_from_request,
+)
 from cat.auth.permissions import AuthPermission, AuthResource, AuthUserInfo
 from cat.db.database import DEFAULT_SYSTEM_KEY
-from cat.exceptions import CustomNotFoundException, CustomForbiddenException, CustomUnauthorizedException
+from cat.exceptions import (
+    CustomForbiddenException,
+    CustomNotFoundException,
+    CustomUnauthorizedException,
+    ManagementModeException,
+)
 from cat.looking_glass import BillTheLizard, CheshireCat, StrayCat
 
 
@@ -82,6 +91,23 @@ class ConnectionAuth(ABC):
         # if user has no permissions, raise forbidden exception
         if user and user.permissions is None:
             self._not_allowed(connection)
+
+        # management gate: let plugins decide whether this request is allowed
+        if "auth_request" in lizard.plugin_manager.hooks:
+            try:
+                auth_res = await lizard.plugin_manager.execute_hook(
+                    "auth_request", user, agent_id, connection, caller=lizard
+                )
+                if isinstance(auth_res, str) and auth_res:
+                    if connection.scope.get("type") == "websocket":
+                        raise WebSocketException(code=1008, reason=auth_res)
+                    raise CustomForbiddenException(auth_res)
+            except ManagementModeException as e:
+                # mgmt_message plugin raises a dedicated exception; translate to
+                # the protocol-specific gate error (same behaviour as the str return)
+                if connection.scope.get("type") == "websocket":
+                    raise WebSocketException(code=1008, reason=str(e)) from e
+                raise
 
         if ccat is not None and (chat_id := extract_chat_id_from_request(connection)):
             stray_cat = await StrayCat.from_cat(user_data=user, cat=ccat, stray_id=chat_id)  # type: ignore[arg-type]

@@ -54,6 +54,19 @@ class ServiceUpdater:
         """
         updater = None
         try:
+            # Let plugins validate/enrich the settings payload BEFORE it is stored
+            # (e.g. OpenRouter model validation and cost auto-population).
+            # No-op by default; see base_plugin.hooks.factory.before_llm_settings_update.
+            if self._factory.setting_category == "llm":
+                enriched = await self._factory.hook_manager.execute_hook(
+                    "before_llm_settings_update",
+                    settings,
+                    model_provider_name,
+                    caller=None,
+                )
+                if enriched is not None:
+                    settings = enriched
+
             updater = await self._update_factory_object(model_provider_name, settings)
 
             return {"name": model_provider_name, "value": updater.new_setting["value"]}  # type: ignore

@@ -3,6 +3,7 @@ from typing import List
 from apscheduler.events import EVENT_JOB_EXECUTED, EVENT_JOB_ERROR, EVENT_JOB_SUBMITTED
 from apscheduler.executors.asyncio import AsyncIOExecutor
 from apscheduler.executors.pool import ProcessPoolExecutor
+from apscheduler.jobstores.base import JobLookupError
 from apscheduler.jobstores.redis import RedisJobStore
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from pydantic import BaseModel, Field
@@ -251,6 +252,14 @@ class WhiteRabbit:
             self._set_job_status(job_id, JobStatus.REMOVED)
             log.info(f"WhiteRabbit: Removed job {job_id}")  # type: ignore[attr-defined]
             return True
+        except JobLookupError:
+            # The job is already gone (removed by another worker/replica sharing the
+            # RedisJobStore, or never existed). Nothing to do — not an error.
+            if job_id in self.jobs:
+                self.jobs.remove(job_id)
+            self._set_job_status(job_id, JobStatus.REMOVED)
+            log.debug(f"WhiteRabbit: job {job_id} already removed (skipping)")
+            return True
         except Exception as e:
             log.error(f"WhiteRabbit: error during job removal. {e}")  # type: ignore[attr-defined]
             return False
@@ -348,6 +357,9 @@ class WhiteRabbit:
             job_id = f"{job.__name__}-interval-{days}-{hours}-{minutes}-{seconds}"
 
         # Schedule the job
+        # replace_existing=True makes scheduling idempotent across workers/replicas:
+        # they all share the same RedisJobStore, so without it a second worker adding
+        # the same job id raises ConflictingIdError (and get→remove→add is not atomic).
         self.scheduler.add_job(
             job,
             "interval",
@@ -359,6 +371,7 @@ class WhiteRabbit:
             minutes=minutes,
             seconds=seconds,
             kwargs=kwargs,
+            replace_existing=True,
         )
         self.jobs.append(job_id)
 

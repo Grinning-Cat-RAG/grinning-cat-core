@@ -1,5 +1,7 @@
-from tests.utils import just_installed_plugin
+from cat.core_plugins.mgmt_message.settings import PluginSettings
+
 from tests.mocks.mock_plugin.mock_plugin_overrides import MockPluginSettings
+from tests.utils import just_installed_plugin
 
 
 # endpoint to get settings and settings schema
@@ -26,6 +28,14 @@ async def test_get_all_plugin_settings(lizard, secure_client, secure_client_head
             }
         elif setting["name"] == "white_rabbit":
             assert setting["value"] == {"embed_procedures_every_n_days": 7}
+        elif setting["name"] == "mgmt_message":
+            assert setting["value"] == {
+                "management_message": "",
+                "management_active": False,
+                "global_message": "",
+                "show_global_msg": False,
+            }
+            assert setting["scheme"] == PluginSettings.model_json_schema()
         else:
             assert setting["value"] == {}
             assert setting["scheme"] == {}

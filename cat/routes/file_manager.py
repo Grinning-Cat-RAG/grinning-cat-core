@@ -1,19 +1,20 @@
 import os
 from io import BytesIO
 from typing import Dict, List, Tuple
-from fastapi import APIRouter, Body, BackgroundTasks
+from fastapi import APIRouter, BackgroundTasks, Body
 from pydantic import BaseModel
 from starlette.responses import StreamingResponse
 
 from cat.auth.connection import AuthorizedInfo
-from cat.auth.permissions import AuthResource, AuthPermission, check_permissions
+from cat.auth.permissions import AuthPermission, AuthResource, check_permissions
 from cat.exceptions import CustomNotFoundException, CustomValidationException
 from cat.routes.routes_utils import (
-    GetSettingsResponse,
     GetSettingResponse,
+    GetSettingsResponse,
     UpsertSettingResponse,
-    sanitize_source_name,
     run_background_task,
+    sanitize_source_name,
+    has_write_permission,
 )
 from cat.services.factory.file_manager import FileResponse
 from cat.services.memory.models import VectorMemoryType
@@ -57,7 +58,7 @@ async def get_file_managers_settings(
         setting_category="file_manager",
         schema_name="fileManagerName",
     )
-    return await sf.get_factory_settings()
+    return await sf.get_factory_settings(reveal=has_write_permission(info.user.permissions, AuthResource.FILE_MANAGER))
 
 
 @router.get("/settings/{file_manager_name}", response_model=GetSettingResponse)
@@ -74,7 +75,7 @@ async def get_file_manager_settings(
         setting_category="file_manager",
         schema_name="fileManagerName",
     )
-    return await sf.get_factory_setting(file_manager_name)
+    return await sf.get_factory_setting(file_manager_name, reveal=has_write_permission(info.user.permissions, AuthResource.FILE_MANAGER))
 
 
 @router.put("/settings/{file_manager_name}", response_model=UpsertSettingResponse)
@@ -157,8 +158,29 @@ async def delete_file(
         # delete the file from the file storage
         res = info.cheshire_cat.file_manager.remove_file(os.path.join(path, sanitized_source))
 
+        # the file is gone from storage: notify the plugins BEFORE the memory
+        # points are deleted so multimodal_ingestion can cascade-remove the
+        # extracted-image files (their names live in the point metadata)
+        chat_or_agent = path.split(os.sep, 1)[1] if os.sep in path else "agent"
+        await info.cheshire_cat.plugin_manager.execute_hook(
+            "before_file_manager_file_delete",
+            sanitized_source,
+            str(chat_or_agent),
+            caller=info.cheshire_cat,
+        )
+
         # delete points
         await info.cheshire_cat.vector_memory_handler.delete_tenant_points(str(collection_id), metadata)  # type: ignore[arg-type]
+
+        # the file is gone: notify the plugins so a stale ingestion-status row
+        # cannot linger (the row is owned by the ingestion_status plugin; the
+        # core only fires the deletion hook)
+        await info.cheshire_cat.plugin_manager.execute_hook(
+            "after_file_manager_file_deleted",
+            sanitized_source,
+            str(chat_or_agent),
+            caller=info.cheshire_cat,
+        )
 
         return FileManagerDeletedFiles(deleted=res)
     except Exception as e:
@@ -184,6 +206,15 @@ async def delete_files(
         for file in files:
             metadata |= {"source": file.name}
             await info.cheshire_cat.vector_memory_handler.delete_tenant_points(str(collection_id), metadata)  # type: ignore[arg-type]
+            # drop the ingestion-status row for each removed file (plugin-owned:
+            # the core only fires the deletion hook)
+            chat_or_agent = path.split(os.sep, 1)[1] if os.sep in path else "agent"
+            await info.cheshire_cat.plugin_manager.execute_hook(
+                "after_file_manager_file_deleted",
+                file.name,
+                str(chat_or_agent),
+                caller=info.cheshire_cat,
+            )
 
         return FileManagerDeletedFiles(deleted=res)
     except Exception as e:

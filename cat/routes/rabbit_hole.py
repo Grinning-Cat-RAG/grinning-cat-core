@@ -3,8 +3,9 @@ import mimetypes
 import os
 from io import BytesIO
 from typing import Dict, List
+
 import httpx
-from fastapi import Form, APIRouter, UploadFile, BackgroundTasks
+from fastapi import APIRouter, BackgroundTasks, Form, UploadFile
 from pydantic import BaseModel, Field
 
 from cat.auth.connection import AuthorizedInfo
@@ -66,14 +67,30 @@ async def _on_upload_single_file(
                     f"MIME type {content_type} not supported. Admitted types: {' - '.join(admitted_types)}"
                 )
 
-            # upload file to long-term memory
-            await lizard.rabbit_hole.ingest_file(
-                cat=cat,
-                file=file_bytes,
-                filename=filename,
-                content_type=content_type,
-                metadata=metadata or {},
-            )
+            # upload file to long-term memory through the configured ingestion
+            # engine (a plugin may replace the flow with its own phase machine;
+            # the default engine wraps the original rabbit_hole.ingest_file)
+            from cat.services.factory.ingestion import resolve_ingestion_engine
+
+            engine = await resolve_ingestion_engine(lizard)
+            if engine is not None:
+                await engine.ingest_file(
+                    cat=cat,
+                    file=file_bytes,
+                    filename=filename,
+                    content_type=content_type,
+                    metadata=metadata or {},
+                    store_file=True,
+                )
+            else:
+                # fallback: no engine resolvable -> original upstream flow
+                await lizard.rabbit_hole.ingest_file(
+                    cat=cat,
+                    file=file_bytes,
+                    filename=filename,
+                    content_type=content_type,
+                    metadata=metadata or {},
+                )
     finally:
         if os.path.exists(path):
             os.remove(path)
@@ -179,10 +196,16 @@ async def upload_url(
 
             response.raise_for_status()
 
-            # upload file to long-term memory, in the background
+            # resolve the configured ingestion engine and upload the URL in the
+            # background through it (a plugin may replace the flow; the default
+            # engine wraps the original rabbit_hole.ingest_file)
+            from cat.services.factory.ingestion import resolve_ingestion_engine
+
+            engine = await resolve_ingestion_engine(info.lizard)
+            ingest_callable = engine.ingest_file if engine is not None else info.lizard.rabbit_hole.ingest_file
             run_background_task(
                 background_tasks,
-                info.lizard.rabbit_hole.ingest_file,
+                ingest_callable,
                 cat=info.stray_cat or info.cheshire_cat,
                 file=upload_config.url,
                 metadata=upload_config.metadata,

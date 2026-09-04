@@ -3,7 +3,7 @@ from fastapi import APIRouter, Body
 
 from cat.auth.connection import AuthorizedInfo
 from cat.auth.permissions import AuthPermission, AuthResource, check_permissions
-from cat.routes.routes_utils import GetSettingsResponse, GetSettingResponse, UpsertSettingResponse
+from cat.routes.routes_utils import GetSettingsResponse, GetSettingResponse, UpsertSettingResponse, has_write_permission
 from cat.services.service_factory import ServiceFactory
 
 
@@ -23,7 +23,7 @@ async def get_agentic_workflow_settings(
         setting_category="agentic_workflow",
         schema_name="agenticWorkflowName",
     )
-    return await sf.get_factory_settings()
+    return await sf.get_factory_settings(reveal=has_write_permission(info.user.permissions, AuthResource.AGENTIC_WORKFLOW))
 
 
 @router.get("/settings/{agentic_workflow_name}", response_model=GetSettingResponse)
@@ -40,7 +40,10 @@ async def get_agentic_workflow_setting(
         setting_category="agentic_workflow",
         schema_name="agenticWorkflowName",
     )
-    return await sf.get_factory_setting(agentic_workflow_name)
+    return await sf.get_factory_setting(
+        agentic_workflow_name,
+        reveal=has_write_permission(info.user.permissions, AuthResource.AGENTIC_WORKFLOW),
+    )
 
 
 @router.put("/settings/{agentic_workflow_name}", response_model=UpsertSettingResponse)
