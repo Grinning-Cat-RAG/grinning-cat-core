@@ -16,7 +16,17 @@ from cat.core_plugins.base_plugin.file_managers.configs import LocalFileManagerC
 
 
 @hook(priority=0)
-def factory_allowed_llms(allowed: List[LLMSettings], cat) -> List:
+def factory_allowed_ingestions(allowed, lizard):
+    """Hook to extend the list of supported ingestion (re-embed) engines.
+
+    The ``efficient_ingestion`` core plugin registers its
+    ``EfficientIngestionConfiguration`` here. No-op default.
+    """
+    return allowed
+
+
+@hook(priority=0)
+def factory_allowed_llms(allowed: List[LLMSettings], cat) -> list:
     """
     Hook to extend support of LLMs.
 
@@ -28,6 +38,32 @@ def factory_allowed_llms(allowed: List[LLMSettings], cat) -> List:
         list of allowed LLMSettings classes for the allowed language models
     """
     return allowed
+
+
+@hook(priority=0)
+def before_llm_settings_update(payload: dict, language_model_name: str, cat) -> dict:
+    """Hook to validate/enrich LLM settings before they are stored.
+
+    Called by the core right before the LLM settings payload is upserted (PUT
+    ``/llm/settings/{language_model_name}``). Plugins can use it to:
+
+    * validate the payload against provider-specific constraints (e.g. that
+      ``model`` is one of the models the provider actually serves);
+    * enrich the stored settings with provider-derived metadata (capabilities,
+      pricing) that the runtime needs (multimodal dispatch, context splitting,
+      accounting).
+
+    Args:
+        payload: the settings dict about to be stored.
+        language_model_name: the config class name being saved (e.g.
+            ``LLMOpenRouterConfig``).
+        cat: CheshireCat instance.
+
+    Returns:
+        The (possibly modified) payload that will be stored. If a plugin returns
+        ``None`` the original payload is kept.
+    """
+    return payload
 
 
 @hook(priority=0)

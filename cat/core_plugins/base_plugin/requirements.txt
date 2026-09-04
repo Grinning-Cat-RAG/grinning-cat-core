@@ -1,3 +1,0 @@
-bs4==0.0.2
-pdfminer-six==20250506
-pymupdf==1.26.5

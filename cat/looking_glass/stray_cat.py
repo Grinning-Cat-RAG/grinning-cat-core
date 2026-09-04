@@ -9,10 +9,14 @@ from cat.auth.permissions import AuthUserInfo
 from cat.log import log
 from cat.looking_glass.mad_hatter.mad_hatter import MadHatter
 from cat.looking_glass.mad_hatter.procedures import CatProcedure
-from cat.looking_glass.models import AgenticWorkflowTask, AgenticWorkflowOutput, ChatResponse
+from cat.looking_glass.models import (
+    AgenticWorkflowOutput,
+    AgenticWorkflowTask,
+    ChatResponse,
+)
 from cat.mixins import BotMixin, NonCopyableMixin
 from cat.services.memory.messages import CatMessage, UserMessage
-from cat.services.memory.models import VectorMemoryType, RecallSettings
+from cat.services.memory.models import RecallSettings, VectorMemoryType
 from cat.services.memory.working_memory import WorkingMemory
 from cat.services.notifier import NotifierService
 from cat.templates import prompts
@@ -223,7 +227,8 @@ class StrayCat(BotMixin, NonCopyableMixin):
             # (it ran concurrently with recalls + hooks); this await is typically instant.
             tools = await procedures_task
 
-            # prepare agent input
+            # prepare agent input (multimodal_ingestion plugin enriches it with
+            # the recalled images via before_agentic_workflow)
             agent_input = AgenticWorkflowTask(
                 system_prompt=system_prompt,
                 user_prompt=self.working_memory.user_message.text,  # type: ignore[arg-type]
@@ -231,6 +236,7 @@ class StrayCat(BotMixin, NonCopyableMixin):
                 history=[h.langchainfy() for h in self.working_memory.history[-config.latest_n_history:]],
                 tools=tools,
             )
+            agent_input = await plugin_manager.execute_hook("before_agentic_workflow", agent_input, caller=self)
 
             agent_output = await self._agentic_workflow.run(
                 task=agent_input,

@@ -1,4 +1,4 @@
-from typing import Dict, List
+from typing import Dict, List, Set
 from fastapi import Depends
 from pydantic import Field, BaseModel
 
@@ -103,3 +103,7 @@ class AuthUserInfo(BaseModel):
     # - custom attributes
     # - roles
     extra: Dict = Field(default_factory=dict)
+
+    @staticmethod
+    def known_keys() -> Set[str]:
+        return {"id", "username", "password", "permissions", "created_at", "updated_at"}

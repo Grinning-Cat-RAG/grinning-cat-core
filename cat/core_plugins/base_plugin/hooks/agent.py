@@ -54,3 +54,17 @@ def agent_allowed_tools(allowed_tools: List[StructuredTool], cat: StrayCat) -> L
         tools (List[StructuredTool]): List of allowed Langchain tools.
     """
     return allowed_tools
+
+
+@hook(priority=0)
+def llm_vision_capable(capable: bool, cat) -> bool:
+    """
+    Whether the configured chat LLM can accept image content (vision).
+
+    Called before attaching recalled multimodal images to the LLM prompt.
+    The initial value is True when the active embedder is multimodal; a
+    plugin may return False to force text-only behavior (e.g. when the
+    configured chat LLM is not vision-capable). Default returns ``capable``
+    unchanged.
+    """
+    return capable

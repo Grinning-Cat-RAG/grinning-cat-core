@@ -1,0 +1,16 @@
+[project]
+name = "base-plugin"
+version = "0.0.0"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    "beautifulsoup4==4.15.0",
+    "bs4==0.0.2",
+    "cffi==2.0.0",
+    "charset-normalizer==3.4.5",
+    "cryptography==46.0.5",
+    "pdfminer-six==20260107",
+    "pycparser==3.0",
+    "pymupdf==1.28.2",
+    "soupsieve==2.9.2",
+    "typing-extensions==4.15.0",
+]

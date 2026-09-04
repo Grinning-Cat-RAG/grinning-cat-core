@@ -1,4 +1,5 @@
 from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -9,11 +10,12 @@ from scalar_fastapi import get_scalar_api_reference
 from cat.db.database import get_async_db
 from cat.env import get_env
 from cat.exceptions import (
-    LoadMemoryException,
-    CustomValidationException,
-    CustomNotFoundException,
     CustomForbiddenException,
+    CustomNotFoundException,
     CustomUnauthorizedException,
+    CustomValidationException,
+    LoadMemoryException,
+    ManagementModeException,
 )
 from cat.log import log
 from cat.routes import (
@@ -21,11 +23,11 @@ from cat.routes import (
     auth,
     auth_handler,
     base,
+    chunker,
+    context_retriever,
     embedder,
     file_manager,
     llm,
-    chunker,
-    context_retriever,
     plugins,
     rabbit_hole,
     users,
@@ -34,7 +36,7 @@ from cat.routes import (
     websocket,
 )
 from cat.routes.openapi import get_openapi_configuration_function
-from cat.routes.routes_utils import startup_app, shutdown_app
+from cat.routes.routes_utils import shutdown_app, startup_app
 
 
 @asynccontextmanager
@@ -164,6 +166,12 @@ def create_app() -> FastAPI:
     @app.exception_handler(CustomForbiddenException)
     async def custom_forbidden_exception_handler(request, exc):
         log.error(exc)
+        return JSONResponse(status_code=403, content={"detail": str(exc)})
+
+
+    @app.exception_handler(ManagementModeException)
+    async def management_mode_exception_handler(request, exc):
+        log.info("System in management mode")
         return JSONResponse(status_code=403, content={"detail": str(exc)})
 
 

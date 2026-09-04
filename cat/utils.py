@@ -6,6 +6,7 @@ import inspect
 import os
 import subprocess
 import tempfile
+import time
 from enum import Enum as BaseEnum, EnumMeta
 from io import BytesIO
 from typing import Dict, List, Type, TypeVar, Any, Generic, Tuple
@@ -344,15 +345,47 @@ def default_llm_answer_prompt() -> str:
 
 
 def pod_id() -> str:
-    if not os.path.exists(".pod_id"):
-        p_id = hashlib.sha256(os.urandom(16)).hexdigest()[:8]
-        with open(".pod_id", "w") as f:
-            f.write(p_id)
-        return p_id
+    """Return the stable, unique identity of this pod (container/replica).
 
-    with open(".pod_id", "r") as f:
-        p_id = f.read().strip()
-    return p_id
+    The id is generated once and persisted to ``.pod_id`` in the current
+    working directory. Creation uses ``O_CREAT | O_EXCL`` so that concurrent
+    processes (e.g. uvicorn ``--workers N``) converge on a *single* id instead
+    of racing and producing divergent values.
+    """
+    path = ".pod_id"
+
+    def _read() -> str | None:
+        try:
+            with open(path, "r") as f:
+                value = f.read().strip()
+            return value or None
+        except FileNotFoundError:
+            return None
+
+    # Fast path: it already exists and is complete.
+    existing = _read()
+    if existing:
+        return existing
+
+    # Atomically claim creation: exactly one process wins.
+    new_id = hashlib.sha256(os.urandom(16)).hexdigest()[:8]
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    except FileExistsError:
+        # We lost the race. The winner may not have written yet: poll briefly.
+        for _ in range(100):
+            winner = _read()
+            if winner:
+                return winner
+            time.sleep(0.01)
+        # Winner left an empty file behind (e.g. crashed mid-write): recover.
+        with open(path, "w") as f:
+            f.write(new_id)
+        return new_id
+    else:
+        with os.fdopen(fd, "w") as f:
+            f.write(new_id)
+        return new_id
 
 
 def retrieve_image(content_image: str | None) -> str | None:

@@ -6,14 +6,15 @@ requires-python = ">=3.11,<3.14"
 license-files = ["LICENSE"]
 authors = [
     { name = "Matteo Cacciola" },
-    { name = "Piero Savastano" },
-    { name = "Cheshire Cat AI Contributors" },
+    { name = "Andrea Sterbini" },
+    { name = "Grinning Cat AI Contributors" },
 ]
 dependencies = [
     "aiofiles",
     "asgi-lifespan",
     "autopep8",
     "bcrypt",
+    "beautifulsoup4",
     "cryptography",
     "fastapi",
     "fastapi-healthz[redis]",
@@ -23,11 +24,12 @@ dependencies = [
     "httpx",
     "httpx-ws",
     "langchain",
-    "langchain-community",
+    "langchain-text-splitters>=1.1.2",
     "lxml",
     "loguru",
     "perflint",
     "pillow",
+    "pymupdf",
     "pydantic",
     "PyJWT",
     "pylint",
@@ -83,9 +85,6 @@ load-plugins = "pylint_actions, perflint"
 
 [tool.setuptools]
 packages = ["cat"]
-
-[tool.ruff]
-extend-ignore = ["E722", "F821", "E741"]
 
 [tool.uv]
 package = true

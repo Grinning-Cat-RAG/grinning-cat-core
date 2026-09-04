@@ -1,0 +1,169 @@
+# syntax=docker/dockerfile:1
+
+# =============================================================================
+# Grinning Cat Core — Hardened image (Docker Hardened Images variant)
+#
+# Hardening applied:
+#   1. MULTI-STAGE: compilers & dev-headers (build-essential, libmagic-dev) live
+#      ONLY in the builder stage — they never appear in the final image layers.
+#   2. Runs as an unprivileged user (uid 65532, DHI nonroot convention) — never root.
+#   3. PYTHONDONTWRITEBYTECODE=1 — no bytecode written at runtime.
+#   4. Explicit STOPSIGNAL + HEALTHCHECK.
+#   5. NLTK data moved to an explicit, owned path (/app/nltk_data).
+#   6. Writable app dir: /app owned by nonroot (runtime writes .pod_id, data/, plugins).
+#
+# NOTE on the base image: both stages use the `-dev` DHI variant. The `3.13`
+# "runtime" variant is distroless (no /bin/sh, no apt) and therefore cannot host
+# the heavy runtime system deps (libreoffice, ffmpeg, pandoc, ...) nor run the
+# apt-get used to install them. The `-dev` variant does NOT preinstall compilers
+# (gcc/make are absent by default), so confining `build-essential` to the builder
+# stage still keeps the toolchain out of the final image.
+# =============================================================================
+
+# Build-time proxy only — consumed during image construction, never baked in.
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG NO_PROXY
+
+# ---------------------------------------------------------------------------
+# Stage 1 — BUILDER
+# ---------------------------------------------------------------------------
+FROM dhi.io/python:3.13-dev AS builder
+
+ENV PYTHONUNBUFFERED=1 \
+    UV_LINK_MODE=copy \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PATH="/app/.venv/bin:$PATH" \
+    VIRTUAL_ENV=/app/.venv \
+    DEBIAN_FRONTEND=noninteractive \
+    NLTK_ALLOW_PROXIED_URLOPEN=1
+
+# uv — fast deterministic installs (copied again into the runtime stage)
+COPY --from=dhi.io/uv:0 /usr/local/bin/uv /usr/local/bin/uvx /usr/local/bin/
+
+WORKDIR /app
+
+# Build-only system dependencies (compilers + dev headers stay in this stage)
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        build-essential \
+        libmagic1 \
+        libmagic-dev \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# 1) Early, cacheable model layer: COPY the pinned requirements file ALONE, then
+#    create the venv, install ONLY spacy+nltk, and pre-download the spaCy
+#    models + NLTK data. By keeping the other manifests (pyproject.toml,
+#    uv.lock, requirements.txt, requirements-plugins.txt) OUT of this layer's
+#    inputs, a dep bump or core_plugins change does NOT invalidate it — the
+#    heavy model downloads are reused across builds, rebuilding only when
+#    requirements-models.txt itself changes.
+# `uv pip install` never prunes the venv, so the preinstall set AND the models
+# downloaded by `spacy download` survive the subsequent core/plugins layers.
+# NLTK data stays under /app/nltk_data (survives the non-root switch) and egress
+#    uses the trusted build proxy (NLTK_ALLOW_PROXIED_URLOPEN=1).
+COPY requirements-models.txt ./
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv venv --seed .venv && \
+    uv pip install --python .venv -r requirements-models.txt && \
+    spacy download it_core_news_lg && \
+    spacy download en_core_web_lg && \
+    spacy download en_core_web_sm && \
+    python -m nltk.downloader -d /app/nltk_data punkt averaged_perceptron_tagger
+
+# 2) Core layer: framework deps only. Depends solely on requirements.txt, so a
+#    plugin bump never rebuilds it and a core bump never re-downloads models.
+COPY requirements.txt ./
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install --python .venv -r requirements.txt
+
+# 3) Plugins layer: everything plugin-related (libraries + their requirements
+#    hashes). Changes most often; isolated from 1) and 2).
+COPY requirements-plugins.txt ./
+COPY ./cat/core_plugins ./cat/core_plugins
+COPY ./scripts/hash_plugin_requirements.py ./scripts/hash_plugin_requirements.py
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install --python .venv -r requirements-plugins.txt && \
+    python3 scripts/hash_plugin_requirements.py
+
+# The project manifests must be present in /app for the RUNTIME stage: the
+# app (cat.main, plugin installs, `uv run` tooling) look for pyproject.toml
+# (and uv.lock) in the working directory. Copying them AFTER the 3 install
+# layers keeps their cache isolated: a pyproject/uv.lock change (i.e. ANY deps
+# bump) invalidates ONLY this layer, never the ~600 MB model/core/plugins layers.
+COPY pyproject.toml uv.lock ./
+
+# ---------------------------------------------------------------------------
+# Stage 2 — RUNTIME (final)
+# ---------------------------------------------------------------------------
+FROM dhi.io/python:3.13-dev AS final
+
+ENV PYTHONUNBUFFERED=1 \
+    UV_NO_CACHE=1 \
+    UV_LINK_MODE=copy \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PATH="/app/.venv/bin:$PATH" \
+    VIRTUAL_ENV=/app/.venv \
+    NLTK_DATA=/app/nltk_data \
+    PORT=80 \
+    DEBIAN_FRONTEND=noninteractive \
+    NLTK_ALLOW_PROXIED_URLOPEN=1
+
+# Runtime-only system dependencies (no compilers, no dev headers).
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        curl \
+        hostname \
+        libmagic1 \
+        poppler-utils \
+        tesseract-ocr \
+        libgl1 \
+        media-types \
+        mailcap \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# Required by unstructured[all-docs] in the grinning-cat-plus plugin
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        libreoffice*nogui \
+        pandoc \
+        ffmpeg \
+        tesseract-ocr-{ita,eng} \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# uv runtime binary — needed for on-demand plugin dependency installs
+COPY --from=dhi.io/uv:0 /usr/local/bin/uv /usr/local/bin/uvx /usr/local/bin/
+
+WORKDIR /app
+
+# Application, virtualenv, spaCy models and NLTK data — owned by the runtime user
+COPY --from=builder --chown=nonroot:nonroot /app /app
+
+RUN chown nonroot:nonroot /app
+
+# Fresh source + migrations + license
+COPY --chown=nonroot:nonroot ./cat ./cat
+COPY --chown=nonroot:nonroot ./migrations ./migrations
+COPY --chown=nonroot:nonroot ./LICENSE ./
+
+# WORKDIR /app created the directory as root; the COPY --chown above only owned
+# the copied CONTENTS. The app writes top-level files in /app at runtime
+# (.pod_id, .welcome, dormouse/, creates data/), so own /app itself too.
+
+# Drop privileges for the runtime process and everything it spawns.
+# `nonroot` (uid/gid 65532) is the pre-provisioned unprivileged user shipped by
+# the DHI base images; its writable home is /home/nonroot.
+USER nonroot
+ENV HOME=/home/nonroot
+
+EXPOSE 80
+
+STOPSIGNAL SIGTERM
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=45s --retries=3 \
+    CMD ["python", "-c", "import urllib.request, sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:80/health/liveness', timeout=3).status == 200 else 1)"]
+
+CMD ["python", "-m", "cat.main"]

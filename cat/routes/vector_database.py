@@ -3,7 +3,8 @@ from fastapi import APIRouter, Body, BackgroundTasks
 
 from cat.auth.connection import AuthorizedInfo
 from cat.auth.permissions import AuthPermission, AuthResource, check_permissions
-from cat.routes.routes_utils import GetSettingsResponse, GetSettingResponse, UpsertSettingResponse, run_background_task
+from cat.db.cruds import settings as crud_settings
+from cat.routes.routes_utils import GetSettingsResponse, GetSettingResponse, UpsertSettingResponse, run_background_task, has_write_permission
 from cat.services.service_factory import ServiceFactory
 
 router = APIRouter(tags=["Vector Database"], prefix="/vector_database")
@@ -23,7 +24,7 @@ async def get_vector_databases_settings(
         setting_category="vector_database",
         schema_name="vectorDatabaseName",
     )
-    return await sf.get_factory_settings()
+    return await sf.get_factory_settings(reveal=has_write_permission(info.user.permissions, AuthResource.VECTOR_DATABASE))
 
 
 @router.get(
@@ -42,7 +43,7 @@ async def get_vector_database_settings(
         setting_category="vector_database",
         schema_name="vectorDatabaseName",
     )
-    return await sf.get_factory_setting(vector_database_name)
+    return await sf.get_factory_setting(vector_database_name, reveal=has_write_permission(info.user.permissions, AuthResource.VECTOR_DATABASE))
 
 
 @router.put(
@@ -58,6 +59,7 @@ async def upsert_vector_database_setting(
     ccat = info.cheshire_cat
 
     previous_vector_db = ccat.vector_memory_handler
+    previous_config = await crud_settings.get_setting_by_name(ccat.agent_key, vector_database_name)  # type: ignore[union-attr]
 
     sf = ServiceFactory(
         agent_key=ccat.agent_key,  # type: ignore[union-attr]
@@ -73,5 +75,13 @@ async def upsert_vector_database_setting(
     )
     if previous_vector_db != ccat.vector_memory_handler:
         run_background_task(background_tasks, ccat.transfer_vector_points_from, previous_vector_db)
+    elif previous_config is not None and previous_config["value"] != payload:
+        await ccat.plugin_manager.execute_hook(  # type: ignore[union-attr]
+            "after_vector_database_settings_update",
+            vector_database_name,
+            previous_config["value"],
+            payload,
+            caller=ccat,
+        )
 
     return UpsertSettingResponse(**result)

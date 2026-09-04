@@ -1,5 +1,5 @@
 from typing import Type
-from langchain_community.embeddings import FakeEmbeddings
+from langchain_core.embeddings import FakeEmbeddings
 from pydantic import ConfigDict
 from cat.services.factory.embedder import EmbedderSettings
 

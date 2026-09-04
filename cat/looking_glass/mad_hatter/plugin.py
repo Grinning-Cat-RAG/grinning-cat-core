@@ -1,15 +1,19 @@
 import asyncio
+import fcntl
 import glob
+import hashlib
 import importlib
 import json
 import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
-from inspect import getmembers, isabstract
+from inspect import getmembers, isabstract, isawaitable
 from pathlib import Path
 from typing import Dict, List, Tuple, Any, Type
+import tomli
 from pydantic import BaseModel, ValidationError
 
 from cat.db.cruds import plugins as crud_plugins
@@ -23,7 +27,7 @@ from cat.looking_glass.mad_hatter.decorators.plugin_decorator import CatPluginDe
 from cat.looking_glass.mad_hatter.decorators.tool import CatTool
 from cat.looking_glass.mad_hatter.procedures import CatProcedure
 from cat.looking_glass.models import PluginSettingsModel, PluginManifest
-from cat.utils import inspect_calling_agent, get_base_path, to_camel_case
+from cat.utils import inspect_calling_agent, get_base_path, get_project_path, to_camel_case
 
 
 class Plugin:
@@ -204,7 +208,14 @@ class Plugin:
 
         # is "load_settings" hook defined in the plugin?
         if "load_settings" in self.overrides:
-            return self.overrides["load_settings"].function(self._id, agent_id)
+            # the override is called plain: when it is an async function the
+            # coroutine must be awaited, otherwise it would be returned as-is
+            # (plugin settings that never resolve) — so the plugin can rely on
+            # the async official ``cat.db.crud`` API instead of sync Redis clients
+            result = self.overrides["load_settings"].function(self._id, agent_id)
+            if isawaitable(result):
+                result = await result
+            return result
 
         # by default, plugin settings are saved inside the Redis database
         settings = await crud_plugins.get_setting(agent_id, self._id) or self._get_settings_from_model()  # type: ignore[arg]
@@ -225,7 +236,12 @@ class Plugin:
     async def save_settings(self, settings: Dict, agent_id: str) -> Dict[str, Any]:
         # is "settings_save" hook defined in the plugin?
         if "save_settings" in self.overrides:
-            return self.overrides["save_settings"].function(self._id, settings, agent_id)
+            # same plain-call handling as load_settings: await only when the
+            # override is actually async
+            result = self.overrides["save_settings"].function(self._id, settings, agent_id)
+            if isawaitable(result):
+                result = await result
+            return result
 
         try:
             # overwrite settings over old ones
@@ -279,57 +295,198 @@ class Plugin:
         json_file_data["name"] = json_file_data.get("name", to_camel_case(self._id))
         return PluginManifest(**json_file_data)
 
+    @staticmethod
+    def _hash_files(paths: List[str]) -> str:
+        """SHA256 hash of the concatenated contents of the given files, in order."""
+        h = hashlib.sha256()
+        for path in paths:
+            with open(path, "rb") as f:
+                for chunk in iter(lambda: f.read(8192), b""):
+                    h.update(chunk)
+        return h.hexdigest()
+
+    @staticmethod
+    def _read_pyproject_dependencies(pyproject_file: str) -> List[str]:
+        with open(pyproject_file, "rb") as f:
+            data = tomli.load(f)
+        return data.get("project", {}).get("dependencies", [])
+
+    @staticmethod
+    def _root_lock_path() -> str:
+        return os.path.join(get_project_path(), "uv.lock")
+
+    @classmethod
+    def _root_lock_constraints(cls) -> List[str]:
+        """PEP 508 constraints pinning every package in the root project's
+        uv.lock, so a plugin's dependency resolution can never silently
+        upgrade or downgrade a system library the core app depends on."""
+        root_lock = cls._root_lock_path()
+        if not os.path.exists(root_lock):
+            return []
+        with open(root_lock, "rb") as f:
+            data = tomli.load(f)
+        return [
+            f"{pkg['name']}=={pkg['version']}"
+            for pkg in data.get("package", [])
+            if "version" in pkg
+        ]
+
+    def _requirements_source(self) -> str | None:
+        """Path to the plugin's pyproject.toml, or None if the plugin has no
+        dependencies to install. requirements.txt is not supported: plugins
+        install exclusively through pyproject.toml + uv."""
+        pyproject_file = os.path.join(self.path, "pyproject.toml")
+        if os.path.exists(pyproject_file) and self._read_pyproject_dependencies(pyproject_file):
+            return pyproject_file
+        return None
+
+    @staticmethod
+    def _should_exit_from_installing_requirements(hash_file: str, current_hash: str) -> bool:
+        """Check if the plugin's requirements have been installed."""
+        if os.path.exists(hash_file):
+            with open(hash_file, "r") as hf:
+                return hf.read().strip() == current_hash
+        return False
+
     async def _install_requirements(self):
-        req_file = os.path.join(self.path, "requirements.txt")
-        if not os.path.exists(req_file):
+        pyproject_file = self._requirements_source()
+        if pyproject_file is None:
             return
 
-        start_time = time.time()
-        log.info(f"Installing requirements for plugin {self.id}")
+        hash_inputs = [pyproject_file]
+        if os.path.exists(self._root_lock_path()):
+            hash_inputs.append(self._root_lock_path())
+        current_hash = self._hash_files(hash_inputs)
+        hash_file = os.path.join(self.path, ".requirements_hash")
 
-        has_error = False
-        install_cmd = ["uv", "pip", "install", "--no-cache", "--no-upgrade", "-r", req_file]
+        # Fast path: neither the plugin's dependencies nor the root project's
+        # locked versions have changed since last install
+        if self._should_exit_from_installing_requirements(hash_file, current_hash):
+            log.info(f"Plugin {self.id} requirements already installed")
+            return
+
+        loop = asyncio.get_running_loop()
+        lock_file = os.path.join(self.path, ".install.lock")
+
+        # Try to become the installer via a non-blocking flock.
+        # Only ONE worker succeeds — the others poll for the hash to appear.
+        lf = open(lock_file, "w")
         try:
-            proc = await asyncio.create_subprocess_exec(
-                *install_cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-            )
-            while line := await proc.stdout.readline():  # type: ignore[union-attr]
-                log.debug(line.decode().strip())
-            await proc.wait()
-            if proc.returncode != 0:
-                raise subprocess.CalledProcessError(proc.returncode or 1, install_cmd)
+            fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            lf.close()
+            # Another worker is installing → poll asynchronously
+            for _ in range(60):  # up to 6 seconds
+                await asyncio.sleep(0.1)
+                if self._should_exit_from_installing_requirements(hash_file, current_hash):
+                    return
+            # Poll timed out — fallback to blocking install
+            await loop.run_in_executor(None, self._install_requirements_sync, pyproject_file, current_hash)
+            return
 
-            duration = time.time() - start_time
-            log.info(f"Installation of requirements for {self.id} completed in {duration:.2f}s")
-        except subprocess.CalledProcessError as e:
-            log.error(f"Error while installing plugin {self.id} requirements: {e}")
-
-            log.info(f"Uninstalling requirements for: {self.id}")
-            uninstall_cmd = ["uv", "pip", "uninstall", "-r", "requirements.txt"]
-            try:
-                proc = await asyncio.create_subprocess_exec(
-                    *uninstall_cmd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.STDOUT,
-                )
-                while line := await proc.stdout.readline():  # type: ignore[union-attr]
-                    log.debug(line.decode().strip())
-                await proc.wait()
-                if proc.returncode != 0:
-                    raise subprocess.CalledProcessError(proc.returncode or 1, uninstall_cmd)
-            except Exception as e_:
-                log.error(f"Error while uninstalling plugin {self.id} requirements: {e_}")
-
-            has_error = True
+        # We hold the lock → run the install in a thread
+        try:
+            await loop.run_in_executor(None, self._install_requirements_sync, pyproject_file, current_hash, lf)
         finally:
+            fcntl.flock(lf, fcntl.LOCK_UN)
+            lf.close()
+
+    @staticmethod
+    def _run_streamed(cmd: List[str], env: Dict[str, str]) -> int:
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env
+        )
+        if proc.stdout:
+            for line in proc.stdout:
+                log.debug(line.strip())
+        proc.wait()
+        return proc.returncode
+
+    def _install_requirements_sync(
+        self, pyproject_file: str, current_hash: str, lock_fh=None
+    ):
+        """Synchronous compile-then-install with cross-process serialization
+        via fcntl.flock.
+
+        The plugin's pyproject.toml is compiled into a fresh uv.lock —
+        replacing any existing one — constrained against the root project's
+        own uv.lock, so uv refuses to resolve a dangerous upgrade or
+        downgrade of a system library. Dependencies are then installed
+        strictly from that lock into the active virtual environment.
+
+        If *lock_fh* is given the lock is already held by the caller;
+        otherwise a blocking flock is acquired.
+        """
+        hash_file = os.path.join(self.path, ".requirements_hash")
+
+        if lock_fh is None:
+            lock_file = os.path.join(self.path, ".install.lock")
+            lf = open(lock_file, "w")
+            fcntl.flock(lf, fcntl.LOCK_EX)
+            own_lock = True
+        else:
+            lf = lock_fh
+            own_lock = False
+
+        try:
+            # Double-check: another worker may have installed while we waited
+            if self._should_exit_from_installing_requirements(hash_file, current_hash):
+                return
+
+            start_time = time.time()
+            log.info(f"Compiling and installing requirements for plugin {self.id}")
+
+            with open(pyproject_file, "r") as f:
+                pyproject_text = f.read()
+            constraints = self._root_lock_constraints()
+            constraint_block = (
+                "\n[tool.uv]\nconstraint-dependencies = [\n"
+                + "".join(f'    "{c}",\n' for c in constraints)
+                + "]\n"
+            )
+
+            venv_dir = os.path.join(get_project_path(), ".venv")
+            env = {**os.environ, "VIRTUAL_ENV": venv_dir}
+
+            try:
+                with tempfile.TemporaryDirectory() as tmp_dir:
+                    with open(os.path.join(tmp_dir, "pyproject.toml"), "w") as f:
+                        f.write(pyproject_text + constraint_block)
+
+                    lock_cmd = ["uv", "lock", "--project", tmp_dir, "--no-cache"]
+                    if self._run_streamed(lock_cmd, env) != 0:
+                        raise subprocess.CalledProcessError(1, lock_cmd)
+
+                    sync_cmd = [
+                        "uv", "sync", "--project", tmp_dir,
+                        "--no-install-project", "--active", "--frozen", "--inexact",
+                        "--link-mode=copy", "--no-cache",
+                    ]
+                    if self._run_streamed(sync_cmd, env) != 0:
+                        raise subprocess.CalledProcessError(1, sync_cmd)
+
+                    # Persist the compiled lock next to the plugin's pyproject.toml,
+                    # replacing any existing one
+                    shutil.copyfile(
+                        os.path.join(tmp_dir, "uv.lock"), os.path.join(self.path, "uv.lock")
+                    )
+
+                duration = time.time() - start_time
+                log.info(f"Installation of requirements for {self.id} completed in {duration:.2f}s")
+
+                # Persist hash so future calls take the fast path
+                with open(hash_file, "w") as hf:
+                    hf.write(current_hash)
+            except subprocess.CalledProcessError as e:
+                log.error(f"Error while installing plugin {self.id} requirements: {e}")
+                raise Exception(f"Error while installing plugin {self.id} requirements")
+        finally:
+            if own_lock:
+                fcntl.flock(lf, fcntl.LOCK_UN)
+                lf.close()
             # Clean __pycache__ directories (cross-platform approach)
             for pycache in Path("/app").rglob("__pycache__"):
                 shutil.rmtree(pycache, ignore_errors=True)
-
-        if has_error:
-            raise Exception(f"Error while installing plugin {self.id} requirements")
 
     # lists of hooks and tools
     def _load_decorated_functions(self):

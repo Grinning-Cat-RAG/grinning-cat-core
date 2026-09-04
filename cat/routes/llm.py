@@ -3,7 +3,7 @@ from fastapi import APIRouter, Body
 
 from cat.auth.connection import AuthorizedInfo
 from cat.auth.permissions import AuthPermission, AuthResource, check_permissions
-from cat.routes.routes_utils import GetSettingsResponse, GetSettingResponse, UpsertSettingResponse
+from cat.routes.routes_utils import GetSettingsResponse, GetSettingResponse, UpsertSettingResponse, has_write_permission
 from cat.services.service_factory import ServiceFactory
 
 router = APIRouter(tags=["Large Language Model"], prefix="/llm")
@@ -23,7 +23,7 @@ async def get_llms_settings(
         setting_category="llm",
         schema_name="languageModelName",
     )
-    return await sf.get_factory_settings()
+    return await sf.get_factory_settings(reveal=has_write_permission(info.user.permissions, AuthResource.LLM))
 
 
 @router.get("/settings/{language_model_name}", response_model=GetSettingResponse, summary="Get LLM Settings")
@@ -40,7 +40,7 @@ async def get_llm_settings(
         setting_category="llm",
         schema_name="languageModelName",
     )
-    return await sf.get_factory_setting(language_model_name)
+    return await sf.get_factory_setting(language_model_name, reveal=has_write_permission(info.user.permissions, AuthResource.LLM))
 
 
 @router.put("/settings/{language_model_name}", response_model=UpsertSettingResponse, summary="Upsert LLM Settings")

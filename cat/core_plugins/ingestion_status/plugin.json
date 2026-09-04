@@ -1,0 +1,9 @@
+{
+    "name": "Ingestion Status",
+    "description": "Tracks per-source ingestion status in Redis (uploaded, downloading, downloaded, processing, completed, error) by observing the RabbitHole lifecycle hooks.",
+    "author_name": "Andrea Sterbini",
+    "plugin_url": "https://github.com/DEH-RAG/grinning-cat-core",
+    "tags": "core, default, cat, ingestion, status, rabbit_hole",
+    "thumb": "",
+    "version": "0.0.1"
+}

@@ -3,7 +3,7 @@ import string
 from abc import ABC, abstractmethod
 from functools import cached_property
 from itertools import combinations
-from typing import Type, List
+from typing import Type, List, Optional
 from langchain_core.embeddings import Embeddings as LangChainEmbeddings
 from pydantic import ConfigDict
 from sklearn.feature_extraction.text import CountVectorizer
@@ -14,6 +14,14 @@ from cat.utils import get_nlp_object_name
 
 class Embeddings(LangChainEmbeddings, ABC):
     """Base class for all embedders."""
+
+    # Max input tokens the embedder can accept per input text. ``None`` means
+    # "unknown/unlimited" and is the safe default for embedders that do not
+    # declare a limit. Concrete embedders override this, e.g. from the model's
+    # context window or the provider's documented input cap. Callers (chunkers,
+    # rabbit hole) may read it to size chunks that never exceed the embedder.
+    max_input_tokens: Optional[int] = None
+
     def __eq__(self, other):
         if not isinstance(other, Embeddings):
             return False
@@ -32,6 +40,15 @@ class Embeddings(LangChainEmbeddings, ABC):
         """Embedding dimensionality — computed once per instance, then cached."""
         return len(self.embed_query("hello world"))
 
+    def _estimate_tokens(self, text: str) -> int:
+        """Rough token estimate for a text input.
+
+        Default is a conservative ~3 characters per token, so the estimate is
+        never an undercount. Embedders that can use a real tokenizer (or read
+        the provider's actual token count) should override this for accuracy.
+        """
+        return max(1, len(text) // 3)
+
 
 class MultimodalEmbeddings(Embeddings, ABC):
     """Base class for all multimodal embedders."""
@@ -45,6 +62,16 @@ class MultimodalEmbeddings(Embeddings, ABC):
     def embed_images(self, images: List[str | bytes]) -> List[List[float]]:
         """Embed a list of images and returns the embedding vectors that are lists of floats."""
         pass
+
+
+def is_multimodal_embedder(embedder) -> bool:
+    """Whether a resolved embedder *instance* can embed images.
+
+    Used by the chunk-reuse re-embed path, where only the instance is available
+    (no ``RabbitHole``/settings). True iff the embedder is a
+    ``MultimodalEmbeddings`` subclass OR exposes an ``embed_images`` attribute.
+    """
+    return isinstance(embedder, MultimodalEmbeddings) or hasattr(embedder, "embed_images")
 
 
 class DumbEmbedder(Embeddings):

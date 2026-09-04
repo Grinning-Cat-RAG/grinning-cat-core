@@ -153,3 +153,68 @@ async def test_plugin_uninstall(lizard, plugin_is_flat):
     assert len(active_plugins) == len(core_plugins)
     for p in active_plugins:
         assert p in core_plugins
+
+
+async def test_ingestion_status_is_untoggling_and_forced_active(lizard):
+    """ingestion_status must be always-on: part of the untoggling set, so it is
+    force-added to every agent's active_plugins (even ones that previously
+    customized the list without it) and cannot be deactivated."""
+    plugin_manager = lizard.plugin_manager
+
+    assert "ingestion_status" in plugin_manager.get_untoggling_plugin_ids
+
+    # Simulate an agent that customized active_plugins WITHOUT ingestion_status
+    from cat.db.cruds import settings as crud_settings
+    from cat.db.models import Setting
+
+    customized = [p for p in plugin_manager.get_core_plugins_ids if p != "ingestion_status"]
+    await crud_settings.upsert_setting_by_name(
+        plugin_manager.agent_key, Setting(name="active_plugins", value=customized)
+    )
+
+    active_plugins = await plugin_manager.load_active_plugins_ids_from_db()
+    assert "ingestion_status" in active_plugins
+
+    # registered hooks are active
+    hook_plugins = {h.plugin_id for h in plugin_manager.hooks.get("rabbithole_ingestion_start", [])}
+    assert "ingestion_status" in hook_plugins
+
+
+async def test_ingestion_status_cannot_be_deactivated(lizard):
+    plugin_manager = lizard.plugin_manager
+
+    with pytest.raises(Exception, match="cannot be deactivated"):
+        await plugin_manager.toggle_plugin("ingestion_status")
+
+
+async def test_multimodal_ingestion_is_untoggling_and_forced_active(lizard):
+    """multimodal_ingestion must be always-on so its file-deletion cascade is
+    registered on pre-existing agents too (the ones whose active_plugins list
+    was seeded before that core plugin existed). Without this, deleting a file
+    from which images were extracted never removes the image files."""
+    plugin_manager = lizard.plugin_manager
+
+    assert "multimodal_ingestion" in plugin_manager.get_untoggling_plugin_ids
+
+    # Simulate an agent that customized active_plugins WITHOUT multimodal_ingestion
+    from cat.db.cruds import settings as crud_settings
+    from cat.db.models import Setting
+
+    customized = [p for p in plugin_manager.get_core_plugins_ids if p != "multimodal_ingestion"]
+    await crud_settings.upsert_setting_by_name(
+        plugin_manager.agent_key, Setting(name="active_plugins", value=customized)
+    )
+
+    active_plugins = await plugin_manager.load_active_plugins_ids_from_db()
+    assert "multimodal_ingestion" in active_plugins
+
+    # registered hooks are active (including the deletion cascade)
+    hook_plugins = {h.plugin_id for h in plugin_manager.hooks.get("before_file_manager_file_delete", [])}
+    assert "multimodal_ingestion" in hook_plugins
+
+
+async def test_multimodal_ingestion_cannot_be_deactivated(lizard):
+    plugin_manager = lizard.plugin_manager
+
+    with pytest.raises(Exception, match="cannot be deactivated"):
+        await plugin_manager.toggle_plugin("multimodal_ingestion")

@@ -1,0 +1,9 @@
+{
+    "name": "Management Message",
+    "description": "Stores a global management message and a global notice message, and gates access to the whole instance in management mode.",
+    "author_name": "Andrea Sterbini",
+    "plugin_url": "https://github.com/DEH-RAG/grinning-cat-core",
+    "tags": "core, management, message, global, settings",
+    "thumb": "",
+    "version": "0.0.1"
+}
