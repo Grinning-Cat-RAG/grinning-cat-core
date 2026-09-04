@@ -1,4 +1,4 @@
-FROM python:3.13-slim-bullseye AS builder
+FROM python:3.13-slim-bookworm AS builder
 
 ### ENVIRONMENT VARIABLES ###
 ENV PYTHONUNBUFFERED=1 \
@@ -36,7 +36,7 @@ RUN pip install -U pip uv && \
     find ./ -type d -name __pycache__ -exec rm -rf {} +
 
 # ──────────────────────────────────────────────
-FROM python:3.13-slim-bullseye AS final
+FROM python:3.13-slim-bookworm AS final
 
 ENV PYTHONUNBUFFERED=1 \
     UV_NO_CACHE=1 \
