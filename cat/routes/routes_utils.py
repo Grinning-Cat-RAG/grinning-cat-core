@@ -169,7 +169,7 @@ async def get_available_plugins(
 
     # get active plugins
     active_plugins_ids = await plugin_manager.load_active_plugins_ids_from_db()
-    excluded_plugin_ids = plugin_manager.get_untoggling_plugin_ids if agent_id != DEFAULT_SYSTEM_KEY else []
+    excluded_plugin_ids = plugin_manager.get_non_toggleable_plugin_ids if agent_id != DEFAULT_SYSTEM_KEY else []
 
     # list installed plugins' manifest
     installed_plugins = [

@@ -103,3 +103,24 @@ async def test_endpoints_deactivation_or_uninstall(lizard):
         assert isinstance(e, CatEndpoint)
         assert e.plugin_id != "mock_plugin"
         assert e.plugin_id in lizard.plugin_manager.get_core_plugins_ids
+
+
+# The admin UI calls both of these on every Plugins page load, and nothing was
+# exercising them: a rename of the plugin-manager property behind the second one
+# turned it into an AttributeError without a single test noticing.
+async def test_core_plugins_endpoints(lizard, secure_client, secure_client_headers, cheshire_cat):
+    response = await secure_client.get("/admins/core_plugins/", headers=secure_client_headers)
+
+    assert response.status_code == 200
+    assert sorted(response.json()) == sorted(lizard.plugin_manager.get_core_plugins_ids)
+
+
+async def test_core_plugins_untoggling_endpoint(lizard, secure_client, secure_client_headers, cheshire_cat):
+    response = await secure_client.get("/admins/core_plugins/untoggling/", headers=secure_client_headers)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert sorted(body) == sorted(lizard.plugin_manager.get_non_toggleable_plugin_ids)
+    assert body  # the list has content: every entry must be a real plugin
+    for plugin_id in body:
+        assert plugin_id in lizard.plugin_manager.get_core_plugins_ids

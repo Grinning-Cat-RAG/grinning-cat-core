@@ -16,8 +16,8 @@ async def test_get_all_plugin_settings(lizard, secure_client, secure_client_head
     assert len(json["settings"]) == len(available_plugins)
 
     # system plugins are not manageable at an agent level: they are not listed here
-    assert plugin_manager.get_untoggling_plugin_ids
-    for system_plugin in plugin_manager.get_untoggling_plugin_ids:
+    assert plugin_manager.get_non_toggleable_plugin_ids
+    for system_plugin in plugin_manager.get_non_toggleable_plugin_ids:
         assert system_plugin not in [s["name"] for s in json["settings"]]
 
     for setting in json["settings"]:

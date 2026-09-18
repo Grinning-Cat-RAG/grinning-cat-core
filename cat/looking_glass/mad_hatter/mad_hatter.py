@@ -66,16 +66,17 @@ class MadHatter:
             # the core plugins should be appended when the agent is created, i.e. has no active plugins in db
             active_plugins.extend(self.get_core_plugins_ids)
 
-        # ensure all core untoggling plugins (e.g. base_plugin and other always-active plugins) are active
-        active_plugins.extend(self.get_untoggling_plugin_ids)
+        # non-toggleable plugins are always-on: force them back even when the
+        # stored list was customized without them
+        active_plugins.extend(self.get_non_toggleable_plugin_ids)
 
         # Remove duplicates
         active_plugins = list(set(active_plugins))
 
-        # Ensure base_factory is first
-        if self.get_base_core_plugin_id in active_plugins:
-            active_plugins.remove(self.get_base_core_plugin_id)
-        active_plugins.insert(0, self.get_base_core_plugin_id)
+        # ...except the ones BillTheLizard runs on its own behalf: an agent
+        # carries neither them nor their `agents:<id>:plugins:*` keys
+        if self.agent_key != DEFAULT_SYSTEM_KEY:
+            active_plugins = [p for p in active_plugins if p not in self.get_system_only_plugin_ids]
 
         return active_plugins
 
@@ -170,7 +171,7 @@ class MadHatter:
         if not self.plugin_exists(plugin_id):
             raise Exception(f"Plugin {plugin_id} not present in plugins folder")
 
-        if plugin_id not in self.active_plugins or plugin_id in self.get_untoggling_plugin_ids:
+        if plugin_id not in self.active_plugins or plugin_id in self.get_non_toggleable_plugin_ids:
             return
 
         # if the plugin is within the dependencies of other plugins, it cannot be deactivated (raise an exception)
@@ -199,8 +200,8 @@ class MadHatter:
 
     # activate / deactivate plugin
     async def toggle_plugin(self, plugin_id: str):
-        if plugin_id in self.get_untoggling_plugin_ids:
-            raise Exception(f"{', '.join(self.get_untoggling_plugin_ids)} cannot be deactivated")
+        if plugin_id in self.get_non_toggleable_plugin_ids:
+            raise Exception(f"{', '.join(self.get_non_toggleable_plugin_ids)} cannot be deactivated")
 
         if not self.plugin_exists(plugin_id):
             raise Exception(f"Plugin {plugin_id} not active in the system")
@@ -313,11 +314,6 @@ class MadHatter:
             if ((plugin_id := os.path.basename(os.path.normpath(folder))) not in self._skip_folders)
         ]
 
-        # Ensure base_factory is first
-        if self.get_base_core_plugin_id in plugins:
-            plugins.remove(self.get_base_core_plugin_id)
-        plugins.insert(0, self.get_base_core_plugin_id)
-
         return plugins
 
     # check if plugin exists
@@ -396,13 +392,22 @@ class MadHatter:
         return "base_plugin"
 
     @property
-    def get_untoggling_plugin_ids(self) -> List[str]:
-        # always-on system plugins: not only can they not be deactivated, they are
-        # force-added to every agent's active_plugins even when the stored list
-        # was customized without them (see load_active_plugins_ids_from_db).
-        # They are also hidden from the agent-level plugin routes, which manage
-        # them neither in the listing nor in the settings (see is_system_plugin).
+    def get_non_toggleable_plugin_ids(self) -> List[str]:
+        # Plugins that exist for the instance as a whole, not for an agent:
+        # their settings are global (stored on the system agent) and their
+        # hooks run on BillTheLizard's plugin manager. They are always-on.
         return [self.get_base_core_plugin_id, "white_rabbit", "march_hare", "mgmt_message"]
+
+    @property
+    def get_system_only_plugin_ids(self) -> List[str]:
+        # Plugins that exist for the instance as a whole, not for an agent:
+        # their settings are global (stored on the system agent) and every one
+        # of their hooks takes the lizard (after_lizard_bootstrap,
+        # before_lizard_shutdown, lizard_notify_plugin_*, ...), so no agent
+        # carries them.
+        # base_plugin is the one always-on plugin that is NOT system-only: it
+        # holds the default hooks every agent runs.
+        return [p for p in self.get_non_toggleable_plugin_ids if p != self.get_base_core_plugin_id]
 
     @property
     def get_core_plugins_ids(self) -> List[str]:
@@ -411,7 +416,7 @@ class MadHatter:
         return core_plugins
 
     def is_system_plugin(self, plugin_id: str) -> bool:
-        return plugin_id in self.get_untoggling_plugin_ids
+        return plugin_id in self.get_non_toggleable_plugin_ids
 
     @property
     def agent_key(self) -> str:

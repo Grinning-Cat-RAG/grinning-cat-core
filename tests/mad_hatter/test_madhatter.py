@@ -5,12 +5,17 @@ from inspect import isfunction
 import cat.utils as utils
 from cat.looking_glass.mad_hatter.decorators.hook import CatHook
 from cat.looking_glass.mad_hatter.plugin import Plugin
+from cat.db.database import DEFAULT_SYSTEM_KEY
 
 from tests.utils import create_mock_plugin_zip
 
 
 async def _test_on_plugin_manager(plugin_manager):
     all_plugins = plugin_manager.get_core_plugins_ids
+    if plugin_manager.agent_key != DEFAULT_SYSTEM_KEY:
+        # system-only plugins are loaded by BillTheLizard alone, never by an
+        # agent's plugin manager; base_plugin is always-on but not system-only
+        all_plugins = [p for p in all_plugins if p not in plugin_manager.get_system_only_plugin_ids]
 
     assert len(plugin_manager.plugins.keys()) == len(all_plugins)
 
@@ -160,7 +165,7 @@ async def test_system_plugins_are_forced_active(lizard):
     agent's active_plugins, even to agents that previously customized the list
     without them."""
     plugin_manager = lizard.plugin_manager
-    system_plugins = plugin_manager.get_untoggling_plugin_ids
+    system_plugins = plugin_manager.get_non_toggleable_plugin_ids
 
     assert system_plugins
     for plugin_id in system_plugins:
@@ -183,7 +188,7 @@ async def test_system_plugins_are_forced_active(lizard):
 async def test_system_plugins_cannot_be_deactivated(lizard):
     plugin_manager = lizard.plugin_manager
 
-    for plugin_id in plugin_manager.get_untoggling_plugin_ids:
+    for plugin_id in plugin_manager.get_non_toggleable_plugin_ids:
         with pytest.raises(Exception, match="cannot be deactivated"):
             await plugin_manager.toggle_plugin(plugin_id)
 
@@ -191,7 +196,7 @@ async def test_system_plugins_cannot_be_deactivated(lizard):
 async def test_non_system_core_plugins_are_not_system(lizard):
     plugin_manager = lizard.plugin_manager
 
-    toggleable = [p for p in plugin_manager.get_core_plugins_ids if p not in plugin_manager.get_untoggling_plugin_ids]
+    toggleable = [p for p in plugin_manager.get_core_plugins_ids if p not in plugin_manager.get_non_toggleable_plugin_ids]
 
     assert toggleable
     for plugin_id in toggleable:

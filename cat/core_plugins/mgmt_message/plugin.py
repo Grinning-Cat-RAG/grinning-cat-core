@@ -1,16 +1,18 @@
 from cat import hook
 from cat.auth.permissions import AuthResource
-from cat.db.cruds import settings as crud_settings
+from cat.db.cruds import plugins as crud_plugins
 from cat.db.database import DEFAULT_SYSTEM_KEY
 from cat.exceptions import ManagementModeException
+
+from .settings import MGMT_SETTING_NAME
 
 
 @hook(priority=1)
 async def auth_request(local_user, agent_id, connection, **kwargs):
-    # read global settings from the system:agent settings list (same mechanism
-    # as the system-level embedder configuration)
-    setting = await crud_settings.get_setting_by_name(DEFAULT_SYSTEM_KEY, "mgmt_message")
-    value = (setting or {}).get("value") or {}
+    # these settings are global for the whole instance: they live on the system
+    # agent's plugin key (system:plugins:mgmt_message), like every other system
+    # plugin, so the per-agent agent_id is not used here
+    value = await crud_plugins.get_setting(DEFAULT_SYSTEM_KEY, MGMT_SETTING_NAME) or {}
     if not value.get("management_active", False):
         return  # allow
 

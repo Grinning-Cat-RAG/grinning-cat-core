@@ -2,6 +2,7 @@ import os
 import shutil
 import pytest
 
+from tests.routes.plugins.conftest import REGISTRY_CATALOGUE
 from tests.utils import create_mock_plugin_zip
 
 
@@ -18,12 +19,11 @@ async def test_list_registry_plugins(secure_client, secure_client_headers, chesh
 
     # registry (see more registry tests in `./test_plugins_registry.py`)
     assert isinstance(json["registry"], list)
-    assert len(json["registry"]) >= 0
+    assert len(json["registry"]) == len(REGISTRY_CATALOGUE)
 
-    if len(json["registry"]) > 0:
-        # query
-        for key in ["query"]:  # ["query", "author", "tag"]:
-            assert key in json["filters"].keys()
+    # query
+    for key in ["query"]:  # ["query", "author", "tag"]:
+        assert key in json["filters"].keys()
 
 
 async def test_list_registry_plugins_by_query(secure_client, secure_client_headers, cheshire_cat):
@@ -33,7 +33,8 @@ async def test_list_registry_plugins_by_query(secure_client, secure_client_heade
 
     assert response.status_code == 200
     assert json["filters"]["query"] == params["query"]
-    assert len(json["registry"]) > 0  # found registry plugins with text
+    # only the catalogue entry matching the query comes back
+    assert len(json["registry"]) == 1
     for p in json["registry"]:
         plugin_text = p["name"] + p["description"]
         assert params["query"] in plugin_text  # verify searched text

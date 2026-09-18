@@ -16,4 +16,4 @@ async def get_core_untoggling_plugins(
     info: AuthorizedInfo = check_permissions(AuthResource.PLUGIN, AuthPermission.READ),
 ) -> List[str]:
     """Get list of available core plugins which cannot be deactivated"""
-    return info.lizard.plugin_manager.get_untoggling_plugin_ids
+    return info.lizard.plugin_manager.get_non_toggleable_plugin_ids

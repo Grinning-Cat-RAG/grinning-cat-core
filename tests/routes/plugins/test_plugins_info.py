@@ -1,3 +1,6 @@
+from tests.routes.plugins.conftest import REGISTRY_CATALOGUE
+
+
 async def test_list_plugins(lizard, secure_client, secure_client_headers, cheshire_cat):
     response = await secure_client.get("/plugins/", headers=secure_client_headers)
     json = response.json()
@@ -25,4 +28,4 @@ async def test_list_plugins(lizard, secure_client, secure_client_headers, cheshi
 
     # registry (see more registry tests in `./test_plugins_registry.py`)
     assert isinstance(json["registry"], list)
-    assert len(json["registry"]) > 0
+    assert [p["plugin_url"] for p in json["registry"]] == [p["plugin_url"] for p in REGISTRY_CATALOGUE]
