@@ -3,7 +3,7 @@ import pytest
 from cat.db.cruds import settings as crud_settings
 from cat.db.database import DEFAULT_SYSTEM_KEY
 
-from tests.utils import just_installed_plugin, agent_id
+from tests.utils import agent_core_plugins, just_installed_plugin, agent_id
 
 
 async def _check_installed_in_cat(secure_client, secure_client_headers, is_active):
@@ -22,11 +22,11 @@ async def _check_installed_in_cat(secure_client, secure_client_headers, is_activ
 
 
 async def _check_not_installed_in_cat(lizard, secure_client, secure_client_headers):
-    core_plugins = lizard.plugin_manager.get_core_plugins_ids
+    core_plugins = agent_core_plugins(lizard.plugin_manager)
     # GET plugins endpoint lists the plugin
     response = await secure_client.get("/plugins/", headers=secure_client_headers)
     available_plugins = response.json()["installed"]
-    assert len(available_plugins) == len(core_plugins)  # core plugins only
+    assert len(available_plugins) == len(core_plugins)  # agent-visible core plugins only
 
     mock_plugin = [p for p in available_plugins if p["id"] == "mock_plugin"]
     assert len(mock_plugin) == 0  # plugin not available

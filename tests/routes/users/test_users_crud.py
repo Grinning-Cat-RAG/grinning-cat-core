@@ -4,8 +4,9 @@ from pydantic import ValidationError
 from cat.auth.permissions import AuthResource, AuthPermission
 from cat.db.cruds import conversations as crud_conversations
 from cat.routes.users import UserBase, UserUpdate
+from cat.services.memory.messages import ConversationMessage, UserMessage
 
-from tests.utils import agent_id, api_key, create_new_user, check_user_fields, new_user_password
+from tests.utils import agent_id, api_key, create_new_user, check_user_fields, fake_timestamp, new_user_password
 
 
 def test_validation_errors():
@@ -243,3 +244,39 @@ async def test_no_access_if_api_keys_active(secure_client, secure_client_headers
     response = await secure_client.get("/users/", headers=headers)
     assert response.status_code == 200
     assert len(response.json()) == 0
+
+
+async def test_delete_user_deletes_their_conversations(secure_client, secure_client_headers, cheshire_cat):
+    """Deleting a user must also drop every conversation of that user.
+
+    The conversation keys are per-chat (``agents:<id>:conversations:<user>:<chat>``),
+    so the removal has to be pattern-based: an exact-key delete with a literal
+    ``*`` in it matches nothing and leaves the history behind.
+    """
+    user_id = (await create_new_user(secure_client, headers=secure_client_headers))["id"]
+    other_user_id = (await create_new_user(secure_client, username="Bobby", headers=secure_client_headers))["id"]
+
+    def _message(text: str) -> ConversationMessage:
+        return ConversationMessage(who="user", when=fake_timestamp, content=UserMessage(text=text))
+
+    # two conversations for the user to be deleted, one for another user
+    for chat_id in ("chat_one", "chat_two"):
+        await crud_conversations.set_messages(
+            agent_id, user_id, chat_id, [_message(f"hello from {chat_id}")]
+        )
+    await crud_conversations.set_messages(
+        agent_id, other_user_id, "chat_other", [_message("hello")]
+    )
+
+    assert len(await crud_conversations.get_conversations_attributes(agent_id=agent_id, user_id=user_id)) == 2
+
+    response = await secure_client.delete(f"/users/{user_id}", headers=secure_client_headers)
+    assert response.status_code == 200
+
+    # every conversation of the deleted user is gone...
+    assert await crud_conversations.get_conversations_attributes(agent_id=agent_id, user_id=user_id) == []
+    for chat_id in ("chat_one", "chat_two"):
+        assert await crud_conversations.get_conversation(agent_id, user_id, chat_id) is None
+
+    # ...and the other user's conversation is untouched
+    assert await crud_conversations.get_conversation(agent_id, other_user_id, "chat_other") is not None

@@ -1,15 +1,15 @@
 import asyncio
 import base64
 import types
+import uuid
 from io import BytesIO
 
 from langchain_core.documents import Document
 
 from cat.core_plugins.base_plugin.parsers import MimeTypeBasedParser
-from cat.db.database import DEFAULT_SYSTEM_KEY
 from cat.rabbit_hole import RabbitHole
 from cat.services.factory.embedder import MultimodalEmbeddings
-from cat.services.memory.models import VectorMemoryType
+from cat.services.memory.models import PointStruct, VectorMemoryType
 from tests.utils import agent_id
 
 
@@ -29,22 +29,6 @@ class FakeMultimodalEmbedder(MultimodalEmbeddings):
         return [[0.1] * 4 for _ in images]
 
 
-class PartialFailMultimodalEmbedder(FakeMultimodalEmbedder):
-    """Multimodal embedder that returns ``None`` for a failed/skipped image embed.
-
-    Mirrors the MyPLUS vLLM embedder contract after the "skip image and continue"
-    decision: a failed image yields a ``None`` placeholder in the aligned
-    ``embed_images`` result list (and ``embed_image`` returns ``None``).
-    """
-
-    def embed_image(self, image):
-        return None
-
-    def embed_images(self, images):
-        return [None if i == 0 else [0.1] * 4 for i in range(len(images))]
-
-
-
 def _image_payload(data: bytes, mime: str = "image/jpeg") -> dict:
     return {
         "image_base64": base64.b64encode(data).decode(),
@@ -53,27 +37,36 @@ def _image_payload(data: bytes, mime: str = "image/jpeg") -> dict:
     }
 
 
-async def test_store_documents_multimodal_embeds_and_stores_images(cheshire_cat, monkeypatch):
+async def test_store_documents_delegates_image_points_to_plugin_hook(cheshire_cat, monkeypatch):
+    """Image points are built by a plugin through ``rabbithole_stores_image_points``.
+
+    The core only collects what the hook returns and appends it to the same
+    collection: with no plugin installed the no-op returns ``[]`` (upstream
+    parity, no image points).
+    """
     stored: dict = {}
+    hook_calls: list = []
 
     async def fake_add_points(collection_name, points):
         stored["collection"] = collection_name
         stored["points"] = points
 
-    async def fake_embedder():
-        return FakeMultimodalEmbedder()
+    fake_image_point = PointStruct(
+        id=uuid.uuid4().hex,
+        payload={"page_content": "", "metadata": {"image": True, "image_file": "test_img_0.jpg"}},
+        vector=[0.1] * 4,
+    )
 
-    # Force multimodal detection and swap the embedder + the vector memory storage.
-    monkeypatch.setattr(cheshire_cat.lizard, "embedder", fake_embedder)
+    original_execute_hook = cheshire_cat.plugin_manager.execute_hook
+
+    async def fake_execute_hook(hook_name, *args, caller=None):
+        if hook_name == "rabbithole_stores_image_points":
+            hook_calls.append({"args": args, "caller": caller})
+            return [fake_image_point]
+        return await original_execute_hook(hook_name, *args, caller=caller)
+
+    monkeypatch.setattr(cheshire_cat.plugin_manager, "execute_hook", fake_execute_hook)
     monkeypatch.setattr(cheshire_cat.vector_memory_handler, "add_points_to_tenant", fake_add_points)
-
-    # Record save_file calls instead of writing the image files to the real storage.
-    saved_files: list = []
-
-    async def fake_save_file(file_bytes, content_type, source, chat_id=None):
-        saved_files.append((file_bytes, content_type, source, chat_id))
-
-    monkeypatch.setattr(cheshire_cat, "save_file", fake_save_file)
 
     rabbit_hole = RabbitHole()
     rabbit_hole.cat = cheshire_cat
@@ -81,254 +74,102 @@ async def test_store_documents_multimodal_embeds_and_stores_images(cheshire_cat,
 
     docs = [Document(page_content="a text chunk", metadata={})]
     images = [_image_payload(b"\x89PNG\r\n\x1a\n")]
+    source_bytes = b"the raw source"
 
     points = await rabbit_hole.store_documents(
-        docs=docs, source="test.txt", file_hash="hash", metadata={}, images=images,
+        docs=docs, source="test.txt", file_hash="hash", metadata={"k": "v"}, images=images,
+        source_bytes=source_bytes,
     )
 
+    # the plugin got everything it needs to build the image points
+    assert len(hook_calls) == 1
+    seed, hook_images, hook_source, hook_source_bytes, hook_metadata, hook_hash, hook_chat_id = hook_calls[0]["args"]
+    assert seed == []
+    assert hook_images == images
+    assert hook_source == "test.txt"
+    assert hook_source_bytes == source_bytes
+    assert hook_metadata == {"k": "v"}
+    assert hook_hash == "hash"
+    assert hook_chat_id is None
+    assert hook_calls[0]["caller"] is cheshire_cat
+
+    # one text point + the point returned by the plugin, in the same collection
     assert stored["collection"] == str(VectorMemoryType.DECLARATIVE)
-    # one text point + one image point
     assert len(points) == 2
-
-    text_points = [p for p in points if not p.payload["metadata"].get("image")]
-    image_points = [p for p in points if p.payload["metadata"].get("image")]
-
-    assert len(text_points) == 1
-    assert len(image_points) == 1
-
-    image_metadata = image_points[0].payload["metadata"]
-    assert image_metadata["image"] is True
-    assert image_metadata["source"] == "test.txt"
-    assert "image_base64" not in image_metadata
-    assert "image_mime_type" not in image_metadata
-    image_file = image_metadata["image_file"]
-    assert image_file.startswith("test_img_0_")
-    assert image_file.endswith(".jpg")
-
-    # the image was saved as a file, not embedded in the point metadata
-    assert saved_files == [(b"\x89PNG\r\n\x1a\n", "image/jpeg", image_file, None)]
+    assert fake_image_point in points
+    assert stored["points"] == points
 
 
-async def test_store_documents_multimodal_uses_agent_embedder(cheshire_cat, monkeypatch):
-    """The image points must come from the agent's own embedder (embed_images)."""
+async def test_store_documents_image_hook_receives_chat_id_in_conversation(cheshire_cat, monkeypatch):
+    """In a conversation (stray set) the plugin is handed the chat id, and the
+    points land in the episodic collection."""
     stored: dict = {}
-
-    async def fake_add_points(collection_name, points):
-        stored["points"] = points
-
-    calls: dict = {"images": []}
-
-    class RecordingEmbedder(FakeMultimodalEmbedder):
-        def embed_images(self, images):
-            calls["images"] = list(images)
-            return super().embed_images(images)
-
-    async def fake_embedder():
-        return RecordingEmbedder()
-
-    monkeypatch.setattr(cheshire_cat.lizard, "embedder", fake_embedder)
-    monkeypatch.setattr(cheshire_cat.vector_memory_handler, "add_points_to_tenant", fake_add_points)
-
-    # Record save_file calls instead of writing the image files to the real storage.
-    saved_files: list = []
-
-    async def fake_save_file(file_bytes, content_type, source, chat_id=None):
-        saved_files.append((file_bytes, content_type, source, chat_id))
-
-    monkeypatch.setattr(cheshire_cat, "save_file", fake_save_file)
-
-    rabbit_hole = RabbitHole()
-    rabbit_hole.cat = cheshire_cat
-    rabbit_hole.stray = None
-
-    docs = [Document(page_content="a text chunk")]
-
-    await rabbit_hole.store_documents(docs=docs, source="test.txt", metadata={}, images=[_image_payload(b"IMG1")])
-
-    # the raw image bytes are what gets embedded
-    assert calls["images"] == [b"IMG1"]
-
-    # the image was saved as a file in the agent storage
-    assert len(saved_files) == 1
-    assert saved_files[0][2].startswith("test_img_")
-
-
-async def test_store_documents_multimodal_in_conversation_adds_chat_id(cheshire_cat, monkeypatch):
-    """In a conversation (stray set), image points carry chat_id in their metadata
-    and the image file is saved under the conversation id."""
-    stored: dict = {}
+    hook_calls: list = []
 
     async def fake_add_points(collection_name, points):
         stored["collection"] = collection_name
-        stored["points"] = points
 
-    saved_files: list = []
+    original_execute_hook = cheshire_cat.plugin_manager.execute_hook
 
-    async def fake_save_file(file_bytes, content_type, source, chat_id=None):
-        saved_files.append((file_bytes, content_type, source, chat_id))
+    async def fake_execute_hook(hook_name, *args, caller=None):
+        if hook_name == "rabbithole_stores_image_points":
+            hook_calls.append(args)
+            return []
+        return await original_execute_hook(hook_name, *args, caller=caller)
 
-    async def fake_embedder():
-        return FakeMultimodalEmbedder()
-
-    monkeypatch.setattr(cheshire_cat.lizard, "embedder", fake_embedder)
+    monkeypatch.setattr(cheshire_cat.plugin_manager, "execute_hook", fake_execute_hook)
     monkeypatch.setattr(cheshire_cat.vector_memory_handler, "add_points_to_tenant", fake_add_points)
-    monkeypatch.setattr(cheshire_cat, "save_file", fake_save_file)
 
     rabbit_hole = RabbitHole()
     rabbit_hole.cat = cheshire_cat
     rabbit_hole.stray = types.SimpleNamespace(id="chat_abc")
 
-    docs = [Document(page_content="a text chunk")]
+    await rabbit_hole.store_documents(
+        docs=[Document(page_content="a text chunk")], source="test.txt", metadata={},
+        images=[_image_payload(b"IMG1")],
+    )
 
-    await rabbit_hole.store_documents(docs=docs, source="test.txt", metadata={}, images=[_image_payload(b"IMG1")])
-
-    # image points land in the episodic collection and carry chat_id
+    assert len(hook_calls) == 1
+    assert hook_calls[0][-1] == "chat_abc"
     assert stored["collection"] == str(VectorMemoryType.EPISODIC)
-    image_points = [p for p in stored["points"] if p.payload["metadata"].get("image")]
-    assert len(image_points) == 1
-    assert image_points[0].payload["metadata"]["chat_id"] == "chat_abc"
-    # the saved image file is scoped to the conversation
-    assert len(saved_files) == 1
-    assert saved_files[0][3] == "chat_abc"
 
 
-async def test_store_documents_multimodal_image_source_does_not_duplicate(cheshire_cat, monkeypatch):
-    """Uploading an image file embeds the whole file (no derived files/points).
-
-    The hi_res parser can split an image into sub-crops: those must be ignored and
-    the source file itself embedded as a single image point (image_file = source).
-    """
-    stored: dict = {}
-    saved_files: list = []
+async def test_store_documents_image_hook_not_called_without_images(cheshire_cat, monkeypatch):
+    """No images collected by the parsers: the image seam is never entered."""
+    hook_calls: list = []
 
     async def fake_add_points(collection_name, points):
-        stored["points"] = points
+        pass
 
-    async def fake_save_file(file_bytes, content_type, source, chat_id=None):
-        saved_files.append((file_bytes, content_type, source, chat_id))
+    original_execute_hook = cheshire_cat.plugin_manager.execute_hook
 
-    async def fake_embedder():
-        return FakeMultimodalEmbedder()
+    async def fake_execute_hook(hook_name, *args, caller=None):
+        if hook_name == "rabbithole_stores_image_points":
+            hook_calls.append(args)
+            return []
+        return await original_execute_hook(hook_name, *args, caller=caller)
 
-    monkeypatch.setattr(cheshire_cat.lizard, "embedder", fake_embedder)
+    monkeypatch.setattr(cheshire_cat.plugin_manager, "execute_hook", fake_execute_hook)
     monkeypatch.setattr(cheshire_cat.vector_memory_handler, "add_points_to_tenant", fake_add_points)
-    monkeypatch.setattr(cheshire_cat, "save_file", fake_save_file)
 
     rabbit_hole = RabbitHole()
     rabbit_hole.cat = cheshire_cat
     rabbit_hole.stray = None
 
-    docs = [Document(page_content="")]
-    source_bytes = b"\xff\xd8\xff\xe0" + b"\x00" * 16  # fake jpeg payload
-    # parser crops for the image source (must be ignored)
-    crops = [_image_payload(b"crop1", mime="image/jpeg"), _image_payload(b"crop2", mime="image/jpeg")]
+    points = await rabbit_hole.store_documents(docs=[Document(page_content="a text chunk")], source="test.txt")
 
-    points = await rabbit_hole.store_documents(
-        docs=docs, source="photo.jpeg", metadata={}, images=crops, source_bytes=source_bytes,
-    )
-
-    image_points = [p for p in points if p.payload["metadata"].get("image")]
-    # exactly ONE image point, no derived files
-    assert len(image_points) == 1
-    assert image_points[0].payload["metadata"]["image_file"] == "photo.jpeg"
-    assert image_points[0].payload["metadata"]["source"] == "photo.jpeg"
-    assert saved_files == []
-
-
-async def test_store_documents_skips_none_image_vectors(cheshire_cat, monkeypatch):
-    """A failed/skipped image embed (``None`` vector) must be dropped entirely:
-    its file is NOT saved and no point is stored for it. ``add_points_to_tenant``
-    must never receive a ``None``-vector point (Qdrant would reject it or store
-    payload-only garbage)."""
-    stored: dict = {}
-
-    async def fake_add_points(collection_name, points):
-        stored["collection"] = collection_name
-        stored["points"] = points
-
-    async def fake_embedder():
-        return PartialFailMultimodalEmbedder()
-
-    saved_files: list = []
-
-    async def fake_save_file(file_bytes, content_type, source, chat_id=None):
-        saved_files.append((file_bytes, content_type, source, chat_id))
-
-    monkeypatch.setattr(cheshire_cat.lizard, "embedder", fake_embedder)
-    monkeypatch.setattr(cheshire_cat.vector_memory_handler, "add_points_to_tenant", fake_add_points)
-    monkeypatch.setattr(cheshire_cat, "save_file", fake_save_file)
-
-    rabbit_hole = RabbitHole()
-    rabbit_hole.cat = cheshire_cat
-    rabbit_hole.stray = None
-
-    docs = [Document(page_content="a text chunk", metadata={})]
-    # first image fails to embed (None), second succeeds
-    images = [_image_payload(b"IMG_FAIL"), _image_payload(b"IMG_OK")]
-
-    points = await rabbit_hole.store_documents(
-        docs=docs, source="test.txt", file_hash="hash", metadata={}, images=images,
-    )
-
-    # exactly ONE image point: the failed image is dropped
-    image_points = [p for p in points if p.payload["metadata"].get("image")]
-    assert len(image_points) == 1
-    assert image_points[0].payload["metadata"]["image_file"].startswith("test_img_1_")
-
-    # the failed image's file was NOT saved (only the successful one)
-    assert len(saved_files) == 1
-    assert saved_files[0][2].startswith("test_img_1_")
-
-    # add_points_to_tenant received no None-vector point
-    assert all(p.vector is not None for p in stored["points"])
-
-
-async def test_store_documents_whole_image_none_embed_skipped(cheshire_cat, monkeypatch):
-    """Whole-image source: if ``embed_images`` returns ``[None]`` (failed embed),
-    no image point is stored and no file is saved."""
-    stored: dict = {}
-
-    async def fake_add_points(collection_name, points):
-        stored["points"] = points
-
-    saved_files: list = []
-
-    async def fake_save_file(file_bytes, content_type, source, chat_id=None):
-        saved_files.append((file_bytes, content_type, source, chat_id))
-
-    async def fake_embedder():
-        return PartialFailMultimodalEmbedder()
-
-    monkeypatch.setattr(cheshire_cat.lizard, "embedder", fake_embedder)
-    monkeypatch.setattr(cheshire_cat.vector_memory_handler, "add_points_to_tenant", fake_add_points)
-    monkeypatch.setattr(cheshire_cat, "save_file", fake_save_file)
-
-    rabbit_hole = RabbitHole()
-    rabbit_hole.cat = cheshire_cat
-    rabbit_hole.stray = None
-
-    docs = [Document(page_content="")]
-    source_bytes = b"\xff\xd8\xff\xe0" + b"\x00" * 16  # fake jpeg payload
-
-    points = await rabbit_hole.store_documents(
-        docs=docs, source="photo.jpeg", metadata={}, images=[_image_payload(b"crop")], source_bytes=source_bytes,
-    )
-
-    # the failed whole-image embed produces no image point and no saved file
-    image_points = [p for p in points if p.payload["metadata"].get("image")]
-    assert image_points == []
-    assert saved_files == []
-    assert all(p.vector is not None for p in stored["points"])
+    assert hook_calls == []
+    assert len(points) == 1
 
 
 async def test_store_documents_text_only_ignores_images(cheshire_cat, monkeypatch):
-    """When the embedder is not multimodal, images are ignored and only text is stored."""
+    """With no plugin answering the image seam, images are ignored and only text is
+    stored (upstream parity: the no-op hook returns ``[]``)."""
     stored: dict = {}
 
     async def fake_add_points(collection_name, points):
         stored["points"] = points
 
-    # detection reports a text-only embedder
     monkeypatch.setattr(cheshire_cat.vector_memory_handler, "add_points_to_tenant", fake_add_points)
 
     rabbit_hole = RabbitHole()
@@ -437,37 +278,6 @@ async def test_text_points_do_not_carry_image_base64(cheshire_cat, monkeypatch):
 def test_agent_id_is_test_agent(cheshire_cat):
     # guard that tests run against the expected agent key
     assert cheshire_cat.agent_key == agent_id
-
-
-async def test_is_multimodal_embedder_uses_lizard_context(cheshire_cat, monkeypatch):
-    """The embedder factory must run in the lizard (system) plugin-manager context.
-
-    The ``factory_allowed_embedders`` hooks are declared with a ``lizard`` parameter
-    (core base_plugin and PLUS alike): ``MadHatter.context_execute_hook`` passes the
-    caller under that keyword only when the executing manager belongs to
-    BillTheLizard. Using an agent plugin manager would pass ``cat`` and make the
-    hooks raise ``TypeError: unexpected keyword argument 'cat'``.
-
-    Moved to the multimodal_ingestion plugin (``is_multimodal_embedder_active``).
-    """
-    from cat.core_plugins.multimodal_ingestion import ingestion as mmi
-    captured = {}
-
-    class FakeServiceFactory:
-        def __init__(self, agent_key, hook_manager, **kwargs):
-            captured["agent_key"] = agent_key
-            captured["plugin_manager_agent_key"] = hook_manager.agent_key
-            captured["kwargs"] = kwargs
-
-        async def get_config_class_from_adapter(self, obj):
-            return None
-
-    monkeypatch.setattr("cat.services.service_factory.ServiceFactory", FakeServiceFactory)
-
-    assert await mmi.is_multimodal_embedder_active(cheshire_cat) is False
-
-    assert captured["agent_key"] == DEFAULT_SYSTEM_KEY
-    assert captured["plugin_manager_agent_key"] == DEFAULT_SYSTEM_KEY
 
 
 async def test_file_to_docs_parse_runs_off_event_loop(cheshire_cat, monkeypatch):
@@ -695,103 +505,3 @@ async def test_ingest_file_sets_processing_before_parse(cheshire_cat, monkeypatc
     # processing fires after the file is persisted but before the parser runs
     assert order == ["save_file", "processing", "parse"]
 
-
-async def test_ingest_file_survives_restart_via_resume(cheshire_cat, monkeypatch):
-    """F3: a container restart during a large-file parse does not lose the file.
-
-    ``ingest_file`` persists the bytes to the file manager BEFORE the (slow)
-    parse runs. A simulated restart + resume of the stale ``uploaded`` entry
-    then re-reads the file from disk and completes it — never hitting the
-    "file missing" path.
-    """
-    import time
-    from unittest.mock import AsyncMock
-
-    from cat.core_plugins.efficient_ingestion import resume as ingestion_resume
-    from cat.core_plugins.ingestion_status.registry import get_status, status_key
-    from cat.db import crud
-
-    agent_key = cheshire_cat.agent_key
-    source = "hello.txt"
-    file_bytes = b"hello world"
-
-    # ---- phase 1: in-flight large-file ingestion ----------------------------
-    # The fixture's file manager is a DummyFileManager (not writable), so the
-    # durable-persist guarantee is proven by ORDER: save_file must run BEFORE
-    # the (slow) parse. The resume phase below then proves the persisted bytes
-    # are read back from disk and the ingestion completes.
-    order: list = []
-    saved: list = []
-
-    async def fake_save_file(file_bytes, content_type, source, chat_id=None):
-        order.append("save_file")
-        saved.append((file_bytes, content_type, source, chat_id))
-
-    async def slow_parse_to_docs(self, source, file_bytes, content_type=None):
-        order.append("parse")
-        await asyncio.sleep(0.05)  # simulate a long parse
-        return [Document(page_content="x")], []
-
-    async def fake_store_documents(self, docs, source, file_hash=None, metadata=None, images=None, source_bytes=None):
-        return []
-
-    async def fake_execute_hook(self, *args, **kwargs):
-        return None
-
-    monkeypatch.setattr(cheshire_cat, "save_file", fake_save_file)
-    monkeypatch.setattr(RabbitHole, "_parse_to_docs", slow_parse_to_docs)
-    monkeypatch.setattr(RabbitHole, "store_documents", fake_store_documents)
-    monkeypatch.setattr(cheshire_cat.plugin_manager, "execute_hook", fake_execute_hook)
-
-    rabbit_hole = RabbitHole()
-    rabbit_hole.cat = cheshire_cat
-    rabbit_hole.stray = None
-
-    await rabbit_hole.ingest_file(
-        cat=cheshire_cat, file=BytesIO(file_bytes), metadata={}, filename=source, content_type="text/plain",
-    )
-
-    # the file bytes were persisted BEFORE the slow parse completed
-    assert order == ["save_file", "parse"]
-    assert saved == [(file_bytes, "text/plain", source, None)]
-
-    # ---- phase 2: simulated restart + resume --------------------------------
-    old = time.time() - 1000
-    await crud.store(status_key(agent_key, "agent", source), {
-        "source": source,
-        "scope": "agent",
-        "chat_id": None,
-        "type": "file",
-        "status": "uploaded",
-        "error": None,
-        "error_at": None,
-        "created_at": old,
-        "updated_at": old,
-    })
-
-    monkeypatch.setattr(cheshire_cat.lizard, "get_cheshire_cat", AsyncMock(return_value=cheshire_cat))
-    # the file is present on disk (persisted in phase 1)
-    monkeypatch.setattr(cheshire_cat.file_manager, "read_file", lambda s, p: file_bytes)
-
-    # phase 2 goes through the ONE phase machine: spy on it (it re-reads the
-    # persisted file and completes the source)
-    import cat.core_plugins.efficient_ingestion.resume as efficient_resume_mod
-    from cat.core_plugins.ingestion_status.registry import set_status as _set_status_c
-
-    machine_calls = []
-
-    async def fake_machine(ccat, collection_name, stored_sources, stale_after=None):
-        for s in stored_sources:
-            machine_calls.append((str(collection_name), s.name))
-            await _set_status_c(ccat.agent_key, "agent", s.name, type_="file", status="completed", chat_id=None)
-
-    monkeypatch.setattr(efficient_resume_mod, "reembed_sources", fake_machine)
-
-    await ingestion_resume._resume_agent(cheshire_cat.lizard, agent_key)
-
-    # the resume handed the source to the phase machine exactly once (no "file
-    # missing" path) and it completed
-    assert machine_calls == [("declarative", source)]
-    doc = await get_status(agent_key, "agent", source)
-    assert doc is not None
-    assert doc["status"] == "completed"

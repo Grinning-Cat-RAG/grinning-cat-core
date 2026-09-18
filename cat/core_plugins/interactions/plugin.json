@@ -2,7 +2,7 @@
     "name": "Model Interactions",
     "description": "Add interactions handler to the language model.",
     "author_name": "Matteo Cacciola",
-    "plugin_url": "https://github.com/matteocacciola/grinning-cat-core",
+    "plugin_url": "https://github.com/Grinning-Cat-RAG/grinning-cat-core",
     "tags": "core, default, language model, interaction, handler",
     "thumb": "",
     "version": "0.0.1"

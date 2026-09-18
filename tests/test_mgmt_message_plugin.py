@@ -9,8 +9,8 @@ Coverage:
     ``ManagementModeException`` (a ``CustomForbiddenException``), translated
     by ``ConnectionAuth`` into ``CustomForbiddenException`` (HTTP) /
     ``WebSocketException(code=1008)`` (WS),
-(c) ``GET /plugins/settings/mgmt_message`` returns the 4 settings in normal
-    mode (the RITA read path),
+(c) ``GET /plugins/system/settings/mgmt_message`` returns the 4 settings in
+    normal mode (the RITA read path),
 (d) ``management_active=false`` is a no-op for any principal.
 
 Uses the ``tests/conftest.py`` fixtures: Redis db=1 (isolated), agent
@@ -31,10 +31,8 @@ from cat.auth.permissions import (
     get_base_permissions,
 )
 from cat.core_plugins.mgmt_message.plugin import auth_request
-from cat.core_plugins.mgmt_message.settings import (
-    _MGMT_SETTING_CATEGORY,
-    _MGMT_SETTING_NAME,
-)
+from cat.core_plugins.mgmt_message.settings import _MGMT_SETTING_NAME, PluginSettings
+from cat.db.cruds import plugins as crud_plugins
 from cat.db.cruds import settings as crud_settings
 from cat.db.database import DEFAULT_AGENT_KEY, DEFAULT_SYSTEM_KEY, get_sync_db
 from cat.db.models import Setting
@@ -62,7 +60,7 @@ def _make_admin_user():
 async def _store(payload: dict):
     await crud_settings.upsert_setting_by_name(
         DEFAULT_SYSTEM_KEY,
-        Setting(name=_MGMT_SETTING_NAME, value=payload, category=_MGMT_SETTING_CATEGORY),
+        Setting(name=_MGMT_SETTING_NAME, value=payload),
     )
 
 
@@ -92,7 +90,6 @@ async def test_storage_round_trip_in_system_agent():
     entry = found[0]
     assert isinstance(entry, dict)
     assert entry["value"] == payload
-    assert entry["category"] == _MGMT_SETTING_CATEGORY
 
     # real async read path used by the hook
     loaded = await crud_settings.get_setting_by_name(DEFAULT_SYSTEM_KEY, _MGMT_SETTING_NAME)
@@ -107,29 +104,41 @@ async def test_storage_round_trip_in_system_agent():
     await _cleanup()
 
 
-async def test_legacy_key_migrated_on_load():
-    # seed the legacy system:plugins:mgmt_message key (old mechanism)
-    payload = {
-        "management_message": "Sistema in manutenzione",
-        "management_active": True,
-        "global_message": "Avviso globale",
-        "show_global_msg": True,
-    }
-    db = get_sync_db()
-    db.json().set(f"{DEFAULT_SYSTEM_KEY}:plugins:{PLUGIN_ID}", "$", payload)
+async def test_load_settings_returns_defaults_when_not_stored():
+    """Nothing stored in ``system:agent``: the model defaults are served."""
+    await _cleanup()
 
     from cat.core_plugins.mgmt_message.settings import load_settings
 
     loaded = await load_settings.function(PLUGIN_ID, DEFAULT_SYSTEM_KEY)
-    assert loaded == payload
+    assert loaded == PluginSettings().model_dump()
 
-    # migrated into system:agent, legacy key removed
-    assert db.keys("system:plugins:*") == []
-    found = db.json().get(MGMT_SYSTEM_AGENT_KEY, f'$[?(@.name=="{_MGMT_SETTING_NAME}")]')
-    assert isinstance(found, list) and found
-    assert found[0]["value"] == payload
 
-    await _cleanup()
+async def test_drop_agent_keys_removes_per_agent_leftovers():
+    """The per-agent ``agents:<id>:plugins:mgmt_message`` keys written by the core
+    at plugin activation are leftovers: this plugin's single source of truth is
+    the global ``system:agent`` list, so they must be dropped."""
+    from cat.core_plugins.mgmt_message.settings import drop_agent_keys
+
+    db = get_sync_db()
+    leftovers = [
+        crud_plugins.format_key("agent_one", PLUGIN_ID),
+        crud_plugins.format_key("agent_two", PLUGIN_ID),
+    ]
+    for key in leftovers:
+        db.json().set(key, "$", {"management_active": True})
+
+    # another plugin's per-agent key must survive
+    other_key = crud_plugins.format_key("agent_one", "another_plugin")
+    db.json().set(other_key, "$", {"a": 1})
+
+    await drop_agent_keys()
+
+    for key in leftovers:
+        assert db.json().get(key) is None
+    assert db.json().get(other_key) is not None
+
+    db.delete(other_key)
 
 
 # ---------------------------------------------------------------------------
@@ -274,8 +283,8 @@ async def test_http_gateway_allows_system_principal_with_real_hook(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# (c) normal-mode / RITA read: GET /mgmt_message/settings (SYSTEM READ, moved
-# from the old core /plugins/system/settings route into the plugin)
+# (c) normal-mode / RITA read: GET /plugins/system/settings/mgmt_message
+# (SYSTEM READ) — the plugin owns only the write route
 # ---------------------------------------------------------------------------
 
 async def test_get_plugin_settings_normal_mode(secure_client, secure_client_headers, cheshire_cat):
@@ -287,8 +296,12 @@ async def test_get_plugin_settings_normal_mode(secure_client, secure_client_head
     }
     await _store(payload)
 
-    # admin (system agent) reads the global settings — this is the RITA read path
-    response = await secure_client.get("/mgmt_message/settings", headers=secure_client_headers)
+    # admin (system agent) reads the global settings — this is the RITA read path.
+    # The plugin has no GET route of its own: the read goes through the system
+    # plugin-settings route, which keeps listing system plugins.
+    response = await secure_client.get(
+        "/plugins/system/settings/mgmt_message", headers=secure_client_headers
+    )
 
     assert response.status_code == 200
     body = response.json()
@@ -315,9 +328,7 @@ async def test_get_plugin_settings_normal_mode(secure_client, secure_client_head
 # persists the plugin settings into system:agent — the MyADMIN Management mode
 # save path
 async def test_put_mgmt_message_settings(client, secure_client, secure_client_headers, cheshire_cat):
-    # activate the plugin so its settings are loaded via the plugin overrides
-    await secure_client.put("/plugins/toggle/mgmt_message", headers=secure_client_headers)
-
+    # mgmt_message is a system plugin: always active, no toggle needed
     payload = {
         "management_message": "Nuovo messaggio",
         "management_active": True,
@@ -338,7 +349,6 @@ async def test_put_mgmt_message_settings(client, secure_client, secure_client_he
     found = db.json().get(MGMT_SYSTEM_AGENT_KEY, f'$[?(@.name=="{_MGMT_SETTING_NAME}")]')
     assert isinstance(found, list) and found
     assert found[0]["value"] == payload
-    assert found[0]["category"] == _MGMT_SETTING_CATEGORY
 
     # the value is served from system:agent
     loaded = await crud_settings.get_setting_by_name(DEFAULT_SYSTEM_KEY, _MGMT_SETTING_NAME)
@@ -348,18 +358,17 @@ async def test_put_mgmt_message_settings(client, secure_client, secure_client_he
 
 
 # ---------------------------------------------------------------------------
-# (c2) the plugin settings routes must NOT be public: read and write require
-# SYSTEM permission, exactly like the old core /plugins/system/settings routes
+# (c2) the settings routes must NOT be public: the plugin's own write route and
+# the system read route both require SYSTEM permission
 # ---------------------------------------------------------------------------
 
 async def test_settings_endpoints_require_system_permission(client, secure_client, secure_client_headers, cheshire_cat):
-    # activate the plugin so its custom endpoints are registered
-    await secure_client.put("/plugins/toggle/mgmt_message", headers=secure_client_headers)
-
+    # mgmt_message is a system plugin: always active, its endpoints are registered
     unauthenticated_put = await client.put("/mgmt_message/settings", json={"management_active": True})
     assert unauthenticated_put.status_code == 401
 
-    unauthenticated_get = await client.get("/mgmt_message/settings")
+    # the settings read is served by the system plugin route, which is protected too
+    unauthenticated_get = await client.get("/plugins/system/settings/mgmt_message")
     assert unauthenticated_get.status_code == 401
 
     await _cleanup()
@@ -396,9 +405,7 @@ async def test_auth_request_noop_when_no_setting(monkeypatch):
 # ---------------------------------------------------------------------------
 
 async def test_public_global_message_endpoint_no_auth(client, secure_client, secure_client_headers, cheshire_cat):
-    # activate the plugin so its custom endpoint is registered
-    await secure_client.put("/plugins/toggle/mgmt_message", headers=secure_client_headers)
-
+    # mgmt_message is a system plugin: always active, its endpoints are registered
     payload = {
         "management_message": "Sistema in manutenzione",
         "management_active": False,

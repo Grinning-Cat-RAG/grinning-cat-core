@@ -2,7 +2,7 @@
     "name": "Conversation History",
     "description": "Store and retrieve conversation history to provide context and reasoning for LLMs.",
     "author_name": "Matteo Cacciola",
-    "plugin_url": "https://github.com/matteocacciola/grinning-cat-core",
+    "plugin_url": "https://github.com/Grinning-Cat-RAG/grinning-cat-core",
     "tags": "core, default, conversation, history, context, reasoning, llm",
     "thumb": "",
     "version": "0.0.1"

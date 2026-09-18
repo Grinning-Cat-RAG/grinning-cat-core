@@ -2,7 +2,7 @@
     "name": "White Rabbit",
     "description": "Cron and schedule tasks.",
     "author_name": "Matteo Cacciola",
-    "plugin_url": "https://github.com/matteocacciola/grinning-cat-core",
+    "plugin_url": "https://github.com/Grinning-Cat-RAG/grinning-cat-core",
     "tags": "core, default, cat, cron, schedule, task",
     "thumb": "",
     "version": "0.0.1"

@@ -2,7 +2,7 @@
     "name": "Cat Webhooks",
     "description": "Allow the consumers of the Cheshirecat API to register webhooks to be notified when certain events occur.",
     "author_name": "Matteo Cacciola",
-    "plugin_url": "https://github.com/matteocacciola/grinning-cat-core",
+    "plugin_url": "https://github.com/Grinning-Cat-RAG/grinning-cat-core",
     "tags": "core, webhooks",
     "thumb": "",
     "version": "0.0.1"

@@ -3,7 +3,6 @@ import mimetypes
 import os
 from io import BytesIO
 from typing import Dict, List
-
 import httpx
 from fastapi import APIRouter, BackgroundTasks, Form, UploadFile
 from pydantic import BaseModel, Field
@@ -70,27 +69,15 @@ async def _on_upload_single_file(
             # upload file to long-term memory through the configured ingestion
             # engine (a plugin may replace the flow with its own phase machine;
             # the default engine wraps the original rabbit_hole.ingest_file)
-            from cat.services.factory.ingestion import resolve_ingestion_engine
-
-            engine = await resolve_ingestion_engine(lizard)
-            if engine is not None:
-                await engine.ingest_file(
-                    cat=cat,
-                    file=file_bytes,
-                    filename=filename,
-                    content_type=content_type,
-                    metadata=metadata or {},
-                    store_file=True,
-                )
-            else:
-                # fallback: no engine resolvable -> original upstream flow
-                await lizard.rabbit_hole.ingest_file(
-                    cat=cat,
-                    file=file_bytes,
-                    filename=filename,
-                    content_type=content_type,
-                    metadata=metadata or {},
-                )
+            engine = await lizard.ingestion()
+            await engine.ingest_file(
+                cat=cat,
+                file=file_bytes,
+                filename=filename,
+                content_type=content_type,
+                metadata=metadata or {},
+                store_file=True,
+            )
     finally:
         if os.path.exists(path):
             os.remove(path)
@@ -199,13 +186,10 @@ async def upload_url(
             # resolve the configured ingestion engine and upload the URL in the
             # background through it (a plugin may replace the flow; the default
             # engine wraps the original rabbit_hole.ingest_file)
-            from cat.services.factory.ingestion import resolve_ingestion_engine
-
-            engine = await resolve_ingestion_engine(info.lizard)
-            ingest_callable = engine.ingest_file if engine is not None else info.lizard.rabbit_hole.ingest_file
+            engine = await info.lizard.ingestion()
             run_background_task(
                 background_tasks,
-                ingest_callable,
+                engine.ingest_file,
                 cat=info.stray_cat or info.cheshire_cat,
                 file=upload_config.url,
                 metadata=upload_config.metadata,

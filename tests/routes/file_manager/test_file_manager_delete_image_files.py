@@ -5,11 +5,11 @@ from cat.routes.file_manager import delete_file
 
 
 async def test_delete_file_fires_image_cascade_hook(monkeypatch):
-    """Deleting a source file must fire ``before_file_manager_file_delete`` so the
-    multimodal_ingestion plugin cascade-removes its extracted-image files.
+    """Deleting a source file must fire ``before_file_manager_file_delete`` so a
+    plugin can cascade-remove its extracted-image files.
 
     The core only wires the hook BEFORE the memory points are deleted; the actual
-    image-file cascade lives in the plugin (covered in test_multimodal_ingestion.py).
+    image-file cascade lives in the plugin that answers the hook.
     """
     removed_files = []
     deleted_points = []

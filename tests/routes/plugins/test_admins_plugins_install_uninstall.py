@@ -4,14 +4,15 @@ from cat.db import crud
 from cat.db.cruds import plugins as crud_plugins
 from cat.db.database import DEFAULT_SYSTEM_KEY
 
-from tests.utils import api_key, agent_id, just_installed_plugin
+from tests.utils import agent_core_plugins, api_key, agent_id, just_installed_plugin
 
 
 # NOTE: here we test zip upload and install
 # installation from registry is in `./test_plugins_registry.py`
 async def test_plugin_install_from_zip(lizard, secure_client, secure_client_headers, cheshire_cat):
     await just_installed_plugin(secure_client, secure_client_headers)
-    core_plugins = lizard.plugin_manager.get_core_plugins_ids
+    # only the agent-visible core plugins: system plugins are hidden at an agent level
+    core_plugins = agent_core_plugins(lizard.plugin_manager)
 
     # during tests, the cat uses a different folder for plugins
     mock_plugin_final_folder = "tests/mocks/mock_plugin_folder/mock_plugin"
@@ -41,7 +42,7 @@ async def test_plugin_install_from_zip(lizard, secure_client, secure_client_head
     installed_plugins = response.json()["installed"]
     installed_plugins_names = list(map(lambda p_: p_["id"], installed_plugins))
     assert "mock_plugin" in installed_plugins_names
-    assert len(installed_plugins_names) == len(core_plugins) + 1  # all
+    assert len(installed_plugins_names) == len(core_plugins) + 1
     # core plugins are active, mock_plugin is not at an agent level
     for p in installed_plugins:
         assert isinstance(p["local_info"]["active"], bool)
@@ -59,7 +60,8 @@ async def test_plugin_install_from_zip(lizard, secure_client, secure_client_head
 async def test_plugin_install_after_cheshire_cat_creation(lizard, secure_client, secure_client_headers, cheshire_cat):
     # create a new agent
     ccat = await lizard.create_cheshire_cat("agent_test_test")
-    core_plugins = lizard.plugin_manager.get_core_plugins_ids
+    # only the agent-visible core plugins: system plugins are hidden at an agent level
+    core_plugins = agent_core_plugins(lizard.plugin_manager)
 
     # list the plugins as an agent: mock_plugin is not installed yet
     response = await secure_client.get(
@@ -90,7 +92,8 @@ async def test_create_cheshire_cat_after_plugin_install(lizard, secure_client, s
 
     # create a new agent
     ccat = await lizard.create_cheshire_cat("agent_test_test")
-    core_plugins = lizard.plugin_manager.get_core_plugins_ids
+    # only the agent-visible core plugins: system plugins are hidden at an agent level
+    core_plugins = agent_core_plugins(lizard.plugin_manager)
 
     # now, lists the plugins as an agent (new plugins are installed but deactivated, initially)
     response = await secure_client.get(

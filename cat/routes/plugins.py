@@ -23,7 +23,7 @@ from cat.routes.routes_utils import (
     DeletePluginResponse,
     InstallPluginFromRegistryResponse,
     create_plugin_manifest,
-    run_background_task,
+    run_background_task, UpsertSettingResponse,
 )
 from cat.utils import get_allowed_plugins_mime_types, write_temp_file
 
@@ -42,7 +42,13 @@ async def get_cheshirecat_available_plugins(
     if query is not None:
         query = slugify(query, separator="_")
 
-    return await get_available_plugins(info.lizard.plugin_registry, info.cheshire_cat.plugin_manager, query)  # type: ignore[union-attr]
+    ccat = info.cheshire_cat
+    return await get_available_plugins(
+        info.lizard.plugin_registry,
+        ccat.plugin_manager,
+        ccat.agent_key,
+        query
+    )
 
 
 @router.put("/toggle/{plugin_id}", response_model=TogglePluginResponse)
@@ -57,7 +63,7 @@ async def toggle_plugin_cheshirecat(
     ccat = info.cheshire_cat
 
     # check if plugin exists
-    if not ccat.plugin_manager.plugin_exists(plugin_id):  # type: ignore[union-attr]
+    if not ccat.is_plugin_manageable(plugin_id):
         raise CustomNotFoundException("Plugin not found")
 
     # toggle plugin
@@ -84,25 +90,25 @@ async def get_cheshirecat_plugin_settings(
     plugin_id = slugify(plugin_id, separator="_")
 
     ccat = info.cheshire_cat
-    if not ccat.plugin_exists(plugin_id):  # type: ignore[union-attr]
+    if not ccat.is_plugin_manageable(plugin_id):
         raise CustomNotFoundException("Plugin not found")
 
     reveal = has_write_permission(info.user.permissions, AuthResource.PLUGIN)
     return await get_plugin_settings(ccat.plugin_manager, plugin_id, ccat.agent_key, reveal=reveal)  # type: ignore[union-attr]
 
 
-@router.put("/settings/{plugin_id}", response_model=GetSettingResponse)
+@router.put("/settings/{plugin_id}", response_model=UpsertSettingResponse)
 async def upsert_cheshirecat_plugin_settings(
     plugin_id: str,
     payload: Dict = Body({"setting_a": "some value", "setting_b": "another value"}),
     info: AuthorizedInfo = check_permissions(AuthResource.PLUGIN, AuthPermission.WRITE),
-) -> GetSettingResponse:
+) -> UpsertSettingResponse:
     """Updates the settings of a specific plugin"""
     plugin_id = slugify(plugin_id, separator="_")
 
     # access cat instance
     ccat = info.cheshire_cat
-    if not ccat.plugin_exists(plugin_id):  # type: ignore[union-attr]
+    if not ccat.is_plugin_manageable(plugin_id):
         raise CustomNotFoundException("Plugin not found")
 
     # Get the plugin object
@@ -116,14 +122,14 @@ async def upsert_cheshirecat_plugin_settings(
     final_settings = await plugin.save_settings(payload, ccat.agent_key)  # type: ignore[union-attr]
     await ccat.plugin_manager.execute_hook("after_plugin_settings_update", plugin_id, final_settings, caller=ccat)  # type: ignore[union-attr]
 
-    return GetSettingResponse(name=plugin_id, value=final_settings)
+    return UpsertSettingResponse(name=plugin_id, value=final_settings)
 
 
-@router.post("/settings/{plugin_id}", response_model=GetSettingResponse)
+@router.post("/settings/{plugin_id}", response_model=UpsertSettingResponse)
 async def reset_cheshirecat_plugin_settings(
     plugin_id: str,
     info: AuthorizedInfo = check_permissions(AuthResource.PLUGIN, AuthPermission.WRITE),
-) -> GetSettingResponse:
+) -> UpsertSettingResponse:
     """Resets the settings of a specific plugin"""
     plugin_id = slugify(plugin_id, separator="_")
 
@@ -134,13 +140,13 @@ async def reset_cheshirecat_plugin_settings(
 
     # access cat instance
     ccat = info.cheshire_cat
-    if not ccat.plugin_exists(plugin_id):  # type: ignore[union-attr]
+    if not ccat.is_plugin_manageable(plugin_id):
         raise CustomNotFoundException("Plugin not found")
 
     await crud_plugins.set_setting(ccat.agent_key, plugin_id, factory_settings)  # type: ignore[union-attr]
     await ccat.plugin_manager.execute_hook("after_plugin_settings_update", plugin_id, factory_settings, caller=ccat)  # type: ignore[union-attr]
 
-    return GetSettingResponse(name=plugin_id, value=factory_settings)
+    return UpsertSettingResponse(name=plugin_id, value=factory_settings)
 
 
 @router.get("/installed", response_model=GetAvailablePluginsResponse)
@@ -154,7 +160,13 @@ async def get_lizard_available_plugins(
     if query is not None:
         query = slugify(query, separator="_")
 
-    return await get_available_plugins(info.lizard.plugin_registry, info.lizard.plugin_manager, query)
+    lizard = info.lizard
+    return await get_available_plugins(
+        lizard.plugin_registry,
+        lizard.plugin_manager,
+        lizard.agent_key,
+        query=query,
+    )
 
 
 @router.post("/install/upload", response_model=InstallPluginResponse)

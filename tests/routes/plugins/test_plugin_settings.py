@@ -1,6 +1,4 @@
-from cat.core_plugins.mgmt_message.settings import PluginSettings
-
-from tests.utils import just_installed_plugin
+from tests.utils import agent_core_plugins, just_installed_plugin
 from tests.mocks.mock_plugin.mock_plugin_overrides import MockPluginSettings
 
 
@@ -10,12 +8,17 @@ async def test_get_all_plugin_settings(lizard, secure_client, secure_client_head
     response = await secure_client.get("/plugins/settings", headers=secure_client_headers)
     json = response.json()
 
-    core_plugins = lizard.plugin_manager.get_core_plugins_ids
-    available_plugins = core_plugins + ["mock_plugin"]
+    plugin_manager = lizard.plugin_manager
+    available_plugins = agent_core_plugins(plugin_manager) + ["mock_plugin"]
 
     assert response.status_code == 200
     assert isinstance(json["settings"], list)
     assert len(json["settings"]) == len(available_plugins)
+
+    # system plugins are not manageable at an agent level: they are not listed here
+    assert plugin_manager.get_untoggling_plugin_ids
+    for system_plugin in plugin_manager.get_untoggling_plugin_ids:
+        assert system_plugin not in [s["name"] for s in json["settings"]]
 
     for setting in json["settings"]:
         assert setting["name"] in available_plugins
@@ -27,16 +30,6 @@ async def test_get_all_plugin_settings(lizard, secure_client, secure_client_head
                 "enable_llm_knowledge": True,
                 "fast_reply_message": "Sorry, I have no memories about that.",
             }
-        elif setting["name"] == "white_rabbit":
-            assert setting["value"] == {"embed_procedures_every_n_days": 7}
-        elif setting["name"] == "mgmt_message":
-            assert setting["value"] == {
-                "management_message": "",
-                "management_active": False,
-                "global_message": "",
-                "show_global_msg": False,
-            }
-            assert setting["scheme"] == PluginSettings.model_json_schema()
         else:
             assert setting["value"] == {}
             assert setting["scheme"] == {}
@@ -110,27 +103,22 @@ async def test_save_plugin_settings(secure_client, secure_client_headers, cheshi
     assert saved_config[0]["value"] == fake_settings
 
 
-# base_plugin has no settings and ignores them when saved (for the moment)
 async def test_base_plugin_settings(secure_client, secure_client_headers, cheshire_cat):
-    # write a new setting, and then overwrite it (base_plugin should ignore this)
+    """base_plugin is a system plugin: an agent can neither read nor write its settings.
+
+    They stay reachable on the system routes (see test_admins_plugin_settings.py).
+    """
     fake_settings = {"a": "a", "b": 1}
 
-    # save settings
-    response = await secure_client.put("/plugins/settings/base_plugin", json=fake_settings, headers=secure_client_headers)
+    response = await secure_client.put(
+        "/plugins/settings/base_plugin", json=fake_settings, headers=secure_client_headers
+    )
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Plugin not found"
 
-    # check immediate response
-    json = response.json()
-    assert response.status_code == 200
-    assert json["name"] == "base_plugin"
-    assert json["value"] == {}
-
-    # get settings back (should be empty as base_plugin does not (yet) accept settings
     response = await secure_client.get("/plugins/settings/base_plugin", headers=secure_client_headers)
-    json = response.json()
-    assert response.status_code == 200
-    assert json["name"] == "base_plugin"
-    assert json["value"] == {}
-    assert json["scheme"] == {}
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Plugin not found"
 
 
 async def test_reset_plugin_settings(secure_client, secure_client_headers, cheshire_cat):

@@ -155,66 +155,44 @@ async def test_plugin_uninstall(lizard, plugin_is_flat):
         assert p in core_plugins
 
 
-async def test_ingestion_status_is_untoggling_and_forced_active(lizard):
-    """ingestion_status must be always-on: part of the untoggling set, so it is
-    force-added to every agent's active_plugins (even ones that previously
-    customized the list without it) and cannot be deactivated."""
+async def test_system_plugins_are_forced_active(lizard):
+    """System (untoggling) plugins must be always-on: they are force-added to every
+    agent's active_plugins, even to agents that previously customized the list
+    without them."""
     plugin_manager = lizard.plugin_manager
+    system_plugins = plugin_manager.get_untoggling_plugin_ids
 
-    assert "ingestion_status" in plugin_manager.get_untoggling_plugin_ids
+    assert system_plugins
+    for plugin_id in system_plugins:
+        assert plugin_manager.is_system_plugin(plugin_id)
 
-    # Simulate an agent that customized active_plugins WITHOUT ingestion_status
+    # Simulate an agent that customized active_plugins WITHOUT any system plugin
     from cat.db.cruds import settings as crud_settings
     from cat.db.models import Setting
 
-    customized = [p for p in plugin_manager.get_core_plugins_ids if p != "ingestion_status"]
+    customized = [p for p in plugin_manager.get_core_plugins_ids if p not in system_plugins]
     await crud_settings.upsert_setting_by_name(
         plugin_manager.agent_key, Setting(name="active_plugins", value=customized)
     )
 
     active_plugins = await plugin_manager.load_active_plugins_ids_from_db()
-    assert "ingestion_status" in active_plugins
-
-    # registered hooks are active
-    hook_plugins = {h.plugin_id for h in plugin_manager.hooks.get("rabbithole_ingestion_start", [])}
-    assert "ingestion_status" in hook_plugins
+    for plugin_id in system_plugins:
+        assert plugin_id in active_plugins
 
 
-async def test_ingestion_status_cannot_be_deactivated(lizard):
+async def test_system_plugins_cannot_be_deactivated(lizard):
     plugin_manager = lizard.plugin_manager
 
-    with pytest.raises(Exception, match="cannot be deactivated"):
-        await plugin_manager.toggle_plugin("ingestion_status")
+    for plugin_id in plugin_manager.get_untoggling_plugin_ids:
+        with pytest.raises(Exception, match="cannot be deactivated"):
+            await plugin_manager.toggle_plugin(plugin_id)
 
 
-async def test_multimodal_ingestion_is_untoggling_and_forced_active(lizard):
-    """multimodal_ingestion must be always-on so its file-deletion cascade is
-    registered on pre-existing agents too (the ones whose active_plugins list
-    was seeded before that core plugin existed). Without this, deleting a file
-    from which images were extracted never removes the image files."""
+async def test_non_system_core_plugins_are_not_system(lizard):
     plugin_manager = lizard.plugin_manager
 
-    assert "multimodal_ingestion" in plugin_manager.get_untoggling_plugin_ids
+    toggleable = [p for p in plugin_manager.get_core_plugins_ids if p not in plugin_manager.get_untoggling_plugin_ids]
 
-    # Simulate an agent that customized active_plugins WITHOUT multimodal_ingestion
-    from cat.db.cruds import settings as crud_settings
-    from cat.db.models import Setting
-
-    customized = [p for p in plugin_manager.get_core_plugins_ids if p != "multimodal_ingestion"]
-    await crud_settings.upsert_setting_by_name(
-        plugin_manager.agent_key, Setting(name="active_plugins", value=customized)
-    )
-
-    active_plugins = await plugin_manager.load_active_plugins_ids_from_db()
-    assert "multimodal_ingestion" in active_plugins
-
-    # registered hooks are active (including the deletion cascade)
-    hook_plugins = {h.plugin_id for h in plugin_manager.hooks.get("before_file_manager_file_delete", [])}
-    assert "multimodal_ingestion" in hook_plugins
-
-
-async def test_multimodal_ingestion_cannot_be_deactivated(lizard):
-    plugin_manager = lizard.plugin_manager
-
-    with pytest.raises(Exception, match="cannot be deactivated"):
-        await plugin_manager.toggle_plugin("multimodal_ingestion")
+    assert toggleable
+    for plugin_id in toggleable:
+        assert not plugin_manager.is_system_plugin(plugin_id)

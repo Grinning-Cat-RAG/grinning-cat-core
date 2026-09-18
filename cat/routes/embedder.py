@@ -13,21 +13,6 @@ from cat.routes.routes_utils import (
 from cat.services.service_factory import ServiceFactory
 
 
-async def _run_ingestion_on_embedder_change(lizard) -> None:
-    """Re-embed pass on embedder change, via the replaceable ingestion engine.
-
-    The engine is resolved through the ServiceFactory (``ingestion``
-    category): the core provides ``BaseIngestionConfiguration`` (upstream
-    parity) and plugins can register more efficient implementations through
-    the ``factory_allowed_ingestions`` hook.
-    """
-    from cat.services.factory.ingestion import resolve_ingestion_engine
-
-    engine = await resolve_ingestion_engine(lizard)
-    if engine is not None:
-        await engine.run(lizard)
-
-
 router = APIRouter(tags=["Embedder"], prefix="/embedder")
 
 
@@ -93,9 +78,10 @@ async def upsert_embedder_setting(
     # a characterizing feature of the embedder has been updated: run the
     # replaceable ingestion engine (factory: ingestion category)
     if previous_embedder != current_embedder:
+        engine = await lizard.ingestion()
         run_background_task(
             background_tasks,
-            _run_ingestion_on_embedder_change,
+            engine.run,
             info.lizard,
         )
 

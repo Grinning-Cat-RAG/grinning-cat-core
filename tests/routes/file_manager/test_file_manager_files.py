@@ -1,10 +1,9 @@
 import asyncio
 import io
 
-from cat.core_plugins.ingestion_status.registry import get_status, set_status
 from cat.services.memory.models import VectorMemoryType
 
-from tests.utils import agent_id, send_file, get_memory_contents
+from tests.utils import send_file, get_memory_contents
 
 
 async def check_file_deleted(secure_client, secure_client_headers, collection: VectorMemoryType, ch_id = None):
@@ -24,11 +23,6 @@ async def check_file_deleted(secure_client, secure_client_headers, collection: V
     headers = secure_client_headers
     if ch_id:
         headers |= {"X-Chat-ID": ch_id}
-
-    # seed an ingestion-status row for the file: deleting the file must also
-    # delete its status row, so a stale processing/completed row cannot linger
-    scope = str(ch_id) if ch_id else "agent"
-    await set_status(agent_id, scope, "sample.pdf", type_="file", status="completed")
 
     # check memory contents
     memories = await get_memory_contents(secure_client, headers, collection)
@@ -50,9 +44,6 @@ async def check_file_deleted(secure_client, secure_client_headers, collection: V
     assert isinstance(json["deleted"], bool)
     memories = await get_memory_contents(secure_client, headers, collection)
     assert len(memories) == 0
-
-    # the ingestion-status row was removed along with the file
-    assert await get_status(agent_id, scope, "sample.pdf") is None
 
     # check that the file does not exist anymore in the list of files
     res = await secure_client.request("GET", "/file_manager/", headers=headers)

@@ -2,7 +2,7 @@
     "name": "Cat Analytics",
     "description": "Track the consumed embedding and token usage of your Cat instance.",
     "author_name": "Matteo Cacciola",
-    "plugin_url": "https://github.com/matteocacciola/grinning-cat-core",
+    "plugin_url": "https://github.com/Grinning-Cat-RAG/grinning-cat-core",
     "tags": "core, analytics, embedding, token-usage",
     "thumb": "",
     "version": "0.0.1",

@@ -11,7 +11,7 @@ from pydantic import BaseModel
 
 from cat import utils
 from cat.auth.permissions import AuthPermission, AuthResource
-from cat.db.database import get_async_db
+from cat.db.database import get_async_db, DEFAULT_SYSTEM_KEY
 from cat.env import get_env_float
 from cat.exceptions import CustomValidationException, CustomUnauthorizedException
 from cat.looking_glass.mad_hatter.mad_hatter import MadHatter
@@ -146,6 +146,7 @@ def create_plugin_manifest(
 async def get_available_plugins(
     plugin_registry: PluginRegistry,
     plugin_manager: MadHatter,
+    agent_id: str,
     query: str = None,
     # author: str = None, to be activated in case of more granular search
     # tag: str = None, to be activated in case of more granular search
@@ -168,11 +169,13 @@ async def get_available_plugins(
 
     # get active plugins
     active_plugins_ids = await plugin_manager.load_active_plugins_ids_from_db()
+    excluded_plugin_ids = plugin_manager.get_untoggling_plugin_ids if agent_id != DEFAULT_SYSTEM_KEY else []
 
     # list installed plugins' manifest
     installed_plugins = [
         create_plugin_manifest(p, active_plugins_ids, registry_plugins_index, query)
         for p in (await plugin_manager.available_plugins()).values()
+        if p.id not in excluded_plugin_ids
     ]
 
     return GetAvailablePluginsResponse(
@@ -186,11 +189,22 @@ async def get_available_plugins(
     )
 
 
-async def get_plugins_settings(plugin_manager: MadHatter, agent_id: str, reveal: bool = True) -> PluginsSettingsResponse:
+async def get_plugins_settings(
+    plugin_manager: MadHatter,
+    agent_id: str,
+    reveal: bool = True
+) -> PluginsSettingsResponse:
     settings = []
 
     # plugins are managed by the MadHatter class (and its inherits)
     for plugin in plugin_manager.plugins.values():
+        # system plugins are not manageable at an agent level: they are hidden from the
+        # agent's listing, exactly as `get_available_plugins` does, and their per-plugin
+        # routes answer 404 (see `CheshireCat.is_plugin_manageable`). At a system level
+        # they are visible, as every `/plugins/system/*` route only checks existence.
+        if agent_id != DEFAULT_SYSTEM_KEY and plugin_manager.is_system_plugin(plugin.id):
+            continue
+
         try:
             plugin_settings = await plugin.load_settings(agent_id)
             plugin_schema = plugin.settings_schema()

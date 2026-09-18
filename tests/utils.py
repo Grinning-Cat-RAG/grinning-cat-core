@@ -212,3 +212,13 @@ async def just_installed_plugin(client, headers, activate = False, plugin_id = "
 async def http_message(client, message: Dict, headers = None):
     response = await client.post("/message", headers=headers, json=message)
     return response.status_code, response.json()
+
+
+def agent_core_plugins(plugin_manager) -> list:
+    """Core plugins an agent can see and manage.
+
+    System (untoggling) plugins are always-on and off-limits at an agent level: they are
+    hidden from `/plugins/` and `/plugins/settings`, and their per-plugin routes answer 404.
+    They are still fully visible on the `/plugins/system/*` routes.
+    """
+    return [p for p in plugin_manager.get_core_plugins_ids if not plugin_manager.is_system_plugin(p)]

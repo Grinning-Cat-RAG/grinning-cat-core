@@ -14,6 +14,7 @@ class AuthResource(Enum):
     SYSTEM = "SYSTEM"
     CHESHIRE_CAT = "CHESHIRE_CAT"
     EMBEDDER = "EMBEDDER"
+    INGESTION = "INGESTION"
     MEMORY = "MEMORY"
     CHAT = "CHAT"
     SETTING = "SETTING"

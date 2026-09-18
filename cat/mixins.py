@@ -13,6 +13,7 @@ from cat.services.factory.chunker import BaseChunker
 from cat.services.factory.context_retriever import BaseContextRetriever
 from cat.services.factory.embedder import Embeddings
 from cat.services.factory.file_manager import BaseFileManager
+from cat.services.factory.ingestion import BaseIngestionEngine
 from cat.services.factory.llm import LargeLanguageModel
 from cat.services.factory.vector_db import BaseVectorDatabaseHandler
 from cat.services.service_provider import ServiceProvider
@@ -99,6 +100,9 @@ class OrchestratorMixin(ContextMixin, ABC):
     """
     async def embedder(self) -> Embeddings:
         return await self.service_provider.get_embedder(self.agent_key, self.mad_hatter)
+
+    async def ingestion(self) -> BaseIngestionEngine:
+        return await self.service_provider.get_ingestion(self.agent_key, self.mad_hatter)
 
 
 class BotMixin(ContextMixin, ABC):

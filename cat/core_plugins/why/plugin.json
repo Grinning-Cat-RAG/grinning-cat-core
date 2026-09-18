@@ -2,7 +2,7 @@
     "name": "The Why",
     "description": "Add the context and the reasoning behind the answers of the LLM.",
     "author_name": "Matteo Cacciola",
-    "plugin_url": "https://github.com/matteocacciola/grinning-cat-core",
+    "plugin_url": "https://github.com/Grinning-Cat-RAG/grinning-cat-core",
     "tags": "core, default, reasoning, context, why",
     "thumb": "",
     "version": "0.0.1"

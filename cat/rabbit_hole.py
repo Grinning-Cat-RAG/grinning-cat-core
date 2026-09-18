@@ -492,6 +492,9 @@ class RabbitHole:
         embedder = await self.cat.lizard.embedder()
         plugin_manager = self.cat.plugin_manager
 
+        # `metadata` is documented as optional: normalize it before the dict merge below
+        metadata = metadata or {}
+
         # add custom metadata (sent via endpoint) and default metadata (source and when and eventual chat_id)
         for doc in docs:
             # Drop the transient parser image payload, if any: images are embedded and

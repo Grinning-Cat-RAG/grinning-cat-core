@@ -425,3 +425,7 @@ class CheshireCat(BotMixin, NonCopyableMixin):
             agent_id (str): The unique identifier of the cat.
         """
         return self._id
+
+    def is_plugin_manageable(self, plugin_id: str) -> bool:
+        """Whether the agent can manage the plugin: system plugins are off-limits at an agent level."""
+        return self.plugin_manager.plugin_exists(plugin_id) and not self.plugin_manager.is_system_plugin(plugin_id)

@@ -2,7 +2,7 @@
     "name": "March Hare",
     "description": "Handling events via Redis Stream.",
     "author_name": "Matteo Cacciola",
-    "plugin_url": "https://github.com/matteocacciola/grinning-cat-core",
+    "plugin_url": "https://github.com/Grinning-Cat-RAG/grinning-cat-core",
     "tags": "core, default, cat, redis stream, event management, plugin, management, event bus",
     "thumb": "",
     "version": "0.0.1"

@@ -17,10 +17,18 @@ from cat.core_plugins.base_plugin.file_managers.configs import LocalFileManagerC
 
 @hook(priority=0)
 def factory_allowed_ingestions(allowed, lizard):
-    """Hook to extend the list of supported ingestion (re-embed) engines.
+    """Hook to extend the list of supported ingestion engines.
 
-    The ``efficient_ingestion`` core plugin registers its
-    ``EfficientIngestionConfiguration`` here. No-op default.
+    A plugin registers its own ``BaseIngestionConfiguration`` subclass here to
+    replace the whole ingestion lifecycle (file upload and the re-embed pass on
+    embedder change). No-op default: only the core engine is allowed.
+
+    Args:
+        allowed: List of BaseIngestionConfiguration classes
+        lizard: BillTheLizard instance
+
+    Returns:
+        list of allowed BaseIngestionConfiguration classes for the ingestion engines
     """
     return allowed
 

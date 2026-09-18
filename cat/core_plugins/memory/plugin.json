@@ -2,7 +2,7 @@
     "name": "Memories",
     "description": "Interacting with Working Memory and adding a handler to trace the activities of the Embedder.",
     "author_name": "Matteo Cacciola",
-    "plugin_url": "https://github.com/matteocacciola/grinning-cat-core",
+    "plugin_url": "https://github.com/Grinning-Cat-RAG/grinning-cat-core",
     "tags": "core, default, memory, context, reasoning, llm",
     "thumb": "",
     "version": "0.0.1"

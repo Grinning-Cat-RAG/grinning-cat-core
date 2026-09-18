@@ -352,19 +352,26 @@ async def delete_conversation(agent_id: str, user_id: str, chat_id: str):
         raise
 
 
-async def delete_conversations(agent_id: str, user_id: str):
+async def delete_conversations(agent_id: str, user_id: str) -> int:
     """
     Delete all conversations for a specific user and agent.
+
+    The conversations are stored one key per chat, so the removal is pattern-based
+    (``crud.destroy``): ``crud.delete`` targets a single exact key and would leave
+    every conversation behind, matching nothing for a wildcard.
 
     Args:
         agent_id: ID of the chatbot.
         user_id: ID of the user.
 
+    Returns:
+        Number of conversations deleted.
+
     Raises:
         RedisError: If Redis connection fails.
     """
     try:
-        return await crud.delete(format_key(agent_id, user_id, "*"))
+        return await crud.destroy(format_key(agent_id, user_id, "*"))
     except RedisError as e:
         log.error(f"Redis error deleting conversations for {agent_id}:{user_id}: {e}")
         raise
