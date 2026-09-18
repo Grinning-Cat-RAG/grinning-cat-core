@@ -1,0 +1,6 @@
+# Line endings are LF, everywhere, whoever clones and from whatever
+# machine. Without this the answer is core.autocrlf on the cloning
+# machine, so two contributors disagree about what counts as a change.
+# The code runs on Linux: the CI is ubuntu-latest and the database is a
+# container.
+* text=auto eol=lf
