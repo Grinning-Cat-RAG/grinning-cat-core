@@ -174,7 +174,7 @@ def create_app() -> FastAPI:
     @app.exception_handler(ManagementModeException)
     async def management_mode_exception_handler(request, exc):
         log.info("System in management mode")
-        return JSONResponse(status_code=403, content={"detail": str(exc)})
+        return JSONResponse(status_code=404, content={"detail": str(exc)})
 
 
     @app.exception_handler(CustomUnauthorizedException)

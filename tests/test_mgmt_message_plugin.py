@@ -7,11 +7,12 @@ Coverage:
 (a2) the plugin belongs to the system agent alone: no agent carries it among
     its active plugins, and no ``agents:<id>:plugins:mgmt_message`` key is
     written,
-(b) the management gate: the real ``auth_request`` hook denies unprivileged
-    principals when ``management_active`` is true by raising
-    ``ManagementModeException`` (a ``CustomForbiddenException``), translated
-    by ``ConnectionAuth`` into ``CustomForbiddenException`` (HTTP) /
-    ``WebSocketException(code=1008)`` (WS),
+(b) the management gate: with ``management_active`` true every route other
+    than the plugin's own ones answers as if it did not exist — the real
+    ``auth_request`` hook raises ``ManagementModeException`` (a
+    ``CustomNotFoundException``, so a 404) for every principal, admins
+    included, translated by ``ConnectionAuth`` into ``CustomNotFoundException``
+    (HTTP) / ``WebSocketException(code=1008)`` (WS),
 (c) the read paths return the 4 settings in normal mode: the core's
     ``GET /plugins/system/settings/mgmt_message`` (the RITA read path) and the
     plugin's own ``GET /mgmt_message/settings``, which also serves the schema,
@@ -40,7 +41,7 @@ from cat.db.cruds import plugins as crud_plugins
 from cat.db.cruds import settings as crud_settings
 from cat.db.database import DEFAULT_AGENT_KEY, DEFAULT_SYSTEM_KEY, get_sync_db
 from cat.db.models import Setting
-from cat.exceptions import CustomForbiddenException, ManagementModeException
+from cat.exceptions import CustomNotFoundException, ManagementModeException
 from tests.utils import get_client_admin_headers
 
 # the plugin id (folder name) and the key its settings live on
@@ -153,16 +154,45 @@ async def test_auth_request_denies_unprivileged_when_active():
         await auth_request.function(_make_user(), "system", None)
 
     assert exc_info.value.args[0] == message
-    assert isinstance(exc_info.value, CustomForbiddenException)  # still a 403
+    assert isinstance(exc_info.value, CustomNotFoundException)  # the route is gone: 404
     await _cleanup()
 
 
-async def test_auth_request_allows_system_principal_when_active():
+async def test_auth_request_denies_the_system_principal_too():
+    """Management mode is not a permission check: nobody is exempt, or the
+    instance would still be serving the very routes it is meant to close."""
     await _store({"management_message": "Sistema in manutenzione", "management_active": True})
 
-    result = await auth_request.function(_make_admin_user(), "system", None)
+    with pytest.raises(ManagementModeException):
+        await auth_request.function(_make_admin_user(), "system", None)
+
+    await _cleanup()
+
+
+@pytest.mark.parametrize("path", ["/mgmt_message/settings", "/mgmt_message/global_message"])
+async def test_auth_request_allows_the_plugins_own_endpoints(lizard, path):
+    """They answer whatever the principal: they are the only way to read the
+    management message and to switch the mode back off."""
+    await _store({"management_message": "Sistema in manutenzione", "management_active": True})
+
+    connection = _FakeConnection()
+    connection.url = SimpleNamespace(path=path)
+
+    result = await auth_request.function(_make_user(), "system", connection, lizard=lizard)
 
     assert result is None
+    await _cleanup()
+
+
+async def test_auth_request_denies_a_path_that_only_looks_like_the_plugins(lizard):
+    await _store({"management_message": "Sistema in manutenzione", "management_active": True})
+
+    connection = _FakeConnection()
+    connection.url = SimpleNamespace(path="/mgmt_message/settings/extra")
+
+    with pytest.raises(ManagementModeException):
+        await auth_request.function(_make_user(), "system", connection, lizard=lizard)
+
     await _cleanup()
 
 
@@ -171,15 +201,20 @@ async def test_auth_request_allows_system_principal_when_active():
 # ---------------------------------------------------------------------------
 
 class _RealHookPluginManager:
-    """Plugin-manager stand-in that executes the real ``auth_request`` hook."""
+    """Plugin-manager stand-in that executes the real ``auth_request`` hook.
 
-    def __init__(self, hooks):
+    ``caller`` is passed to the hook under the context name, exactly like
+    ``MadHatter.execute_hook`` does, or the hook would not see the lizard.
+    """
+
+    def __init__(self, hooks, plugins=None):
         self.hooks = hooks
+        self.plugins = plugins or {}
 
-    async def execute_hook(self, hook_name, *args, **kwargs):
+    async def execute_hook(self, hook_name, *args, caller=None, **kwargs):
         tea_cup = args[0]
         for hook in self.hooks[hook_name]:
-            result = await hook.function(tea_cup, *args[1:], **kwargs)
+            result = await hook.function(tea_cup, *args[1:], lizard=caller, **kwargs)
             if result is not None:
                 tea_cup = result
         return tea_cup
@@ -240,7 +275,7 @@ async def test_http_gateway_denial_with_real_hook(monkeypatch):
     connection = _make_connection(lizard, scope_type="http")
 
     auth = HTTPAuth(resource=AuthResource.CHAT, permission=AuthPermission.WRITE)
-    with pytest.raises(CustomForbiddenException) as exc_info:
+    with pytest.raises(CustomNotFoundException) as exc_info:
         await auth(connection)
 
     assert exc_info.value.args[0] == message
@@ -265,9 +300,29 @@ async def test_websocket_gateway_denial_with_real_hook(monkeypatch):
     assert exc_info.value.reason == message
 
 
-async def test_http_gateway_allows_system_principal_with_real_hook(monkeypatch):
+async def test_http_gateway_denies_system_principal_with_real_hook(monkeypatch):
+    """Even an admin goes through the gate: only the plugin's own routes answer."""
+    message = "Sistema in manutenzione"
+
     async def fake_get_setting(key_id, plugin_id):
-        return {"management_active": True, "management_message": "Sistema in manutenzione"}
+        return {"management_active": True, "management_message": message}
+
+    monkeypatch.setattr(crud_plugins, "get_setting", fake_get_setting)
+
+    lizard = _make_lizard_with_real_hook(_make_admin_user())
+    connection = _make_connection(lizard, scope_type="http")
+
+    auth = HTTPAuth(resource=AuthResource.CHAT, permission=AuthPermission.WRITE)
+    with pytest.raises(CustomNotFoundException) as exc_info:
+        await auth(connection)
+
+    assert exc_info.value.args[0] == message
+
+
+async def test_http_gateway_allows_the_instance_out_of_management_mode(monkeypatch):
+    """With the mode off, the very same request is authorized."""
+    async def fake_get_setting(key_id, plugin_id):
+        return {"management_active": False, "management_message": "Sistema in manutenzione"}
 
     monkeypatch.setattr(crud_plugins, "get_setting", fake_get_setting)
 
@@ -401,6 +456,48 @@ async def test_put_mgmt_message_settings(client, secure_client, secure_client_he
 
     loaded = await crud_plugins.get_setting(DEFAULT_SYSTEM_KEY, PLUGIN_ID)
     assert loaded == payload
+
+    await _cleanup()
+
+
+async def test_management_mode_closes_every_route_but_the_plugins_own(client, secure_client, cheshire_cat):
+    """The contract of management mode: the instance answers only on this
+    plugin's routes, and the way back in stays open."""
+    message = "Sistema in manutenzione"
+    settings = {
+        "management_message": message,
+        "management_active": True,
+        "global_message": "",
+        "show_global_msg": False,
+    }
+    await _store(settings)
+
+    # POST /auth/token carries no auth dependency, so it never reaches the gate:
+    # an admin can still get a token and switch the mode back off
+    admin_headers = await get_client_admin_headers(client)
+
+    # a route that is not the plugin's answers as if it did not exist
+    closed = await secure_client.get("/plugins/system/settings/mgmt_message", headers=admin_headers)
+    assert closed.status_code == 404
+    assert closed.json()["detail"] == message
+
+    # the plugin's own routes keep answering
+    own = await secure_client.get("/mgmt_message/settings", headers=admin_headers)
+    assert own.status_code == 200
+    assert own.json()["value"]["management_active"] is True
+
+    public = await client.get("/mgmt_message/global_message")
+    assert public.status_code == 200
+    assert public.json()["management_message"] == message
+
+    # ...including the write that turns the mode off again
+    off = await secure_client.put(
+        "/mgmt_message/settings", headers=admin_headers, json={**settings, "management_active": False}
+    )
+    assert off.status_code == 200
+
+    reopened = await secure_client.get("/plugins/system/settings/mgmt_message", headers=admin_headers)
+    assert reopened.status_code == 200
 
     await _cleanup()
 
