@@ -1,7 +1,7 @@
 [project]
 name = "Grinning-Cat"
 description = "Production ready AI assistant framework"
-version = "2.0.0"
+version = "1.0.0"
 requires-python = ">=3.11,<3.14"
 license-files = ["LICENSE"]
 authors = [
