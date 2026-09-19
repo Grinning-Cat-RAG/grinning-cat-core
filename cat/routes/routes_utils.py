@@ -4,12 +4,13 @@ from ast import literal_eval
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Dict, List, Any, Type
-from fastapi import Query, BackgroundTasks
+from fastapi import Query, BackgroundTasks, Request
 from langchain_core.caches import InMemoryCache
 from langchain_core.globals import set_llm_cache
 from pydantic import BaseModel
 
 from cat import utils
+from cat.log import log
 from cat.auth.permissions import AuthPermission, AuthResource
 from cat.db.database import get_async_db, DEFAULT_SYSTEM_KEY
 from cat.env import get_env_float
@@ -20,6 +21,14 @@ from cat.looking_glass.mad_hatter.registry import PluginRegistry
 from cat.looking_glass.models import PluginManifest
 from cat.services.redis_search import RedisSearchService
 from cat.utils import SUFFIX_TO_CRYPT, safe_deepcopy
+
+
+def log_user_agent(request: Request) -> None:
+    """Log who is calling an unauthenticated route (health probes, public banner read).
+
+    Usable as a FastAPI dependency or called directly from an endpoint.
+    """
+    log.info(f"{request.method} {request.url.path} User-Agent: {request.headers.get('user-agent', '-')}")
 
 
 class Plugins(BaseModel):

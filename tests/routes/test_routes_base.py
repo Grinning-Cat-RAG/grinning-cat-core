@@ -1,4 +1,6 @@
-from cat import AuthPermission
+import pytest
+
+from cat import AuthPermission, log
 from cat.auth.permissions import AuthResource
 
 from cat.auth.permissions import get_full_permissions
@@ -17,6 +19,19 @@ async def test_ping_success(client):
 
     json_response = response.json()
     assert isinstance(json_response, str)
+
+
+@pytest.mark.parametrize("path", ["/health/readiness", "/health/liveness", "/mgmt_message/global_message"])
+async def test_probe_routes_log_the_user_agent(client, monkeypatch, path):
+    """Health probes and the public banner read are unauthenticated: the caller's
+    User-Agent is logged to tell which client polls them."""
+    messages = []
+    monkeypatch.setattr(log, "info", messages.append)
+
+    response = await client.get(path, headers={"User-Agent": "probe-under-test/1.0"})
+    assert response.status_code == 200
+
+    assert any(path in m and "probe-under-test/1.0" in m for m in messages)
 
 
 async def test_ping_non_admin_endpoint_with_admin(secure_client, secure_client_headers, client, cheshire_cat):

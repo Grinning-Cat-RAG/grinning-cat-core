@@ -1,5 +1,6 @@
 from typing import Any, Dict
 
+from fastapi import Request
 from pydantic import ValidationError
 
 from cat import endpoint, log
@@ -8,7 +9,7 @@ from cat.auth.permissions import AuthPermission, AuthResource, check_permissions
 from cat.db.cruds import plugins as crud_plugins
 from cat.db.database import DEFAULT_SYSTEM_KEY
 from cat.exceptions import CustomValidationException
-from cat.routes.routes_utils import UpsertSettingResponse, GetSettingResponse
+from cat.routes.routes_utils import UpsertSettingResponse, GetSettingResponse, log_user_agent
 
 from .settings import MGMT_SETTING_NAME
 
@@ -62,7 +63,7 @@ async def put_mgmt_settings(
 
 
 @endpoint.get("/global_message", prefix="/mgmt_message", tags=["Management Message"])
-async def get_global_message() -> dict[str, Any]:
+async def get_global_message(request: Request) -> dict[str, Any]:
     """Public, unauthenticated read of the plugin's global settings.
 
     Returns the 4-field settings dict stored on the system agent's plugin key
@@ -77,6 +78,7 @@ async def get_global_message() -> dict[str, Any]:
     Note: the read is intentionally limited to the 4 banner fields; the
     authenticated writes go through ``PUT /mgmt_message/settings``.
     """
+    log_user_agent(request)
     try:
         settings = await crud_plugins.get_setting(DEFAULT_SYSTEM_KEY, MGMT_SETTING_NAME)
         return settings if isinstance(settings, dict) else {}

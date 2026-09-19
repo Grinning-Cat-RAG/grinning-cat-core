@@ -36,6 +36,9 @@ class CheshireCatPluginRegistry(PluginRegistry):
             # TODO: registry should sort plugins by score, until then we sort here at random
             random.shuffle(manifests)
             return manifests
+        except httpx.ReadTimeout as e:
+            log.warning(f"Timeout while calling plugins registry: {e}")
+            return []
         except Exception as e:
             log.error(f"Error while calling plugins registry: {e}")
             return []

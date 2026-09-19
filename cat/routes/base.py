@@ -2,7 +2,7 @@ import json
 from typing import Dict, List
 import jwt
 import tomli
-from fastapi import APIRouter, Body, Request
+from fastapi import APIRouter, Body, Depends, Request
 from fastapi_healthz import (
     HealthCheckRegistry,
     HealthCheckRedis,
@@ -20,6 +20,7 @@ import cat.db.cruds.settings as crud_settings
 from cat.db.database import DEFAULT_SYSTEM_KEY, get_db_connection_string
 from cat.exceptions import CustomUnauthorizedException, CustomNotFoundException
 from cat.looking_glass import StrayCat, ChatResponse
+from cat.routes.routes_utils import log_user_agent
 from cat.services.memory.messages import UserMessage
 
 router = APIRouter()
@@ -61,6 +62,7 @@ router.add_api_route(
     methods=["GET"],
     name="readiness_probe",
     include_in_schema=False,
+    dependencies=[Depends(log_user_agent)],
 )
 
 router.add_api_route(
@@ -69,6 +71,7 @@ router.add_api_route(
     methods=["GET"],
     name="liveness_probe",
     include_in_schema=False,
+    dependencies=[Depends(log_user_agent)],
 )
 
 
