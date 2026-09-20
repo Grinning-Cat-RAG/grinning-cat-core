@@ -49,8 +49,17 @@ The main differences are reported in the [DIFFERENCE WITH CHESHIRECAT report](do
 To make Grinning Cat run on your machine, you just need [`docker`](https://docs.docker.com/get-docker/) installed:
 
 ```bash
-docker run --rm -it -p 1865:80 ghcr.io/matteocacciola/grinning-cat-core:latest
+docker run --rm -it -p 1865:80 \
+  -e CAT_JWT_SECRET="$(python3 -c 'import secrets; print(secrets.token_urlsafe(64))')" \
+  -e CAT_REDIS_HOST=<your_redis_host> \
+  ghcr.io/matteocacciola/grinning-cat-core:latest
 ```
+
+> [!IMPORTANT]
+> The Grinning Cat **refuses to start** if a fundamental environment variable is missing or invalid (see
+> [Configuration and security](#configuration-and-security)). In particular `CAT_JWT_SECRET` has no default and
+> `CAT_REDIS_HOST` must point to a Redis Stack instance. With `docker compose up`, export `CAT_JWT_SECRET` in your
+> shell or put it in `.env` (see `.env.example`).
 - Chat with the Grinning Cat by downloading the [Admin Panel](https://www.github.com/matteocacciola/grinning-cat-admin).
 - Try out the REST API on [localhost:1865/docs](http://localhost:1865/docs).
 
@@ -76,6 +85,92 @@ Everything can be done via the [Admin Panel](https://www.github.com/matteocaccio
 
 Enjoy the Grinning Cat!
 
+# Configuration and security
+
+All settings are environment variables; the full list with defaults is in [`.env.example`](.env.example).
+
+## Startup validation and health checks
+At startup (both when the FastAPI app is created and in its lifespan), the fundamental variables are validated. Any
+error stops the process with an explicit message in the logs:
+
+| Variable                                                                                           | Rule                                                                                    |
+|----------------------------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------|
+| `CAT_JWT_SECRET`                                                                                   | **required**, at least 32 characters, not a known default (e.g. `this_is_a_secret_key`) |
+| `CAT_REDIS_HOST`                                                                                   | required                                                                                |
+| `CAT_REDIS_PORT` / `CAT_REDIS_DB`                                                                  | valid integers (port 1-65535, db >= 0)                                                  |
+| `CAT_QDRANT_HOST`                                                                                  | required                                                                                |
+| `CAT_JWT_EXPIRE_MINUTES`, `CAT_JWT_REFRESH_EXPIRE_MINUTES`, `CAT_JWT_REFRESH_MAX_LIFETIME_MINUTES` | positive numbers                                                                        |
+| `CAT_AUTH_*` rate limit variables                                                                  | positive integers                                                                       |
+| `CAT_CORS_ALLOWED_ORIGINS`                                                                         | if set, a comma separated list of valid origins (`scheme://host[:port]`)                |
+
+Only a warning is logged when `CAT_CRYPTO_KEY` / `CAT_CRYPTO_SALT` or `CAT_ADMIN_DEFAULT_PASSWORD` keep their public
+defaults, or when `CAT_API_KEY` is shorter than 16 characters. The crypto values are not enforced because settings
+already stored are encrypted with them: change them only on a fresh installation.
+
+The same validation runs on every call to `/health/liveness` and `/health/readiness`: an invalid configuration makes
+the probes answer `500` (`configuration` entity `unhealthy`). The response does not say which variable is wrong,
+since these endpoints are public: the details are in the logs.
+
+## Authentication
+Requests are authenticated with **one** of:
+- `Authorization: Bearer <token>`, where the token is either a JWT issued by `/auth/token` or the `CAT_API_KEY`
+  (with the API key, the user is selected via the `X-User-ID` header, or the `user_id` querystring on WebSockets);
+- the `jwt=<token>` cookie, only accepted from an allowed Origin (see below).
+
+The `Authorization` header has priority; a malformed one is rejected, without falling back to the cookie.
+
+> [!CAUTION]
+> Tokens and API keys are **never** accepted in the querystring (e.g. `?token=...`), neither over HTTP nor over
+> WebSocket: URLs end up in proxy and server access logs, browser history and `Referer` headers. A credential sent
+> that way is ignored and the request is rejected as unauthorized. Browser WebSocket clients, which cannot set
+> headers, must use the `jwt` cookie from an allowed Origin.
+
+### Tokens
+| Endpoint             | Body                                     | Result                                                              |
+|----------------------|------------------------------------------|---------------------------------------------------------------------|
+| `POST /auth/token`   | `{"username": "...", "password": "..."}` | `access_token`, `expires_in`, `refresh_token`, `refresh_expires_in` |
+| `POST /auth/refresh` | `{"refresh_token": "..."}`               | a new access token **and** a new refresh token                      |
+| `POST /auth/logout`  | `{"refresh_token": "..."}`               | `204`, the session is revoked                                       |
+
+- The **access token** is an HS256 JWT with `iss`, `aud`, `exp`, `nbf`, `iat`, `jti` and `typ=access`. It is valid
+  only for the agents (and user ids) whose password was verified at login: a user of agent A cannot impersonate a
+  user with the same username on agent B. Users of the `system` agent (super-admins) keep access to every agent.
+  Lifetime: `CAT_JWT_EXPIRE_MINUTES` (default 1 day; with refresh tokens, 15 minutes is recommended).
+- The **refresh token** is an opaque random string, stored in Redis only as a SHA-256 hash. It is **single-use**: every
+  refresh rotates it. Presenting an already used refresh token is treated as theft and revokes the whole session.
+  At every refresh the user must still exist, with the same username and password: deleting the user or changing
+  the password ends the session. Lifetime: `CAT_JWT_REFRESH_EXPIRE_MINUTES` of inactivity (default 7 days), capped by
+  `CAT_JWT_REFRESH_MAX_LIFETIME_MINUTES` from login (default 30 days).
+- Do not call `/auth/refresh` concurrently with the same refresh token (e.g. from several browser tabs): the second
+  call counts as a reuse and closes the session.
+- `/auth/logout` does not invalidate access tokens already issued: they stay valid until they expire.
+- After a user is added to a new agent, a new login is needed to access it.
+- `/me` only accepts a verified access token.
+
+### Brute-force protection
+`/auth/token` and `/auth/refresh` are rate limited with counters shared through Redis, in a fixed window of
+`CAT_AUTH_RATE_LIMIT_WINDOW_SECONDS` (default 900). The checks run before the password is verified:
+
+| Variable                         | Default | Counts                                                            |
+|----------------------------------|---------|-------------------------------------------------------------------|
+| `CAT_AUTH_MAX_ATTEMPTS_PER_IP`   | 30      | every login attempt from the same IP                              |
+| `CAT_AUTH_MAX_FAILURES_PER_USER` | 10      | failed logins for the same username (reset by a successful login) |
+| `CAT_AUTH_MAX_REFRESH_PER_IP`    | 120     | refresh calls from the same IP                                    |
+
+Over the limit the answer is `429 Too Many Requests` with a `Retry-After` header. The per-username limit applies to
+existing and non-existing usernames alike, so it does not reveal which accounts exist; as a trade-off, repeated wrong
+passwords can temporarily lock a user out for at most one window.
+
+## CORS, cookies and reverse proxies
+- `CAT_CORS_ALLOWED_ORIGINS` is the allow-list for CORS **and** for cookie authentication: a `jwt` cookie sent from any
+  other cross-site Origin, over HTTP or WebSocket, is ignored. Same-origin requests and requests without an `Origin`
+  header (non-browser clients) are accepted. If a frontend (e.g. the admin panel) is served from a different origin
+  and authenticates with the cookie, add its origin here.
+- With `CAT_CORS_ALLOWED_ORIGINS` unset, CORS allows any origin but **without credentials**.
+- Behind a reverse proxy set `CAT_HTTPS_PROXY_MODE=true` and `CAT_CORS_FORWARDED_ALLOW_IPS` to the proxy IPs: otherwise
+  the rate limiter sees the proxy IP for every client, and the same-origin check cannot see the public host
+  (`X-Forwarded-Host`).
+
 # Admin panel and UI widget
 You can install an admin panel by using the [`grinning-cat-admin`](https://www.github.com/matteocacciola/grinning-cat-admin) repository.
 The admin panel is a separate project that allows you to manage the Grinning Cat and its settings, plugins, and chatbots.
@@ -84,8 +179,9 @@ It is built with Streamlit and is designed to be easy to use and customizable.
 # API Usage
 
 ## For Streaming Responses (Real-time chat)
-- **Use WebSocket connection** at `/ws`, `/ws/{agent_id}` or `/ws/{agent_id}/{chat_id}`; add the token or the API key as
-a querystring parameter with the syntax `?token=...`
+- **Use WebSocket connection** at `/ws`, `/ws/{agent_id}` or `/ws/{agent_id}/{chat_id}`; authenticate with the
+`Authorization: Bearer <token or API key>` header of the handshake, or, from browsers, with the `jwt` cookie (see
+[Authentication](#authentication))
 - Receive tokens in real-time as they're generated: message type `chat_token` for individual tokens; message type `chat`
 for complete responses
 

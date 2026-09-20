@@ -1,12 +1,13 @@
 from abc import ABC, abstractmethod
 from typing import Type, Literal
-import jwt
 from fastapi.requests import HTTPConnection
 from pydantic import ConfigDict
 
-from cat.auth.auth_utils import is_jwt, extract_user_info_on_api_key, extract_token_from_request, DEFAULT_JWT_ALGORITHM
+from cat.auth.auth_utils import is_jwt, extract_user_info_on_api_key, extract_token_from_request, secure_compare
+from cat.auth.tokens import decode_access_token, get_agent_bindings
 from cat.auth.permissions import AuthResource, AuthPermission, AuthUserInfo
 from cat.db.cruds import users as crud_users
+from cat.db.database import DEFAULT_SYSTEM_KEY
 from cat.env import get_env
 from cat.log import log
 from cat.services.factory.models import BaseFactoryConfigModel
@@ -119,22 +120,28 @@ class CoreAuthHandler(BaseAuthHandler):
         auth_permission: AuthPermission,
         key_id: str,
     ) -> AuthUserInfo | None:
-        try:
-            # decode token
-            payload = jwt.decode(token, get_env("CAT_JWT_SECRET"), algorithms=[DEFAULT_JWT_ALGORITHM])
-        except jwt.ExpiredSignatureError:
-            log.error("Token expired")
+        # verify signature, pinned algorithm, exp/nbf/iat, issuer, audience and token type
+        payload = decode_access_token(token)
+        if payload is None:
             return None
-        except jwt.InvalidTokenError:
-            log.error("Invalid token")
-            return None
-        except Exception as e:
-            log.error(f"Could not auth user from JWT: {e}")
-            return None
+        username = payload["sub"]
 
-        # get user from DB
-        user = await crud_users.get_user_by_username(key_id, payload["sub"])
-        if not user:
+        # the token is valid ONLY for the (agent, user_id) pairs whose password was verified at login.
+        # Looking the user up by username alone would let a user authenticated on agent A impersonate a different
+        # user that happens to have the same username on agent B.
+        bindings = get_agent_bindings(payload)
+        user = None
+        if bound_user_id := bindings.get(key_id):
+            # get user from DB: it must still exist and keep the same username
+            user = await crud_users.get_user(key_id, bound_user_id)
+        elif key_id != DEFAULT_SYSTEM_KEY and (system_user_id := bindings.get(DEFAULT_SYSTEM_KEY)):
+            # a verified *system* user (super-admin, who can manage every agent anyway) keeps the previous
+            # behaviour: they act as the same-username user of the requested agent
+            system_user = await crud_users.get_user(DEFAULT_SYSTEM_KEY, system_user_id)
+            if system_user and system_user.get("username") == username:
+                user = await crud_users.get_user_by_username(key_id, username)
+
+        if not user or user.get("username") != username:
             # do not pass
             return None
 
@@ -145,13 +152,13 @@ class CoreAuthHandler(BaseAuthHandler):
             # do not pass
             return AuthUserInfo(
                 id=user["id"],
-                name=payload["sub"],
+                name=username,
                 extra=user,
             )
 
         return AuthUserInfo(
             id=user["id"],
-            name=payload["sub"],
+            name=username,
             permissions=user["permissions"],
             extra=user,
         )
@@ -167,7 +174,7 @@ class CoreAuthHandler(BaseAuthHandler):
     ) -> AuthUserInfo | None:
         if not (current_api_key := get_env("CAT_API_KEY")):
             return None
-        if api_key != current_api_key:
+        if not secure_compare(api_key, current_api_key):
             return None
 
         request_user_id = request.headers.get("X-User-ID") if protocol == "http" else request.query_params.get("user_id")

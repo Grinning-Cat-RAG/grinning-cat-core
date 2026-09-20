@@ -31,3 +31,9 @@ class ManagementModeException(CustomNotFoundException):
 
 class CustomUnauthorizedException(Exception):
     pass
+
+
+class CustomTooManyRequestsException(Exception):
+    def __init__(self, message: str = "Too Many Requests", retry_after: int | None = None):
+        super().__init__(message)
+        self.retry_after = retry_after

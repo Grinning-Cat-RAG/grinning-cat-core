@@ -17,8 +17,15 @@ def get_supported_env_variables():
         "CAT_REDIS_TLS": False,
         "CAT_QDRANT_HOST": "grinning_cat_vector_memory",
         "CAT_QDRANT_API_KEY": None,
-        "CAT_JWT_SECRET": "this_is_a_secret_key",
-        "CAT_JWT_EXPIRE_MINUTES": str(60 * 24),  # JWT expires after 1 day
+        "CAT_JWT_SECRET": None,  # REQUIRED: no default, the app refuses to start without a strong secret
+        "CAT_JWT_EXPIRE_MINUTES": str(60 * 24),  # JWT expires after 1 day (with refresh tokens, 15 is recommended)
+        "CAT_JWT_REFRESH_EXPIRE_MINUTES": str(60 * 24 * 7),  # refresh token idle lifetime: 7 days
+        "CAT_JWT_REFRESH_MAX_LIFETIME_MINUTES": str(60 * 24 * 30),  # absolute session lifetime: 30 days
+        # brute-force protection on /auth/token and /auth/refresh (fixed window)
+        "CAT_AUTH_RATE_LIMIT_WINDOW_SECONDS": "900",  # 15 minutes
+        "CAT_AUTH_MAX_ATTEMPTS_PER_IP": "30",  # login attempts per IP per window
+        "CAT_AUTH_MAX_FAILURES_PER_USER": "10",  # failed logins per username per window
+        "CAT_AUTH_MAX_REFRESH_PER_IP": "120",  # refresh calls per IP per window
         "CAT_HTTPS_PROXY_MODE": "false",
         "CAT_HISTORY_EXPIRATION": None,  # in minutes
         "CAT_CRYPTO_KEY": "grinning_cat",

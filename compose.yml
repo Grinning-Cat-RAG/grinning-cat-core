@@ -14,6 +14,8 @@ services:
       - "host.docker.internal:host-gateway" # This adds an entry to /etc/hosts file in the container mapping host.docker.internal to the host machine IP addr, allowing the container to access services running on the host, not only on Win and Mac but also Linux. See https://docs.docker.com/desktop/networking/#i-want-to-connect-from-a-container-to-a-service-on-the-host and https://docs.docker.com/reference/cli/docker/container/run/#add-host
     environment:
       - CAT_API_KEY=test
+      # REQUIRED: the app does not start without it (>= 32 random chars). Set it in your shell or in .env
+      - CAT_JWT_SECRET=${CAT_JWT_SECRET:?CAT_JWT_SECRET must be set (>= 32 random characters)}
       - CAT_REDIS_HOST=grinning_cat_redis
       - CAT_REDIS_PORT=6379
       - CAT_LOG_LEVEL=DEBUG

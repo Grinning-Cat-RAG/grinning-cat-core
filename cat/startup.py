@@ -9,10 +9,12 @@ from scalar_fastapi import get_scalar_api_reference
 
 from cat.db.database import get_async_db
 from cat.env import get_env
+from cat.env_check import ensure_valid_env, parse_allowed_origins
 from cat.exceptions import (
     CustomForbiddenException,
     CustomNotFoundException,
     CustomUnauthorizedException,
+    CustomTooManyRequestsException,
     CustomValidationException,
     LoadMemoryException,
     ManagementModeException,
@@ -50,6 +52,9 @@ async def lifespan(app: FastAPI):
     # - Not using "Depends" because it only supports callables (not instances)
     # - Starlette allows this: https://www.starlette.io/applications/#storing-state-on-the-app-instance
 
+    # never serve requests with an insecure or broken configuration
+    ensure_valid_env()
+
     await startup_app(app)
 
     # startup message with admin, public and swagger addresses
@@ -68,6 +73,9 @@ def custom_generate_unique_id(route: APIRoute):
 
 # REST API
 def create_app() -> FastAPI:
+    # fail fast: the process must not start with missing/invalid fundamental env variables (e.g. CAT_JWT_SECRET)
+    ensure_valid_env()
+
     app = FastAPI(
         lifespan=lifespan,
         generate_unique_id_function=custom_generate_unique_id,
@@ -80,12 +88,13 @@ def create_app() -> FastAPI:
     # Configures the CORS middleware for the FastAPI app
     cors_enabled = get_env("CAT_CORS_ENABLED")
     if cors_enabled == "true":
-        cors_allowed_origins_str = get_env("CAT_CORS_ALLOWED_ORIGINS")
-        origins = cors_allowed_origins_str.split(",") if cors_allowed_origins_str else ["*"]
+        origins = parse_allowed_origins() or ["*"]
         app.add_middleware(
             CORSMiddleware,
             allow_origins=origins,
-            allow_credentials=True,
+            # with a wildcard origin Starlette would reflect ANY Origin while allowing credentials (cookies):
+            # credentials are allowed only for an explicit allow-list of origins
+            allow_credentials="*" not in origins,
             allow_methods=["*"],
             allow_headers=["*"],
         )
@@ -175,6 +184,12 @@ def create_app() -> FastAPI:
     async def management_mode_exception_handler(request, exc):
         log.info("System in management mode")
         return JSONResponse(status_code=404, content={"detail": str(exc)})
+
+
+    @app.exception_handler(CustomTooManyRequestsException)
+    async def custom_too_many_requests_exception_handler(request, exc):
+        headers = {"Retry-After": str(exc.retry_after)} if exc.retry_after else None
+        return JSONResponse(status_code=429, content={"detail": str(exc)}, headers=headers)
 
 
     @app.exception_handler(CustomUnauthorizedException)

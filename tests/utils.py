@@ -16,7 +16,7 @@ from cat.services.memory.models import VectorMemoryType
 agent_id = "agent_test"
 chat_id = "a1157e2d-ca3d-4f21-a4a5-b57a64dd01c9"
 api_key = "meow_http"
-jwt_secret = "meow_jwt"
+jwt_secret = "meow_jwt_test_secret_at_least_32_characters"
 
 new_user_password = "wandering_in_wonderland"
 mock_plugin_path = "tests/mocks/mock_plugin/"

@@ -1,6 +1,5 @@
 import json
 from typing import Dict, List
-import jwt
 import tomli
 from fastapi import APIRouter, Body, Depends, Request
 from fastapi_healthz import (
@@ -14,12 +13,15 @@ from pydantic import BaseModel, Field
 
 from cat import utils
 from cat.auth.auth_utils import is_jwt, extract_token_from_request
+from cat.auth.tokens import decode_access_token
 from cat.auth.connection import AuthorizedInfo
 from cat.auth.permissions import AuthPermission, AuthResource, check_permissions
 import cat.db.cruds.settings as crud_settings
 from cat.db.database import DEFAULT_SYSTEM_KEY, get_db_connection_string
+from cat.env_check import validate_env
 from cat.exceptions import CustomUnauthorizedException, CustomNotFoundException
 from cat.looking_glass import StrayCat, ChatResponse
+from cat.log import log
 from cat.routes.routes_utils import log_user_agent
 from cat.services.memory.messages import UserMessage
 
@@ -49,9 +51,38 @@ class HealthCheckLocal(HealthCheckAbstract):
         return HealthCheckStatusEnum.HEALTHY
 
 
+class HealthCheckConfig(HealthCheckAbstract):
+    """Unhealthy if a fundamental env variable is missing/invalid. Details are only logged: health endpoints are
+    public, so the response never says which variable is wrong."""
+    @property
+    def service(self) -> str:
+        return "configuration"
+
+    @property
+    def connection_uri(self) -> str | None:
+        return None
+
+    @property
+    def tags(self) -> List[str]:
+        return ["grinning-cat", "config"]
+
+    @property
+    def comments(self) -> list[str]:
+        return []
+
+    def check_health(self) -> HealthCheckStatusEnum:
+        report = validate_env()
+        if report.ok:
+            return HealthCheckStatusEnum.HEALTHY
+        for error in report.errors:
+            log.error(f"Health check - invalid configuration: {error}")
+        return HealthCheckStatusEnum.UNHEALTHY
+
+
 # Add Health Checks
 _healthChecks = HealthCheckRegistry()
 _healthChecks.add_many([
+    HealthCheckConfig(),
     HealthCheckLocal(),
     HealthCheckRedis(get_db_connection_string())
 ])
@@ -131,7 +162,10 @@ async def me(request: Request) -> MeResponse:
     if not is_jwt(token):
         raise CustomNotFoundException("Not Found")
 
-    token_info = jwt.decode(token, options={"verify_signature": False})
+    # NEVER trust an unverified token: a forged JWT would otherwise be enough to enumerate every agent
+    token_info = decode_access_token(token)
+    if token_info is None:
+        raise CustomUnauthorizedException("Unauthorized")
 
     matches_raw = token_info.get("agents", [])
     if not matches_raw:

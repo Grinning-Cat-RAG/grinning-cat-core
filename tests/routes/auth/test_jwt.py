@@ -5,6 +5,7 @@ import jwt
 from cat.env import get_env
 from cat.auth.permissions import AuthPermission, AuthResource, get_base_permissions
 from cat.auth.auth_utils import is_jwt, DEFAULT_JWT_ALGORITHM
+from cat.auth.tokens import JWT_AUDIENCE, JWT_ISSUER
 
 from tests.utils import agent_id, chat_id, create_new_user, api_key, new_user_password, http_message
 
@@ -71,6 +72,8 @@ async def test_issue_jwt(secure_client, client, cheshire_cat):
             received_token,
             get_env("CAT_JWT_SECRET"),
             algorithms=[DEFAULT_JWT_ALGORITHM],
+            audience=JWT_AUDIENCE,
+            issuer=JWT_ISSUER,
         )
         assert payload["sub"] == "user"
         assert (payload["exp"] - time.time() < 60 * 60 * 24)  # expires in less than 24 hours

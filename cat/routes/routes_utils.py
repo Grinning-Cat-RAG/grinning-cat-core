@@ -1,19 +1,17 @@
 import asyncio
 import json
 from ast import literal_eval
-from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Dict, List, Any, Type
+from typing import Dict, List, Any, Tuple, Type
 from fastapi import Query, BackgroundTasks, Request
 from langchain_core.caches import InMemoryCache
 from langchain_core.globals import set_llm_cache
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from cat import utils
 from cat.log import log
 from cat.auth.permissions import AuthPermission, AuthResource
 from cat.db.database import get_async_db, DEFAULT_SYSTEM_KEY
-from cat.env import get_env_float
 from cat.exceptions import CustomValidationException, CustomUnauthorizedException
 from cat.looking_glass.mad_hatter.mad_hatter import MadHatter
 from cat.looking_glass.mad_hatter.plugin import Plugin
@@ -44,6 +42,13 @@ class UserCredentials(BaseModel):
 class JWTResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
+    expires_in: int | None = None
+    refresh_token: str | None = None
+    refresh_expires_in: int | None = None
+
+
+class RefreshTokenRequest(BaseModel):
+    refresh_token: str = Field(..., min_length=32, max_length=256)
 
 
 class GetAvailablePluginsFilter(BaseModel):
@@ -304,38 +309,27 @@ def validate_permissions(permissions: Dict[str, List[str]], resources: Type[util
     return permissions
 
 
-async def create_jwt_content(credentials: UserCredentials, redis_search_service: RedisSearchService) -> Dict[str, Any]:
-    username = credentials.username
-    password = credentials.password
-
-    # search for user across all agents — async so the Lua script doesn't block the event loop
-    valid_matches = await redis_search_service.search_user_by_credentials(username, password)
+async def authenticate_credentials(
+    credentials: UserCredentials, redis_search_service: RedisSearchService
+) -> List[Tuple[str, Dict[str, Any]]]:
+    """
+    Verifies username/password across all agents. Returns the list of (agent_name, user_without_password) whose
+    password matched, or raises 401. The same generic error is used for "unknown user" and "wrong password".
+    """
+    valid_matches = await redis_search_service.search_user_by_credentials(credentials.username, credentials.password)
     if not valid_matches:
-        # Invalid username or password
-        # wait a little to avoid brute force attacks
+        # wait a little to slow down brute force attacks
         await asyncio.sleep(1)
         raise CustomUnauthorizedException("Invalid Credentials")
 
-    final_valid_matches = []
+    matches: List[Tuple[str, Dict[str, Any]]] = []
     for valid_match in valid_matches:
         valid_match_json = json.loads(valid_match)
-        # remove sensitive info
-        if valid_match_json.get("user", {}).get("password"):
-            del valid_match_json["user"]["password"]
-        final_valid_matches.append(json.dumps(valid_match_json))
+        user = valid_match_json.get("user", {})
+        user.pop("password", None)  # remove sensitive info
+        matches.append((valid_match_json["agent_name"], user))
+    return matches
 
-    # using seconds for easier testing
-    expire_delta_in_seconds = get_env_float("CAT_JWT_EXPIRE_MINUTES") * 60  # type: ignore[operator]
-    now = datetime.now(timezone.utc)
-
-    expires = now + timedelta(seconds=expire_delta_in_seconds)
-
-    return {
-        "sub": username,  # Subject (the Username)
-        "exp": expires,  # Expiry date as a Unix timestamp
-        "iat": now,
-        "agents": final_valid_matches,
-    }
 
 def sanitize_source_name(source_name: str, path: str) -> str:
     # Security: Validate and sanitize the source parameter
