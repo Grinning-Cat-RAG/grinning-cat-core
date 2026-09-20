@@ -36,6 +36,10 @@ jobs:
       - name: Clean Docker system before build
         run: |
           docker system prune -f
+      - name: Create .env from secrets
+        run: |
+          echo "CAT_API_KEY=s32383ihg80dsio4kvkjkckqwa63" >> .env
+          echo "CAT_JWT_SECRET=re43gkrekjtekjrkejtkjrew49853rgnsdrgh3p49toengkstw43uothw34lgsedbczbr25uro3whksdbfjwheow3h4tkeldsbg4uht" >> .env
       - name: Build and test
         run: |
           docker compose build --pull --no-cache

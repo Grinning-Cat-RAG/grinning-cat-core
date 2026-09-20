@@ -13,7 +13,6 @@ from tests.utils import (
     api_key,
     create_new_user,
     new_user_password,
-    http_message,
     send_websocket_message,
 )
 
