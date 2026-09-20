@@ -188,7 +188,7 @@ async def test_agent_destroy_error_because_of_not_existing_agent(client, lizard,
         "/utils/agents/destroy", headers={"Authorization": f"Bearer {received_token}", "X-Agent-ID": "wrong_id"}
     )
 
-    assert response.status_code == 500
+    assert response.status_code == 401
 
     await checks_on_agent_destroy(cheshire_cat)
 

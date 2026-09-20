@@ -37,3 +37,10 @@ class CustomTooManyRequestsException(Exception):
     def __init__(self, message: str = "Too Many Requests", retry_after: int | None = None):
         super().__init__(message)
         self.retry_after = retry_after
+
+
+class UnknownAgentException(ValueError):
+    """
+    Raised when the requested agent does not exist. It is a `ValueError` so that callers that do not care about the
+    distinction keep working; the auth layer turns it into a 401 to avoid disclosing which agents exist.
+    """

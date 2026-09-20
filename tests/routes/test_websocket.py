@@ -184,3 +184,17 @@ async def test_websocket_multiple_connections(secure_client, secure_client_heade
     # websocket connection is closed
     time.sleep(0.5)
     assert lizard.websocket_manager.connections == {}
+
+
+async def test_websocket_with_not_existing_agent(secure_client, cheshire_cat):
+    app = secure_client._fastapi_test_app
+    with pytest.raises(ExceptionGroup) as exc_info:
+        async with httpx.AsyncClient(transport=ASGIWebSocketTransport(app=app)) as ws_client:
+            async with aconnect_ws(
+                "http://server/ws/not_existing_agent", ws_client, headers={"Authorization": f"Bearer {api_key}"},
+            ) as websocket:
+                await websocket.send_json({"text": "It's late! It's late"})
+                await websocket.receive_json()
+
+    # same answer as for invalid credentials: the existence of the agent is not disclosed
+    assert [(e.code, e.reason) for e in exc_info.value.exceptions] == [(1008, "Unauthorized")]

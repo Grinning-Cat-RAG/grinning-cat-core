@@ -16,6 +16,7 @@ from cat.exceptions import (
     CustomNotFoundException,
     CustomUnauthorizedException,
     ManagementModeException,
+    UnknownAgentException,
 )
 from cat.looking_glass import BillTheLizard, CheshireCat, StrayCat
 
@@ -50,7 +51,11 @@ class ConnectionAuth(ABC):
         lizard: BillTheLizard = connection.app.state.lizard
 
         agent_id = extract_agent_id_from_request(connection)
-        ccat = await lizard.get_cheshire_cat(agent_id) if agent_id else None
+        try:
+            ccat = await lizard.get_cheshire_cat(agent_id) if agent_id else None
+        except UnknownAgentException:
+            # do not disclose which agents exist: same answer as for invalid credentials
+            self._not_authorized(connection)
 
         stray_cat = None
 

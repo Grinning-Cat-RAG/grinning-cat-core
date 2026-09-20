@@ -11,6 +11,7 @@ from cat.db.cruds import users as crud_users
 from cat.db.database import DEFAULT_CONVERSATIONS_KEY, DEFAULT_SYSTEM_KEY
 from cat.db.models import Setting
 from cat.env import get_env
+from cat.exceptions import UnknownAgentException
 from cat.log import log
 from cat.looking_glass.cheshire_cat import CheshireCat
 from cat.looking_glass.mad_hatter.mad_hatter import MadHatter
@@ -193,7 +194,7 @@ class BillTheLizard(OrchestratorMixin, NonCopyableMixin):
 
         if agent_id not in await crud_settings.get_agents_main_keys():
             log.debug(f"Requested not existing `{agent_id}`")
-            raise ValueError("Bad Request")
+            raise UnknownAgentException("Bad Request")
 
         agent_settings = await crud_settings.get_settings(agent_id)
         if not agent_settings:

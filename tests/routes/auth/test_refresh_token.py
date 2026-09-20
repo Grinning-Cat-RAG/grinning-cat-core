@@ -62,4 +62,20 @@ async def test_jwt_is_bound_to_the_agent_it_was_issued_for(secure_client, client
     # a token issued for `agent_id` must not authenticate a same-username user of another agent
     headers = {"Authorization": f"Bearer {body['access_token']}", "X-Agent-ID": "another_agent", "X-Chat-ID": chat_id}
     status_code, _ = await http_message(client, {"text": "hey"}, headers)
-    assert status_code in (401, 403, 404)
+    assert status_code == 401
+
+
+async def test_jwt_is_bound_to_an_existing_other_agent(secure_client, client, lizard, cheshire_cat):
+    body = await _login(secure_client, client)
+    other_agent_id = "another_agent"
+    await lizard.create_cheshire_cat(other_agent_id)
+    await create_new_user(
+        secure_client,
+        "user",
+        headers={"Authorization": f"Bearer {api_key}", "X-Agent-ID": other_agent_id},
+        permissions=get_base_permissions(),
+        password=new_user_password,
+    )
+    headers = {"Authorization": f"Bearer {body['access_token']}", "X-Agent-ID": other_agent_id, "X-Chat-ID": chat_id}
+    status_code, _ = await http_message(client, {"text": "hey"}, headers)
+    assert status_code == 401
