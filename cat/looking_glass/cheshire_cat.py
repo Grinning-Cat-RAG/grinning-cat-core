@@ -102,6 +102,14 @@ class CheshireCat(BotMixin, NonCopyableMixin):
         """Destroy all data from the cat."""
         log.info(f"Agent id: {self._id}. Destroying all data from the cat")
 
+        # full delete protocol: write the deletion marker FIRST so in-flight
+        # ingestion workers (EffING's ingestion_canceled) see it and self-abort
+        # while the teardown is still running. Lazy import: agent_deletion is
+        # imported by the core at startup and a top-level import here would
+        # widen the startup import graph.
+        from cat.looking_glass.agent_deletion import set_delete_marker
+        await set_delete_marker(self._id)
+
         # destroy all memories
         await self.destroy_memory()
 
