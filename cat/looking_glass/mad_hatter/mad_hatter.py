@@ -253,8 +253,31 @@ class MadHatter:
         if hook_name not in self.hooks:
             raise Exception(f"Hook {hook_name} not present in any plugin")
 
+        return await self._run_hooks(self.hooks[hook_name], *args, caller=caller)
+
+    async def execute_hook_of_deactivated_plugin(
+        self, plugin: Plugin, hook_name: str, *args, caller: "ContextMixin",  # type: ignore[name-defined]
+    ) -> Any:
+        """
+        Execute the hook of a plugin just deactivated: its hooks are not among the ones of the active plugins anymore,
+        but it must know it was deactivated (e.g. to remove its scheduled jobs or its memories). While the hook runs,
+        ``get_plugin()`` still finds the plugin, which is not active (``active_plugins`` does not contain it).
+        """
+        hooks = sorted((h for h in plugin.hooks if h.name == hook_name), key=lambda h: h.priority, reverse=True)
+        if not hooks:
+            return args[0] if args else None
+
+        restored = plugin.id not in self.plugins
+        self.plugins.setdefault(plugin.id, plugin)
+        try:
+            return await self._run_hooks(hooks, *args, caller=caller)
+        finally:
+            if restored:
+                self.plugins.pop(plugin.id, None)
+
+    async def _run_hooks(self, hooks: List, *args, caller: "ContextMixin") -> Any:  # type: ignore[name-defined]
         tea_cup = utils.safe_deepcopy(args[0]) if args else None
-        for hook in self.hooks[hook_name]:
+        for hook in hooks:
             try:
                 log.debug(f"Executing {hook.plugin_id}::{hook.name} with priority {hook.priority}")
                 hook_args = (utils.safe_deepcopy(tea_cup), *utils.safe_deepcopy(args[1:])) if args else ()

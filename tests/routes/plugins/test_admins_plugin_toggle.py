@@ -18,7 +18,7 @@ async def _check_installed_in_cat(secure_client, secure_client_headers, is_activ
     assert len(mock_plugin["local_info"]["hooks"]) == 3
     assert len(mock_plugin["local_info"]["tools"]) == 2
     assert len(mock_plugin["local_info"]["forms"]) == 1
-    assert len(mock_plugin["local_info"]["endpoints"]) == 7
+    assert len(mock_plugin["local_info"]["endpoints"]) == 8
 
 
 async def _check_not_installed_in_cat(lizard, secure_client, secure_client_headers):

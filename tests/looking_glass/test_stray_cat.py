@@ -139,3 +139,32 @@ async def test_stray_fast_reply_hook(secure_client, secure_client_headers, chesh
     # there should be NO side effects
     upd_stray = await StrayCat.from_cat(user_data=stray.user, cat=cheshire_cat, stray_id=stray.id)
     assert len(upd_stray.working_memory.history) == 0
+
+
+async def test_stray_agent_fast_reply_goes_through_the_plugins(secure_client, secure_client_headers, cheshire_cat, stray):
+    # an agent fast reply skips the agent, not the plugins: they see (and e.g. trace) the answer, and the conversation
+    # history gets it (otherwise the user message stays without an answer)
+    await crud_users.create_user(
+        stray.agent_key,
+        {
+            "id": stray.user.id,
+            "username": stray.user.name,
+            "password": "password123",
+            "permissions": stray.user.permissions
+        },
+    )
+
+    await just_installed_plugin(secure_client, secure_client_headers, plugin_id="mock_plugin_agent_fast_reply")
+
+    ccat_headers = {"X-Agent-ID": stray.agent_key, "Authorization": f"Bearer {api_key}"}
+    await secure_client.put("/plugins/toggle/mock_plugin_agent_fast_reply", headers=ccat_headers)
+
+    status_code, response_json = await http_message(
+        secure_client, {"text": "hello"}, ccat_headers | {"X-Chat-ID": stray.id, "X-User-ID": stray.user.id},
+    )
+    assert status_code == 200
+    assert response_json["message"]["text"] == "This is an agent fast reply (seen by the plugins)"
+
+    upd_stray = await StrayCat.from_cat(user_data=stray.user, cat=cheshire_cat, stray_id=stray.id)
+    history = [(m.who, m.content.text) for m in upd_stray.working_memory.history]
+    assert history == [("user", "hello"), ("assistant", "This is an agent fast reply (seen by the plugins)")]

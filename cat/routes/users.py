@@ -124,9 +124,17 @@ async def delete_user(
     info: AuthorizedInfo = check_permissions(AuthResource.USERS, AuthPermission.DELETE),
 ) -> UserResponse:
     agent_id = info.cheshire_cat.agent_key if info.cheshire_cat else info.lizard.agent_key
+    if not await crud_users.get_user(agent_id, user_id):  # type: ignore[arg-type]
+        raise CustomNotFoundException("User not found")
+
+    # the conversations of the user go with it: files, episodic memories, history and owners (found by the owners,
+    # which never expire, unlike the history). Before the user: if this fails, the deletion can be repeated
+    if info.cheshire_cat is not None:
+        for chat_id in await crud_conversations.get_owned_chats(agent_id, user_id):  # type: ignore[arg-type]
+            await info.cheshire_cat.destroy_conversation(chat_id, user_id)
+    await crud_conversations.delete_conversations(agent_id, user_id)  # type: ignore[arg-type]
+
     deleted_user = await crud_users.delete_user(agent_id, user_id)  # type: ignore[arg-type]
     if not deleted_user:
         raise CustomNotFoundException("User not found")
-
-    await crud_conversations.delete_conversations(agent_id, user_id)  # type: ignore[arg-type]
     return UserResponse(**deleted_user)

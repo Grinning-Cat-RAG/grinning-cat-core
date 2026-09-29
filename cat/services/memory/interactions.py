@@ -1,4 +1,5 @@
 import time
+import uuid
 from typing import Literal, List
 from pydantic import BaseModel, Field, ConfigDict
 
@@ -19,21 +20,25 @@ class ModelInteraction(BaseModel):
         The number of input tokens processed by the model.
     started_at: float
         The timestamp when the interaction started. Defaults to the current time.
+    id: str
+        The identity of the interaction: two calls with the same prompt (e.g. of an agent), even at the same time, are
+        two interactions.
     """
     model_type: Literal["llm", "embedder"]
     source: str
     prompt: List[str]
     input_tokens: int
     started_at: float = Field(default_factory=lambda: time.time())
+    id: str = Field(default_factory=lambda: uuid.uuid4().hex)
 
     model_config = ConfigDict(
         protected_namespaces=()
     )
 
     def __hash__(self) -> int:
-        return hash((self.model_type, tuple(self.prompt), self.input_tokens))
+        return hash(self.id)
 
     def __eq__(self, other) -> bool:
         if not isinstance(other, ModelInteraction):
             return NotImplemented
-        return (self.model_type, self.prompt, self.input_tokens) == (other.model_type, other.prompt, other.input_tokens)
+        return self.id == other.id

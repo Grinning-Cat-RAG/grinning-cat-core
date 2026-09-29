@@ -123,10 +123,12 @@ async def update_setting(agent_id: str, plugin_id: str, updated_settings: Dict[s
         ValueError: If serialization fails.
     """
     try:
-        settings_db = await get_setting(agent_id, plugin_id) or {}
-        settings_db.update(updated_settings)
+        # read, merge and write under a lock: two updates at the same time (e.g. on two instances) never lose one
+        async with crud.distributed_lock(format_key(agent_id, plugin_id)):
+            settings_db = await get_setting(agent_id, plugin_id) or {}
+            settings_db.update(updated_settings)
 
-        return await set_setting(agent_id, plugin_id, settings_db)
+            return await set_setting(agent_id, plugin_id, settings_db)
     except (RedisError, ValueError) as e:
         log.error(f"Error updating settings for {agent_id}:{plugin_id}: {e}")
         raise

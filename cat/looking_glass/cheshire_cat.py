@@ -6,6 +6,7 @@ import uuid
 from io import BytesIO
 from typing import List, Set
 
+from cat.services.factory.embedder import embedding_size
 from cat.auth.permissions import AuthUserInfo
 from cat.db.cruds import (
     conversations as crud_conversations,
@@ -123,6 +124,29 @@ class CheshireCat(BotMixin, NonCopyableMixin):
 
         await self.shutdown()
 
+    async def destroy_conversation(self, chat_id: str, user_id: str):
+        """
+        Destroy a conversation of the agent: its files, its episodic memories, its history and its owner (the chat id can
+        be used again).
+
+        Args:
+            chat_id: The id of the conversation.
+            user_id: The id of the user deleting it (its owner, or a system user).
+        """
+        # delete the files related to the conversation from the storage
+        self.file_manager.remove_folder(os.path.join(self.agent_key, chat_id))
+
+        # delete the elements of the conversation from the vector memory
+        await self.vector_memory_handler.delete_tenant_points(str(VectorMemoryType.EPISODIC), {"chat_id": chat_id})
+
+        # the history of the owner (the conversation may be deleted by a system user) and of the user
+        owner = await crud_conversations.get_owner(self.agent_key, chat_id)
+        for history_user_id in {owner, user_id} - {None}:
+            await crud_conversations.delete_conversation(self.agent_key, history_user_id, chat_id)
+
+        # the chat id can be used again
+        await crud_conversations.release_conversation(self.agent_key, chat_id)
+
     async def get_stored_sources_with_metadata(self) -> dict[VectorMemoryType, list[StoredSourceWithMetadata]]:
         """Get all stored files with their metadata."""
         results = {
@@ -199,7 +223,7 @@ class CheshireCat(BotMixin, NonCopyableMixin):
         # fallback to a different embedder (e.g. DumbEmbedder) emits a different dimension and
         # Qdrant rejects it with an opaque "Vector dimension error" — failing loudly here makes
         # the real cause obvious instead of surfacing as an unhelpful Qdrant upsert error.
-        expected_dim = embedder.size
+        expected_dim = await embedding_size(embedder)
         wrong_dims = {len(v) for v in vectors if len(v) != expected_dim}
         if wrong_dims:
             raise ValueError(
@@ -310,6 +334,9 @@ class CheshireCat(BotMixin, NonCopyableMixin):
                 os.remove(file_path)
 
     async def toggle_plugin(self, plugin_id: str):
+        # the plugin being deactivated, if it is active: its hooks are not executed anymore after the toggle
+        deactivated = self.plugin_manager.plugins.get(plugin_id) if plugin_id in self.plugin_manager.active_plugins else None
+
         await self.plugin_manager.toggle_plugin(plugin_id)
 
         # destroy all procedural embeddings and re-embed them
@@ -317,6 +344,13 @@ class CheshireCat(BotMixin, NonCopyableMixin):
         await self.embed_procedures()
 
         await self.plugin_manager.execute_hook("after_plugin_toggling_on_agent", plugin_id, caller=self)
+
+        # the deactivated plugin is told too, as its hook promises ("immediately after toggling a plugin"): e.g. to
+        # remove its scheduled jobs or its memories
+        if deactivated is not None and plugin_id not in self.plugin_manager.active_plugins:
+            await self.plugin_manager.execute_hook_of_deactivated_plugin(
+                deactivated, "after_plugin_toggling_on_agent", plugin_id, caller=self,
+            )
 
     async def _find_stray_cat(self, chat_id: str) -> StrayCat | None:
         """Finds a stray cat by chat id.
@@ -344,31 +378,32 @@ class CheshireCat(BotMixin, NonCopyableMixin):
         )
         return await StrayCat.from_cat(cat=self, user_data=user_info, stray_id=chat_id)
 
-    def has_custom_endpoint(self, path: str, methods: Set[str] | List[str] | None = None):
+    def has_custom_endpoint(
+        self, path: str, methods: Set[str] | List[str] | None = None, method: str | None = None,
+    ):
         """
         Check if an endpoint with the given path and methods exists in the active plugins.
 
         Args:
-            path (str): The path of the endpoint to check.
+            path (str): The path of the request (e.g. ``/custom/items/42`` for the endpoint ``/custom/items/{id}``).
             methods (set[str] | List[str] | None): The HTTP methods of the endpoint to check. If None, checks all methods.
+            method (str | None): The HTTP method of the request. If None, checks all methods.
 
         Returns:
             bool: True if the endpoint exists, False otherwise.
         """
-        for plugin in self.plugin_manager.plugins.values():
-            # Check if the plugin has an endpoint with the given path and methods
-            for ep in plugin.endpoints:
-                if ep.real_path == path and (methods is None or set(ep.methods) == set(methods)):
-                    return True
-
-        return False
+        return any(
+            ep.matches(path, methods, method)
+            for plugin in self.plugin_manager.plugins.values()
+            for ep in plugin.endpoints
+        )
 
     def plugin_exists(self, plugin_id: str):
         return plugin_id in self.plugin_manager.plugins
 
     async def clone_from(self, ccat: "CheshireCat"):
         embedder = await self.embedder()
-        await self.vector_memory_handler.initialize(embedder.name, embedder.size)
+        await self.vector_memory_handler.initialize(embedder.name, await embedding_size(embedder))
 
         log.info(f"Cloning vector memory from agent {ccat.agent_key} to agent {self.agent_key}")
         collection_name = str(VectorMemoryType.DECLARATIVE)
@@ -401,7 +436,7 @@ class CheshireCat(BotMixin, NonCopyableMixin):
     async def transfer_vector_points_from(self, previous_vector_memory_handler: BaseVectorDatabaseHandler):
         embedder = await self.embedder()
         try:
-            await self.vector_memory_handler.initialize(embedder.name, embedder.size)
+            await self.vector_memory_handler.initialize(embedder.name, await embedding_size(embedder))
             for collection_name in await previous_vector_memory_handler.get_collection_names():
                 points, _ = await previous_vector_memory_handler.get_all_tenant_points(collection_name, with_vectors=True)
                 if points:

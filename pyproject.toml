@@ -15,6 +15,7 @@ dependencies = [
     "autopep8",
     "bcrypt",
     "beautifulsoup4",
+    "coverage",
     "cryptography",
     "fastapi",
     "fastapi-healthz[redis]",
@@ -23,6 +24,7 @@ dependencies = [
     "gunicorn",
     "httpx",
     "httpx-ws",
+    "hypothesis",
     "langchain",
     "langchain-text-splitters>=1.1.2",
     "lxml",
@@ -56,6 +58,8 @@ source = ["cat"]
 branch = true
 omit = [
     "tests/*",
+    # the plugins cloned in cat/plugins have their own suites
+    "cat/plugins/*",
 ]
 
 [tool.pylint]
@@ -91,3 +95,5 @@ package = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+# the suite of the core only: every plugin in cat/plugins has its own suite
+testpaths = ["tests"]

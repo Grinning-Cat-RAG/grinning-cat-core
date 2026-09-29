@@ -190,6 +190,14 @@ for complete responses
 - Receive complete response in single API call
 - Better for integrations, batch processing, or simple request/response patterns
 
+## Conversations
+The chat id is chosen by the client (`X-Chat-ID` header, `chat_id` query or path parameter). A conversation belongs to
+the first user of the agent who uses its chat id, from any endpoint (a message, an upload, the file manager); every
+other user of the agent is refused (`401`, as for credentials that are not valid) until the owner deletes the
+conversation, since its files, its episodic memories and its deletion are identified by the chat id alone. The system
+users (administrators of every agent) access every conversation, without owning it. Deleting a conversation removes its files, its
+episodic memories and its history; deleting a user removes all their conversations.
+
 # Webhooks
 
 Some activities are currently asynchronous: you can register a webhook to be notified when they are completed.

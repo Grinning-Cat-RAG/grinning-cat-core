@@ -1,3 +1,4 @@
+import asyncio
 import os
 from typing import Dict, List, Any
 from fastapi import Query, Depends
@@ -104,7 +105,7 @@ async def recall_memory_points_from_text(
 
     # Embed the query to plot it in the Memory page
     embedder = await lizard.embedder()
-    query_embedding = embedder.embed_query(text)
+    query_embedding = await asyncio.to_thread(embedder.embed_query, text)
     collection_name = str(VectorMemoryType.DECLARATIVE if not info.stray_cat else VectorMemoryType.EPISODIC)
     metadata = {k: v for k, v in metadata.items() if k != "source"}
     if info.stray_cat:

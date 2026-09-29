@@ -1,3 +1,4 @@
+import re
 from typing import Dict, List, Any
 from redis.exceptions import RedisError
 
@@ -379,7 +380,7 @@ async def delete_conversations(agent_id: str, user_id: str) -> int:
 
 async def destroy_all(agent_id: str):
     """
-    Delete all conversations for a specific agent.
+    Delete all conversations for a specific agent, with their owners.
 
     Args:
         agent_id: ID of the chatbot.
@@ -389,13 +390,97 @@ async def destroy_all(agent_id: str):
     """
     try:
         await crud.destroy(format_key(agent_id, "*", "*"))
+        await crud.destroy(owner_key(agent_id, "*"))
     except RedisError as e:
         log.error(f"Redis error destroying conversations for {agent_id}: {e}")
         raise
 
 
-async def get_user_id_from_conversation_keys(agent_id: str, chat_id: str) -> str | None:
-    pattern = format_key(agent_id, "*", chat_id)
+def owner_key(agent_id: str, chat_id: str) -> str:
+    """
+    Format Redis key for the owner of a conversation (e.g., "agents:<agent_id>:conversations_owners:<chat_id>").
 
-    user_ids = list({k.split(":")[3] async for k in get_async_db().scan_iter(pattern)})
-    return user_ids[0] if len(user_ids) == 1 else None
+    The name contains the one of the conversations, so that the cloning of an agent skips it as the conversations.
+    """
+    return f"{DEFAULT_AGENTS_KEY}:{agent_id}:{DEFAULT_CONVERSATIONS_KEY}_owners:{chat_id}"
+
+
+def _glob_escaped(text: str) -> str:
+    """The text as a literal in a Redis pattern."""
+    return re.sub(r"([*?\[\]\\])", r"\\\1", text)
+
+
+async def get_owned_chats(agent_id: str, user_id: str) -> List[str]:
+    """
+    The chat ids owned by a user. The owners never expire, unlike the conversation history: a conversation whose history
+    expired is found as well.
+
+    Args:
+        agent_id: ID of the chatbot.
+        user_id: ID of the user.
+    """
+    db = get_async_db()
+    prefix = owner_key(agent_id, "")
+    keys = [key async for key in db.scan_iter(f"{_glob_escaped(prefix)}*")]
+    owners = await db.mget(keys) if keys else []
+    return [key[len(prefix):] for key, owner in zip(keys, owners) if owner == user_id]
+
+
+async def get_owner(agent_id: str, chat_id: str) -> str | None:
+    """
+    The owner of a conversation: the user who first used its chat id (None if nobody did).
+
+    Args:
+        agent_id: ID of the chatbot.
+        chat_id: ID of the chat session.
+    """
+    return await get_async_db().get(owner_key(agent_id, chat_id))
+
+
+async def claim_conversation(agent_id: str, chat_id: str, user_id: str) -> str:
+    """
+    The owner of a conversation, the user if the chat id was never used: the first user of a chat id owns the
+    conversation (atomically, also with many instances of the Cat).
+
+    The chat id is chosen by the client: the files, the episodic memories and the deletion of a conversation are
+    identified by it, so no other user may use it. The owner is kept as long as the conversation (it has no expiration
+    even if the history expires, since the files and the memories do not).
+
+    Args:
+        agent_id: ID of the chatbot.
+        chat_id: ID of the chat session.
+        user_id: ID of the user using the chat id.
+
+    Returns:
+        The ID of the owner of the conversation.
+    """
+    db = get_async_db()
+    key = owner_key(agent_id, chat_id)
+    while True:
+        if await db.set(key, user_id, nx=True):
+            return user_id
+        if (owner := await db.get(key)) is not None:
+            return owner
+        # released meanwhile (the conversation was deleted): claim it again
+
+
+async def release_conversation(agent_id: str, chat_id: str):
+    """
+    Forget the owner of a deleted conversation: its chat id can be used again.
+
+    Args:
+        agent_id: ID of the chatbot.
+        chat_id: ID of the chat session.
+    """
+    await get_async_db().delete(owner_key(agent_id, chat_id))
+
+
+async def get_user_id_from_conversation_keys(agent_id: str, chat_id: str) -> str | None:
+    """
+    The user of a conversation: its owner.
+
+    Args:
+        agent_id: ID of the chatbot.
+        chat_id: ID of the chat session.
+    """
+    return await get_owner(agent_id, chat_id)

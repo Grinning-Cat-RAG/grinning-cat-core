@@ -133,6 +133,8 @@ async def test_convo_history_by_user(secure_client, secure_client_headers, clien
         "Alice": 3,
     }
 
+    # a chat id belongs to its first user: every user has its own conversation
+    chats = {"White Rabbit": f"{chat_id}-rabbit", "Alice": chat_id}
     tokens = {}
     users = {}
     # send websocket messages
@@ -160,13 +162,13 @@ async def test_convo_history_by_user(secure_client, secure_client_headers, clien
                 {"text": f"Mex n.{m} from {username}"},
                 client,
                 received_token,
-                ch_id=chat_id,
+                ch_id=chats[username],
             )
 
     # check conversation history
     for username, n_messages in convos.items():
         response = await client.get(
-            f"/conversations/{chat_id}/history",
+            f"/conversations/{chats[username]}/history",
             headers={"X-Agent-ID": agent_id, "Authorization": f"Bearer {tokens[username]}"},
         )
         json = response.json()
@@ -184,14 +186,21 @@ async def test_convo_history_by_user(secure_client, secure_client_headers, clien
             else:
                 assert m["who"] == "assistant"
 
+    # a user never reaches the conversation of another one
+    response = await client.get(
+        f"/conversations/{chats['White Rabbit']}/history",
+        headers={"X-Agent-ID": agent_id, "Authorization": f"Bearer {tokens['Alice']}"},
+    )
+    assert response.status_code == 401
+
     # delete White Rabbit convo
     response = await client.delete(
-        f"/conversations/{chat_id}",
+        f"/conversations/{chats['White Rabbit']}",
         headers={"X-Agent-ID": agent_id, "Authorization": f"Bearer {tokens['White Rabbit']}"},
     )
     assert response.status_code == 403  # user has no permission
     response = await secure_client.delete(
-        f"/conversations/{chat_id}",
+        f"/conversations/{chats['White Rabbit']}",
         headers={"X-User-ID": users["White Rabbit"]["id"], "X-Agent-ID": agent_id, "Authorization": f"Bearer {api_key}"},
     )
     assert response.status_code == 200
@@ -199,14 +208,14 @@ async def test_convo_history_by_user(secure_client, secure_client_headers, clien
     # check convo deletion per user
     ### White Rabbit convo is empty
     response = await secure_client.get(
-        f"/conversations/{chat_id}/history",
+        f"/conversations/{chats['White Rabbit']}/history",
         headers=secure_client_headers | {"X-User-ID": users["White Rabbit"]["id"]},
     )
     json = response.json()
     assert len(json["history"]) == 0
     ### Alice convo still the same
     response = await secure_client.get(
-        f"/conversations/{chat_id}/history",
+        f"/conversations/{chats['Alice']}/history",
         headers=secure_client_headers | {"X-User-ID": users["Alice"]["id"]},
     )
     json = response.json()

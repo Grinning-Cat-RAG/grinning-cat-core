@@ -31,8 +31,8 @@ stop:  ## Stop docker containers [args="<name_of_service>"].
 restart:  ## Restart service(s) [args="<name_of_service>"].
 	@docker compose ${docker-compose-files} restart ${args}
 
-test:  ## Run tests.
-	@docker exec grinning_cat_core uv run python -m pytest --color=yes -vvv -W ignore --disable-warnings ${args}
+test:  ## Run tests, with the coverage report (branches included).
+	@docker exec grinning_cat_core sh -c 'uv run python -m coverage run -m pytest --color=yes -vvv -W ignore --disable-warnings ${args}; status=$$?; uv run python -m coverage report -m --skip-covered; exit $$status'
 
 install: ## Update the local virtual environment with the latest requirements.
 	@uv sync --link-mode=copy --frozen --no-install-project --no-upgrade --no-cache

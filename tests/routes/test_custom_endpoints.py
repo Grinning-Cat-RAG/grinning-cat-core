@@ -104,6 +104,9 @@ async def test_custom_endpoints_on_plugin_deactivation_or_uninstall(
         ("POST", "/tests/crud", {"name": "the cat", "description": "it's magic"}, False),
         ("PUT", "/tests/crud/123", {"name": "the cat", "description": "it's magic"}, False),
         ("DELETE", "/tests/crud/123", None, False),
+        # regression: the path with parameters was compared with the template of the endpoint, and the endpoint
+        # behind the authentication was still reachable for the agent without the plugin
+        ("DELETE", "/tests/crud/secure/123", None, True),
     ]
 
     # custom endpoints are active

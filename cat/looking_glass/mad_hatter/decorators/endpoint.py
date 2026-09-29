@@ -1,6 +1,7 @@
 from enum import Enum
 from typing import Callable, List, Any
 from fastapi import APIRouter, FastAPI
+from starlette.routing import compile_path
 
 from cat.log import log
 
@@ -103,6 +104,21 @@ class CatEndpoint:
         This is useful for logging and debugging purposes.
         """
         return f"{self.prefix}{self.path}"
+
+    def matches(self, path: str, methods: set[str] | List[str] | None = None, method: str | None = None) -> bool:
+        """
+        Whether a request path (e.g. ``/items/42``) is served by this endpoint (e.g. ``/items/{item_id}``), as FastAPI
+        matches it; with ``methods``, the endpoint must have exactly those methods, with ``method`` that method.
+        """
+        # compiled once per path (the prefix of an endpoint may change before its activation)
+        if getattr(self, "_compiled", (None,))[0] != self.real_path:
+            self._compiled = (self.real_path, compile_path(self.real_path)[0])
+        if not self._compiled[1].match(path):
+            return False
+        if methods is not None and set(self.methods or []) != set(methods):
+            return False
+        # FastAPI serves GET for a route without methods
+        return method is None or method.upper() in {m.upper() for m in self.methods or ["GET"]}
 
 class Endpoint:
     default_prefix = "/custom"

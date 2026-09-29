@@ -1,5 +1,6 @@
 import time
 import math
+import weakref
 from typing import List, Dict, Any
 import tiktoken
 from langchain_core.callbacks import BaseCallbackHandler
@@ -9,34 +10,41 @@ from langchain_core.outputs.llm_result import LLMResult
 from cat import log
 from cat.core_plugins.interactions.models import LLMModelInteraction
 
-# Thread-safe registry for concurrent requests
-_stray_registry = {}
+# Registry of the strays of the running turns (the handlers are deep-copied by the hooks, the strays must not be):
+# an entry goes away with its stray
+_stray_registry: "weakref.WeakValueDictionary[int, Any]" = weakref.WeakValueDictionary()
 
 
 class ModelInteractionHandler(BaseCallbackHandler):
     """
-    Langchain callback handler for tracking model interactions.
+    Langchain callback handler for tracking model interactions: every LLM call made with the callbacks of a turn is
+    recorded in the working memory of the turn (an agent may call the LLM several times).
     """
     def __init__(self, source: str):
         """
         Args:
             source: Source of the model interaction
         """
+        self.source = source
         # Store the stray ID to survive serialization
         self.stray_id = None
-        self.interaction = LLMModelInteraction(
-            source=source,
-            prompt=[],
-            reply="",
-            input_tokens=0,
-            output_tokens=0,
-            ended_at=0,
-        )
+        # the calls started and not ended yet, by run id
+        self._running: Dict[Any, LLMModelInteraction] = {}
 
     def inject_stray_cat(self, stray: "StrayCat") -> None:
         """Inject the stray for registry lookup."""
         self.stray_id = id(stray)
         _stray_registry[self.stray_id] = stray
+
+    def _start(self, run_id: Any, prompt: List[str], input_tokens: int) -> None:
+        self._running[run_id] = LLMModelInteraction(
+            source=self.source,
+            prompt=prompt,
+            reply="",
+            input_tokens=input_tokens,
+            output_tokens=0,
+            ended_at=0,
+        )
 
     def _count_tokens(self, text: str) -> int:
         # cl100k_base is the most common encoding for OpenAI models such as GPT-3.5, GPT-4 - what about other providers?
@@ -137,6 +145,11 @@ class ModelInteractionHandler(BaseCallbackHandler):
 
             if isinstance(m.content, list):
                 for c in m.content:
+                    if isinstance(c, str):
+                        input_tokens += self._count_tokens(c)
+                        input_prompt.append(c)
+                        continue
+
                     # Count text tokens
                     if c.get("type") == "text":
                         text_content = c.get("text", "")
@@ -153,36 +166,55 @@ class ModelInteractionHandler(BaseCallbackHandler):
 
                     log.warning(f"Could not count tokens for message type: {c.get('type', 'unknown')}")
 
+        self._start(kwargs.get("run_id"), input_prompt, self._with_buffer(input_tokens))
+
+    def on_llm_start(self, serialized: Dict[str, Any], prompts: List[str], **kwargs) -> None:
+        """Track input tokens and prompt content of the (non chat) LLMs."""
+        self._start(kwargs.get("run_id"), list(prompts), self._with_buffer(sum(self._count_tokens(p) for p in prompts)))
+
+    @staticmethod
+    def _with_buffer(tokens: int) -> int:
         # Store token count with small buffer for tokenization variations
         # Different models may tokenize slightly differently
         buffer_multiplier = 1.05  # 5% buffer instead of 20%
-        self.interaction.input_tokens = int(input_tokens * buffer_multiplier)
-        self.interaction.prompt = input_prompt
+        return int(tokens * buffer_multiplier)
+
+    @staticmethod
+    def _text(content: Any) -> str:
+        """The text of a reply: chat models may reply with a list of content blocks (e.g. text and tool calls)."""
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            return "".join(
+                block if isinstance(block, str) else str(block.get("text", ""))
+                for block in content
+                if isinstance(block, str) or (isinstance(block, dict) and block.get("type") == "text")
+            )
+        return str(content or "")
 
     def on_llm_end(self, response: LLMResult, **kwargs) -> None:
-        """Track output tokens and response content."""
-        if self.stray_id is None:
+        """Track output tokens and response content; the call is recorded in the working memory of the turn."""
+        interaction = self._running.pop(kwargs.get("run_id"), None)
+        if interaction is None:
             return
 
         generation = response.generations[0][0]
 
         if hasattr(generation, "message"):
-            response_text = generation.message.content
+            response_text = self._text(generation.message.content)
         else:
             response_text = generation.text
 
-        self.interaction.output_tokens = self._count_tokens(response_text)
-        self.interaction.reply = response_text
-        self.interaction.ended_at = time.time()
+        interaction.output_tokens = self._count_tokens(response_text)
+        interaction.reply = response_text
+        interaction.ended_at = time.time()
 
         # Retrieve the correct stray from the registry
-        stray = _stray_registry.get(self.stray_id)
+        stray = _stray_registry.get(self.stray_id) if self.stray_id is not None else None
         if stray is not None:
-            stray.working_memory.model_interactions.add(self.interaction)
-            _stray_registry.pop(self.stray_id, None)
+            stray.working_memory.model_interactions.add(interaction)
 
     def on_llm_error(self, error: Exception, **kwargs) -> None:
-        """Handle LLM errors and clean up."""
+        """Handle LLM errors: the failed call is not recorded."""
         log.error(f"LLM error in ModelInteractionHandler: {error}")
-        if self.stray_id is not None:
-            _stray_registry.pop(self.stray_id, None)
+        self._running.pop(kwargs.get("run_id"), None)

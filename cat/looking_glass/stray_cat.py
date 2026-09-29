@@ -200,7 +200,8 @@ class StrayCat(BotMixin, NonCopyableMixin):
         try:
             embedder = await self.lizard.embedder()
             config = RecallSettings(
-                embedding=embedder.embed_query(self.working_memory.user_message.text),  # type: ignore[arg-type]
+                # in a worker thread: a remote embedder makes an HTTP call, which must not block the event loop
+                embedding=await asyncio.to_thread(embedder.embed_query, self.working_memory.user_message.text),  # type: ignore[arg-type]
                 metadata=self.working_memory.user_message.get("metadata", {})
             )
 
@@ -217,35 +218,13 @@ class StrayCat(BotMixin, NonCopyableMixin):
             # hook to modify/enrich retrieved memories
             await self.plugin_manager.execute_hook("after_cat_recalls_memories", config, caller=self)
 
-            # if the agent is set to fast reply, skip everything and return the output
+            # if the agent is set to fast reply, skip the agent: the answer still goes through the plugins below
+            # (e.g. the conversation history stores it)
             agent_output = await plugin_manager.execute_hook("agent_fast_reply", caller=self)
             if agent_output:
                 procedures_task.cancel()
-                return CatMessage(text=agent_output.output)
-
-            # By the time we reach here the PROCEDURAL query has very likely already finished
-            # (it ran concurrently with recalls + hooks); this await is typically instant.
-            tools = await procedures_task
-
-            # prepare agent input (multimodal_ingestion plugin enriches it with
-            # the recalled images via before_agentic_workflow)
-            agent_input = AgenticWorkflowTask(
-                system_prompt=system_prompt,
-                user_prompt=self.working_memory.user_message.text,  # type: ignore[arg-type]
-                context=[m.document for m in self.working_memory.context_memories],
-                history=[h.langchainfy() for h in self.working_memory.history[-config.latest_n_history:]],
-                tools=tools,
-            )
-            agent_input = await plugin_manager.execute_hook("before_agentic_workflow", agent_input, caller=self)
-
-            agent_output = await self._agentic_workflow.run(
-                task=agent_input,
-                llm=self.large_language_model,
-                callbacks=await plugin_manager.execute_hook("llm_callbacks", [], caller=self),
-            )
-
-            if agent_output.output == utils.default_llm_answer_prompt():
-                agent_output.with_llm_error = True
+            else:
+                agent_output = await self._run_agent(system_prompt, config, procedures_task)
         except Exception as e:
             log.error(f"Agent id: {self.agent_key}. Error: {e}")
             agent_output = AgenticWorkflowOutput(
@@ -264,6 +243,36 @@ class StrayCat(BotMixin, NonCopyableMixin):
         )
 
         return final_output  # type: ignore[return-value]
+
+    async def _run_agent(
+        self, system_prompt: str, config: RecallSettings, procedures_task: asyncio.Future
+    ) -> AgenticWorkflowOutput:
+        plugin_manager = self.plugin_manager
+
+        # By the time we reach here the PROCEDURAL query has very likely already finished
+        # (it ran concurrently with recalls + hooks); this await is typically instant.
+        tools = await procedures_task
+
+        # prepare agent input (multimodal_ingestion plugin enriches it with
+        # the recalled images via before_agentic_workflow)
+        agent_input = AgenticWorkflowTask(
+            system_prompt=system_prompt,
+            user_prompt=self.working_memory.user_message.text,  # type: ignore[arg-type]
+            context=[m.document for m in self.working_memory.context_memories],
+            history=[h.langchainfy() for h in self.working_memory.history[-config.latest_n_history:]],
+            tools=tools,
+        )
+        agent_input = await plugin_manager.execute_hook("before_agentic_workflow", agent_input, caller=self)
+
+        agent_output = await self._agentic_workflow.run(
+            task=agent_input,
+            llm=self.large_language_model,
+            callbacks=await plugin_manager.execute_hook("llm_callbacks", [], caller=self),
+        )
+
+        if agent_output.output == utils.default_llm_answer_prompt():
+            agent_output.with_llm_error = True
+        return agent_output
 
     async def run_http(self, user_message: UserMessage) -> ChatResponse:
         try:

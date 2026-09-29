@@ -8,7 +8,8 @@ from apscheduler.jobstores.redis import RedisJobStore
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from pydantic import BaseModel, Field
 
-from cat import log, utils
+from cat import utils
+from cat.log import log
 from cat.db.database import get_sync_db
 from cat.utils import singleton
 

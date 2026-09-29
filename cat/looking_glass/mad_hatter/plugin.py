@@ -27,7 +27,7 @@ from cat.looking_glass.mad_hatter.decorators.plugin_decorator import CatPluginDe
 from cat.looking_glass.mad_hatter.decorators.tool import CatTool
 from cat.looking_glass.mad_hatter.procedures import CatProcedure
 from cat.looking_glass.models import PluginSettingsModel, PluginManifest
-from cat.utils import inspect_calling_agent, get_base_path, get_project_path, to_camel_case
+from cat.utils import inspect_calling_agent, get_base_path, get_core_plugins_path, get_project_path, to_camel_case
 
 
 class Plugin:
@@ -224,13 +224,20 @@ class Plugin:
             return {}
 
         try:
-            # Validate the settings
-            self.settings_model().model_validate(settings)
-            return settings
+            # Validate the settings: they are read as the model reads them (e.g. the ones stored as they were sent)
+            return self.normalized_settings(settings)
         except Exception as e:
             log.error(f"Agent {agent_id} - Unable to load plugin {self._id} settings: {e}")
             log.warning(self.plugin_specific_error_message())
             raise e
+
+    def normalized_settings(self, settings: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        The settings as the settings model reads them (e.g. ``"false"`` is ``False``, an enum is its value), field by
+        field: the keys that the model does not declare are kept as they are. ValidationError if they are not valid.
+        """
+        validated = self.settings_model().model_validate(settings).model_dump(mode="json")
+        return {**settings, **{key: validated[key] for key in settings if key in validated}}
 
     # save plugin settings
     async def save_settings(self, settings: Dict, agent_id: str) -> Dict[str, Any]:
@@ -495,6 +502,16 @@ class Plugin:
         endpoints = []
         plugin_overrides = []
 
+        # every module is imported once: reloading them one by one, in the order of the files, left the module importing a
+        # sibling with the classes (and the code) of the previous execution of the sibling. The modules of an installed
+        # plugin loaded before (e.g. of a previous version) are forgotten first; the core plugins never change while the
+        # Cat runs, and the core imports some of their modules directly: they are imported once and kept
+        if not os.path.abspath(self._path).startswith(os.path.abspath(get_core_plugins_path())):
+            package = self._get_py_filename_dotted_notation(os.path.join(self._path, "__init__.py")).removesuffix(".__init__")
+            for name in [m for m in sys.modules if m == package or m.startswith(f"{package}.")]:
+                del sys.modules[name]
+            importlib.invalidate_caches()
+
         load_done = True
         for py_file in self._py_files:
             py_filename = self._get_py_filename_dotted_notation(py_file)
@@ -504,7 +521,6 @@ class Plugin:
             # save a reference to decorated functions
             try:
                 plugin_module = importlib.import_module(py_filename)
-                importlib.reload(plugin_module)
 
                 hooks += getmembers(plugin_module, lambda obj: isinstance(obj, CatHook))
                 procedures += (

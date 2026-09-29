@@ -13,7 +13,7 @@ async def _check_activation(secure_client, secure_client_headers):
     assert len(mock_plugin["local_info"]["hooks"]) == 3
     assert len(mock_plugin["local_info"]["tools"]) == 2
     assert len(mock_plugin["local_info"]["forms"]) == 1
-    assert len(mock_plugin["local_info"]["endpoints"]) == 7
+    assert len(mock_plugin["local_info"]["endpoints"]) == 8
 
 
 async def test_toggle_non_existent_plugin(secure_client, secure_client_headers, cheshire_cat):

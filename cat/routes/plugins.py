@@ -114,8 +114,9 @@ async def upsert_cheshirecat_plugin_settings(
     # Get the plugin object
     plugin = ccat.plugin_manager.plugins[plugin_id]  # type: ignore[union-attr]
     try:
-        # Load the plugin settings Pydantic model, and validate the settings
-        plugin.settings_model().model_validate(payload)
+        # Load the plugin settings Pydantic model, validate the settings and store them as the model reads them
+        # (e.g. "false" is false): stored as they were sent, a plugin would read "false" as true
+        payload = plugin.normalized_settings(payload)
     except ValidationError as e:
         raise CustomValidationException("\n".join(list(map(lambda x: x["msg"], e.errors()))))
 

@@ -10,6 +10,7 @@ from cat.auth.auth_utils import (
     extract_chat_id_from_request,
 )
 from cat.auth.permissions import AuthPermission, AuthResource, AuthUserInfo
+from cat.db.cruds import conversations as crud_conversations
 from cat.db.database import DEFAULT_SYSTEM_KEY
 from cat.exceptions import (
     CustomForbiddenException,
@@ -59,10 +60,13 @@ class ConnectionAuth(ABC):
 
         stray_cat = None
 
+        # the path of the request, matched with the paths of the endpoints (e.g. /items/{id}), and its method (none for
+        # a websocket)
         url_path = connection.url.path
-        is_custom_endpoint = lizard.is_custom_endpoint(url_path)
+        method = connection.scope.get("method")
+        is_custom_endpoint = lizard.is_custom_endpoint(url_path, method=method)
         is_triggered_by_cat = ccat is not None
-        has_cat_custom_endpoint = ccat.has_custom_endpoint(url_path) if ccat is not None else False
+        has_cat_custom_endpoint = ccat.has_custom_endpoint(url_path, method=method) if ccat is not None else False
 
         # if the request comes from a custom endpoint, and it is not available in the picked CheshireCat, block it and
         # return a 404-HTTP error
@@ -71,6 +75,7 @@ class ConnectionAuth(ABC):
 
         # always try core auth first (less costly, in general)
         user = None
+        is_system_user = False
         if not self.is_chat:
             # is that an admin able to manage agents?
             user = await lizard.core_auth_handler.authorize(
@@ -79,6 +84,7 @@ class ConnectionAuth(ABC):
                 self.permission,
                 lizard.agent_key,
             )
+            is_system_user = user is not None
 
         # fallback to agent-specific auth if needed and available
         if not user and ccat is not None:
@@ -115,6 +121,11 @@ class ConnectionAuth(ABC):
                 raise
 
         if ccat is not None and (chat_id := extract_chat_id_from_request(connection)):
+            # the chat id is chosen by the client: a conversation belongs to the first user of its id, and the files,
+            # the episodic memories and the deletion of the conversation are identified by it. The system users
+            # (administrators of every agent) can access any conversation, without owning it
+            if not is_system_user and await crud_conversations.claim_conversation(ccat.agent_key, chat_id, user.id) != user.id:  # type: ignore[union-attr]
+                self._not_authorized(connection)
             stray_cat = await StrayCat.from_cat(user_data=user, cat=ccat, stray_id=chat_id)  # type: ignore[arg-type]
 
         return AuthorizedInfo(lizard=lizard, cheshire_cat=ccat, user=user, stray_cat=stray_cat, agent_id=agent_id)  # type: ignore[arg-type]

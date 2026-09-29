@@ -1,4 +1,3 @@
-import os
 from typing import List, Dict, Any
 from pydantic import BaseModel, Field, model_validator
 
@@ -13,7 +12,6 @@ from cat import (
 )
 from cat.db.cruds import conversations as crud_conversations
 from cat.exceptions import CustomValidationException, CustomNotFoundException
-from cat.services.memory.models import VectorMemoryType
 
 
 class DeleteConversationHistoryResponse(BaseModel):
@@ -66,18 +64,9 @@ async def delete_conversation(
         log.warning("Trying to change conversation name but no StrayCat found in AuthorizedInfo")
         return DeleteConversationHistoryResponse(deleted=False)
 
-    cat = info.cheshire_cat
     try:
-        # delete the files related to the conversation from the storage
-        cat.file_manager.remove_folder(os.path.join(cat.agent_key, stray_cat.id))
-
-        # delete the elements of the conversation from the vector memory
-        await cat.vector_memory_handler.delete_tenant_points(
-            str(VectorMemoryType.EPISODIC), {"chat_id": stray_cat.id},
-        )
-
-        # Delete conversation from the database
-        await crud_conversations.delete_conversation(stray_cat.agent_key, stray_cat.user.id, stray_cat.id)  # type: ignore[union-attr]
+        # files, episodic memories, history and owner (only its owner, or a system user, reaches this point)
+        await info.cheshire_cat.destroy_conversation(stray_cat.id, stray_cat.user.id)  # type: ignore[union-attr]
 
         return DeleteConversationHistoryResponse(deleted=True)
     except Exception as e:

@@ -2,6 +2,7 @@ import asyncio
 from typing import List, Dict
 from fastapi import FastAPI
 
+from cat.services.factory.embedder import embedding_size
 from cat.auth.auth_utils import DEFAULT_ADMIN_USERNAME, hash_password
 from cat.auth.permissions import get_full_permissions
 from cat.db import crud
@@ -129,7 +130,7 @@ class BillTheLizard(OrchestratorMixin, NonCopyableMixin):
                 )
 
             embedder = await self.embedder()
-            await ccat.vector_memory_handler.initialize(embedder.name, embedder.size)
+            await ccat.vector_memory_handler.initialize(embedder.name, await embedding_size(embedder))
             await ccat.embed_procedures()
 
             await self.plugin_manager.execute_hook("after_cheshire_cat_creation", ccat, caller=self)
@@ -248,7 +249,7 @@ class BillTheLizard(OrchestratorMixin, NonCopyableMixin):
         try:
             embedder = await self.embedder()
             embedder_name = embedder.name
-            embedder_size = embedder.size
+            embedder_size = await embedding_size(embedder)
 
             ccat_ids = await crud_settings.get_agents_main_keys()
             stored_files_by_ccat: List[Dict] = []
@@ -281,21 +282,19 @@ class BillTheLizard(OrchestratorMixin, NonCopyableMixin):
             "after_all_cheshire_cats_embedded", success, caller=self,
         )
 
-    def is_custom_endpoint(self, path: str, methods: List[str] | None = None):
+    def is_custom_endpoint(self, path: str, methods: List[str] | None = None, method: str | None = None):
         """
         Check if the given path and methods correspond to a custom endpoint.
 
         Args:
-            path (str): The path of the endpoint to check.
+            path (str): The path of the request (e.g. ``/custom/items/42`` for the endpoint ``/custom/items/{id}``).
             methods (List[str] | None): The HTTP methods of the endpoint to check. If None, checks all methods.
+            method (str | None): The HTTP method of the request. If None, checks all methods.
 
         Returns:
             bool: True if the endpoint is a custom endpoint, False otherwise.
         """
-        return any(
-            ep.real_path == path and (methods is None or set(ep.methods) == set(methods))
-            for ep in self.plugin_manager.endpoints
-        )
+        return any(ep.matches(path, methods, method) for ep in self.plugin_manager.endpoints)
 
     async def install_plugin(self, plugin_path: str) -> str:
         try:

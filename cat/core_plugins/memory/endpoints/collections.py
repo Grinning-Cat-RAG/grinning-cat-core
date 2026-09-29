@@ -1,6 +1,7 @@
 from typing import Dict, List
 from pydantic import BaseModel
 
+from cat.services.factory.embedder import embedding_size
 from cat import AuthorizedInfo, AuthPermission, AuthResource, check_permissions, endpoint
 from cat.exceptions import CustomNotFoundException
 
@@ -97,7 +98,7 @@ async def create_single_collection(
     embedder = await info.cheshire_cat.lizard.embedder()  # type: ignore[union-attr]
     await info.cheshire_cat.vector_memory_handler.create_collection(
         embedder.name,
-        embedder.size,
+        await embedding_size(embedder),
         collection_id
     )
 

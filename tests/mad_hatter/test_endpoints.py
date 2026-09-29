@@ -20,7 +20,7 @@ def test_endpoints_discovery(plugin_manager):
         assert e in plugin_manager.endpoints
 
     # discovered endpoints
-    assert len(mock_plugin_endpoints) == 7
+    assert len(mock_plugin_endpoints) == 8
 
     # basic properties
     for e in mock_plugin_endpoints:
@@ -124,3 +124,23 @@ async def test_core_plugins_untoggling_endpoint(lizard, secure_client, secure_cl
     assert body  # the list has content: every entry must be a real plugin
     for plugin_id in body:
         assert plugin_id in lizard.plugin_manager.get_core_plugins_ids
+
+
+def test_endpoint_matches_the_paths_it_serves():
+    endpoint = CatEndpoint(prefix="/custom", path="/items/{item_id}", function=lambda: None, methods=["DELETE"])
+    assert endpoint.matches("/custom/items/42")
+    assert endpoint.matches("/custom/items/42", method="delete")
+    assert not endpoint.matches("/custom/items/42", method="GET")
+    assert endpoint.matches("/custom/items/42", methods=["DELETE"])
+    assert not endpoint.matches("/custom/items/42", methods=["GET"])
+    for path in ("/custom/items", "/custom/items/42/more", "/items/42", "/custom/items/"):
+        assert not endpoint.matches(path), path
+    files = CatEndpoint(prefix="/custom", path="/files/{name:path}", function=lambda: None, methods=["GET"])
+    assert files.matches("/custom/files/a/b.txt")
+
+
+def test_an_endpoint_without_methods_serves_get():
+    # FastAPI serves GET for a route declared without methods
+    endpoint = CatEndpoint(prefix="/custom", path="/items/{item_id}", function=lambda: None)
+    assert endpoint.matches("/custom/items/42", method="GET")
+    assert not endpoint.matches("/custom/items/42", method="POST")

@@ -47,3 +47,8 @@ def test_put(item_id: int, item: Item):
 @endpoint.delete(path="/crud/{item_id}", prefix="/tests", tags=["Tests"])
 def test_delete(item_id: int):
     return {"id": item_id, "result": "ok"}
+
+
+@endpoint.delete(path="/crud/secure/{item_id}", prefix="/tests", tags=["Tests"])
+def test_delete_secure(item_id: int, info: AuthorizedInfo = check_permissions(AuthResource.PLUGIN, AuthPermission.DELETE)):
+    return {"id": item_id, "result": "ok"}

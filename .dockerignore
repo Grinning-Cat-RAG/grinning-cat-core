@@ -48,3 +48,5 @@ Dockerfile
 Dockerfile:*
 compose.yml
 Makefile
+
+.hypothesis/

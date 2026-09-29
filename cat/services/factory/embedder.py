@@ -1,3 +1,4 @@
+import asyncio
 import re
 import string
 from abc import ABC, abstractmethod
@@ -106,6 +107,12 @@ class DumbEmbedder(Embeddings):
     def embed_query(self, text: str) -> List[float]:
         """Embed a string of text and returns the embedding vector as a list of floats."""
         return self.embed_documents([text])[0]
+
+
+async def embedding_size(embedder) -> int:
+    """The dimensionality of the embeddings, computed in a worker thread: for a remote embedder it is an HTTP call, which
+    must not block the event loop (it serves every request of the instance)."""
+    return await asyncio.to_thread(lambda: embedder.size)
 
 
 class EmbedderSettings(BaseFactoryConfigModel, ABC):

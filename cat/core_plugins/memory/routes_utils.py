@@ -1,3 +1,4 @@
+import asyncio
 import time
 from typing import Dict, List
 from pydantic import BaseModel, Field
@@ -28,7 +29,7 @@ async def upsert_memory_point(
 ) -> MemoryPoint:
     # embed content
     embedder = await info.lizard.embedder()
-    embedding = embedder.embed_query(point.content)
+    embedding = await asyncio.to_thread(embedder.embed_query, point.content)
 
     # ensure source is set
     if not point.metadata.get("source"):

@@ -1,12 +1,41 @@
 import hashlib
 import os
 import shutil
-from pathlib import Path
-from typing import List
+import threading
+from collections import OrderedDict
 from datetime import datetime
+from pathlib import Path
+from stat import S_ISREG
+from typing import List, Tuple
 
 from cat.log import log
 from cat.services.factory.file_manager import BaseFileManager, FileResponse
+
+#: SHA-256 of the files listed by this instance, by (path, size, modification time, inode): a file is read again only
+#: when it changes
+_HASHES: "OrderedDict[Tuple[str, int, int, int], str]" = OrderedDict()
+_HASHES_LOCK = threading.Lock()
+MAX_CACHED_HASHES = 100_000
+
+
+def _file_hash(path: str, stat: os.stat_result, chunk_size: int = 8192) -> str:
+    key = (os.path.abspath(path), stat.st_size, stat.st_mtime_ns, stat.st_ino)
+    with _HASHES_LOCK:
+        if (cached := _HASHES.get(key)) is not None:
+            _HASHES.move_to_end(key)
+            return cached
+
+    sha256 = hashlib.sha256()
+    with Path(path).open("rb") as f:
+        while chunk := f.read(chunk_size):
+            sha256.update(chunk)
+    digest = sha256.hexdigest()
+
+    with _HASHES_LOCK:
+        _HASHES[key] = digest
+        while len(_HASHES) > MAX_CACHED_HASHES:
+            _HASHES.popitem(last=False)
+    return digest
 
 
 class LocalFileManager(BaseFileManager):
@@ -56,30 +85,38 @@ class LocalFileManager(BaseFileManager):
         return True
 
     def _list_files(self, remote_root_dir: str) -> List[FileResponse]:
-        def get_file_hash(file_path: str, chunk_size: int = 8192) -> str:
-            sha256 = hashlib.sha256()
-            with Path(file_path).open("rb") as f:
-                while chunk := f.read(chunk_size):
-                    sha256.update(chunk)
-            return sha256.hexdigest()
-
         if not os.path.exists(remote_root_dir):
             return []
 
         # List only the files in the remote_root_dir (no subfolders)
-        return [
-            FileResponse(
-                path=os.path.join(remote_root_dir, file),
+        files = []
+        for file in os.listdir(remote_root_dir):
+            path = os.path.join(remote_root_dir, file)
+            try:
+                stat = os.stat(path)
+            except FileNotFoundError:  # removed meanwhile
+                continue
+            if not S_ISREG(stat.st_mode):
+                continue
+            files.append(FileResponse(
+                path=path,
                 name=file,
-                hash=get_file_hash(os.path.join(remote_root_dir, file)),
-                size=int(os.path.getsize(os.path.join(remote_root_dir, file))),
-                last_modified=datetime.fromtimestamp(
-                    os.path.getmtime(os.path.join(remote_root_dir, file))
-                ).strftime("%Y-%m-%d")
-            )
-            for file in os.listdir(remote_root_dir)
-            if os.path.isfile(os.path.join(remote_root_dir, file))
-        ]
+                hash=_file_hash(path, stat),
+                size=int(stat.st_size),
+                last_modified=datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d"),
+            ))
+        return files
+
+    def file_exists(self, filename: str, remote_root_dir: str | None = None) -> bool:
+        # the same paths as the base class, without listing (and hashing) the whole folder
+        if remote_root_dir is None:
+            remote_root_dir = os.path.dirname(filename)
+            filename = os.path.basename(filename)
+
+        if self._root_dir not in remote_root_dir:
+            remote_root_dir = os.path.join(self._root_dir, remote_root_dir)
+
+        return os.path.isfile(os.path.join(remote_root_dir, filename))
 
     def _clone_folder(self, remote_root_dir_from: str, remote_root_dir_to: str) -> List[str]:
         cloned_files = []

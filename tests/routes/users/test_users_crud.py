@@ -280,3 +280,73 @@ async def test_delete_user_deletes_their_conversations(secure_client, secure_cli
 
     # ...and the other user's conversation is untouched
     assert await crud_conversations.get_conversation(agent_id, other_user_id, "chat_other") is not None
+
+
+async def test_delete_user_deletes_the_data_of_their_conversations(secure_client, secure_client_headers, cheshire_cat):
+    # regression: the files, the episodic memories and the owners of the chats of a deleted user stayed forever
+    from cat.services.memory.models import VectorMemoryType
+    from tests.utils import get_memory_contents, send_file
+
+    response = await secure_client.put("/file_manager/settings/LocalFileManagerConfig", headers=secure_client_headers, json={})
+    assert response.status_code == 200
+    permissions = {
+        str(AuthResource.CHAT): [str(p) for p in AuthPermission],
+        str(AuthResource.MEMORY): [str(p) for p in AuthPermission],
+        str(AuthResource.UPLOAD): [str(AuthPermission.WRITE)],
+    }
+    leaving = (await create_new_user(secure_client, username="leaving", headers=secure_client_headers, permissions=permissions))["id"]
+    staying = (await create_new_user(secure_client, username="staying", headers=secure_client_headers, permissions=permissions))["id"]
+
+    for user_id, chat_id in ((leaving, "leaving-chat"), (staying, "staying-chat")):
+        headers = {**secure_client_headers, "X-User-ID": user_id}
+        response, _ = await send_file("sample.txt", "text/plain", secure_client, headers, ch_id=chat_id)
+        assert response.status_code == 200
+    # a chat whose history expired: only its owner is left
+    await crud_conversations.claim_conversation(agent_id, "expired-chat", leaving)
+
+    response = await secure_client.delete(f"/users/{leaving}", headers=secure_client_headers)
+    assert response.status_code == 200
+
+    admin = secure_client_headers
+    for chat_id, expected in (("leaving-chat", []), ("staying-chat", ["sample.txt"])):
+        files = (await secure_client.get("/file_manager/", headers={**admin, "X-Chat-ID": chat_id})).json()["files"]
+        assert [f["name"] for f in files] == expected, chat_id
+        memories = await get_memory_contents(secure_client, {**admin, "X-Chat-ID": chat_id}, VectorMemoryType.EPISODIC)
+        assert bool(memories) == bool(expected), chat_id
+    assert await crud_conversations.get_owned_chats(agent_id, leaving) == []
+    assert await crud_conversations.get_owner(agent_id, "staying-chat") == staying
+
+
+async def test_a_failed_deletion_of_a_user_can_be_repeated(secure_client, secure_client_headers, cheshire_cat, monkeypatch):
+    # regression: the user was deleted before the data of their conversations: when the cleanup failed, the user was
+    # gone and the deletion could not be repeated, so the data stayed forever
+    from cat.looking_glass.cheshire_cat import CheshireCat
+
+    user_id = (await create_new_user(secure_client, username="leaving", headers=secure_client_headers))["id"]
+    await crud_conversations.claim_conversation(agent_id, "c1", user_id)
+
+    async def failing(self, chat_id, user_id):
+        raise ConnectionError("vector database down")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(CheshireCat, "destroy_conversation", failing)
+        with pytest.raises(ConnectionError):
+            await secure_client.delete(f"/users/{user_id}", headers=secure_client_headers)
+
+    response = await secure_client.delete(f"/users/{user_id}", headers=secure_client_headers)
+    assert response.status_code == 200
+    assert await crud_conversations.get_owner(agent_id, "c1") is None
+
+
+async def test_a_user_deleted_meanwhile_is_not_found(secure_client, secure_client_headers, cheshire_cat, monkeypatch):
+    # e.g. deleted by another request (or instance) while its conversations were being deleted
+    from cat.db.cruds import users as crud_users
+
+    user_id = (await create_new_user(secure_client, username="racing", headers=secure_client_headers))["id"]
+
+    async def already_deleted(agent_id, user_id):
+        return None
+
+    monkeypatch.setattr(crud_users, "delete_user", already_deleted)
+    response = await secure_client.delete(f"/users/{user_id}", headers=secure_client_headers)
+    assert response.status_code == 404

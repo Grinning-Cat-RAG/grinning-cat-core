@@ -1,3 +1,4 @@
+import copy
 import asyncio
 import hashlib
 import json
@@ -13,6 +14,7 @@ from typing import Dict, List, Tuple
 from httpx import AsyncClient
 from langchain_core.documents.base import Blob, Document
 
+from cat.services.factory.embedder import embedding_size
 from cat.core_plugins.base_plugin.parsers import MimeTypeBasedParser
 from cat.env import get_env_int
 from cat.log import log
@@ -82,6 +84,14 @@ class RabbitHole:
     """Manages content ingestion. I'm late... I'm late!"""
 
     async def ingest_memory(self, cat: "CheshireCat", file: BytesIO, filename: str):  # type: ignore[name-defined]
+        """Upload memories to the declarative memory from a JSON file (see ``_ingest_memory``).
+
+        The rabbit hole of the instance serves every agent at the same time: every ingestion runs on a copy of its own,
+        which keeps the cat (and the chat) of that ingestion only.
+        """
+        return await copy.copy(self)._ingest_memory(cat, file, filename)
+
+    async def _ingest_memory(self, cat: "CheshireCat", file: BytesIO, filename: str):  # type: ignore[name-defined]
         """Upload memories to the declarative memory from a JSON file.
 
         Args:
@@ -132,7 +142,7 @@ class RabbitHole:
 
             # Check embedding size is correct
             embedder = await lizard.embedder()
-            embedder_size = embedder.size
+            embedder_size = await embedding_size(embedder)
             len_mismatch = [len(p.vector) == embedder_size for p in points]  # type: ignore[union-attr]
 
             if not any(len_mismatch):
@@ -150,6 +160,22 @@ class RabbitHole:
             )
 
     async def ingest_file(
+        self,
+        cat: "BotMixin",  # type: ignore[name-defined]
+        file: str | BytesIO,
+        metadata: Dict,
+        filename: str | None = None,
+        store_file: bool = True,
+        content_type: str | None = None,
+    ):
+        """Load a file in the Cat's memory (see ``_ingest_file``).
+
+        The rabbit hole of the instance serves every agent at the same time: every ingestion runs on a copy of its own,
+        which keeps the cat (and the chat) of that ingestion only.
+        """
+        return await copy.copy(self)._ingest_file(cat, file, metadata, filename, store_file, content_type)
+
+    async def _ingest_file(
         self,
         cat: "BotMixin",  # type: ignore[name-defined]
         file: str | BytesIO,

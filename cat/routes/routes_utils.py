@@ -4,8 +4,6 @@ from ast import literal_eval
 from pathlib import Path
 from typing import Dict, List, Any, Tuple, Type
 from fastapi import Query, BackgroundTasks, Request
-from langchain_core.caches import InMemoryCache
-from langchain_core.globals import set_llm_cache
 from pydantic import BaseModel, Field
 
 from cat import utils
@@ -271,7 +269,6 @@ def create_dict_parser(param_name: str, description: str | None = None):
 async def startup_app(app):
     from cat.looking_glass import BillTheLizard
 
-    set_llm_cache(InMemoryCache())
     utils.pod_id()
 
     bill_the_lizard = BillTheLizard()

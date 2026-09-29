@@ -49,7 +49,7 @@ class FakeLizard:
     async def get_cheshire_cat(self, agent_id):
         return None
 
-    def is_custom_endpoint(self, url_path):
+    def is_custom_endpoint(self, url_path, methods=None, method=None):
         return False
 
 
