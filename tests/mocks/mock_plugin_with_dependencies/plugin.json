@@ -2,7 +2,7 @@
     "name": "Mock Plugin with dependencies",
     "description": "A mock plugin that has dependencies on other core plugins.",
     "author_name": "Matteo Cacciola",
-    "plugin_url": "https://github.com/matteocacciola/grinning-cat-core",
+    "plugin_url": "https://github.com/Grinning-Cat-RAG/grinning-cat-core",
     "tags": "mock, test, dependencies",
     "thumb": "",
     "version": "0.0.1",

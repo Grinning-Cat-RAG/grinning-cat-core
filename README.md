@@ -1,13 +1,13 @@
 # Grinning Cat: AI agent as a microservice
 
-![GitHub Repo stars](https://img.shields.io/github/stars/matteocacciola/grinning-cat-core?style=social)
-![GitHub Release](https://img.shields.io/github/v/release/matteocacciola/grinning-cat-core)
-![GitHub commits since latest release](https://img.shields.io/github/commits-since/matteocacciola/grinning-cat-core/latest)
-![GitHub issues](https://img.shields.io/github/issues/matteocacciola/grinning-cat-core)
-![GitHub Release Date](https://img.shields.io/github/release-date/matteocacciola/grinning-cat-core.svg)
-![GitHub tag (with filter)](https://img.shields.io/github/v/tag/matteocacciola/grinning-cat-core)
-![GitHub top language](https://img.shields.io/github/languages/top/matteocacciola/grinning-cat-core)
-[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/matteocacciola/grinning-cat-core)
+![GitHub Repo stars](https://img.shields.io/github/stars/Grinning-Cat-RAG/grinning-cat-core?style=social)
+![GitHub Release](https://img.shields.io/github/v/release/Grinning-Cat-RAG/grinning-cat-core)
+![GitHub commits since latest release](https://img.shields.io/github/commits-since/Grinning-Cat-RAG/grinning-cat-core/latest)
+![GitHub issues](https://img.shields.io/github/issues/Grinning-Cat-RAG/grinning-cat-core)
+![GitHub Release Date](https://img.shields.io/github/release-date/Grinning-Cat-RAG/grinning-cat-core.svg)
+![GitHub tag (with filter)](https://img.shields.io/github/v/tag/Grinning-Cat-RAG/grinning-cat-core)
+![GitHub top language](https://img.shields.io/github/languages/top/Grinning-Cat-RAG/grinning-cat-core)
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/Grinning-Cat-RAG/grinning-cat-core)
 
 # Origin
 
@@ -34,8 +34,8 @@ The Grinning Cat is a framework to build custom AI agents:
   - 🛠 Custom tools, forms, endpoints, MCP clients
   - 🪛 LLM callbacks
 - 🌐 Customizable integration of **MCP clients**, such as LangSmith or LlamaIndex 
-- 🏛 Easy to use Admin Panel (available with the repository [matteocacciola/grinning-cat-admin](https://www.github.com/matteocacciola/grinning-cat-admin))
-- 🦄 Easy to understand [docs](https://deepwiki.com/matteocacciola/grinning-cat-core)
+- 🏛 Easy to use Admin Panel (available with the repository [Grinning-Cat-RAG/grinning-cat-admin](https://www.github.com/Grinning-Cat-RAG/grinning-cat-admin))
+- 🦄 Easy to understand [docs](https://deepwiki.com/Grinning-Cat-RAG/grinning-cat-core)
 - 🌍 Supports any language model via LangChain
 
 We are committed to openness, privacy and creativity, we want to bring AI to the long tail. If you want to know more
@@ -52,7 +52,7 @@ To make Grinning Cat run on your machine, you just need [`docker`](https://docs.
 docker run --rm -it -p 1865:80 \
   -e CAT_JWT_SECRET="$(python3 -c 'import secrets; print(secrets.token_urlsafe(64))')" \
   -e CAT_REDIS_HOST=<your_redis_host> \
-  ghcr.io/matteocacciola/grinning-cat-core:latest
+  ghcr.io/Grinning-Cat-RAG/grinning-cat-core:latest
 ```
 
 > [!IMPORTANT]
@@ -60,14 +60,14 @@ docker run --rm -it -p 1865:80 \
 > [Configuration and security](#configuration-and-security)). In particular `CAT_JWT_SECRET` has no default and
 > `CAT_REDIS_HOST` must point to a Redis Stack instance. With `docker compose up`, export `CAT_JWT_SECRET` in your
 > shell or put it in `.env` (see `.env.example`).
-- Chat with the Grinning Cat by downloading the [Admin Panel](https://www.github.com/matteocacciola/grinning-cat-admin).
+- Chat with the Grinning Cat by downloading the [Admin Panel](https://www.github.com/Grinning-Cat-RAG/grinning-cat-admin).
 - Try out the REST API on [localhost:1865/docs](http://localhost:1865/docs).
 
 This fork is intended as a microservice.
 
 As a first thing, set the **Embedder** for the Grinning Cat. A favourite **LLM** must be set for each chatbot; each
 chatbot can have its own language model, with custom settings.
-Everything can be done via the [Admin Panel](https://www.github.com/matteocacciola/grinning-cat-admin) or via the REST API endpoints.
+Everything can be done via the [Admin Panel](https://www.github.com/Grinning-Cat-RAG/grinning-cat-admin) or via the REST API endpoints.
 
 > [!IMPORTANT]
 > The following `core plugins` are enabled by default:
@@ -172,7 +172,7 @@ passwords can temporarily lock a user out for at most one window.
   (`X-Forwarded-Host`).
 
 # Admin panel and UI widget
-You can install an admin panel by using the [`grinning-cat-admin`](https://www.github.com/matteocacciola/grinning-cat-admin) repository.
+You can install an admin panel by using the [`grinning-cat-admin`](https://www.github.com/Grinning-Cat-RAG/grinning-cat-admin) repository.
 The admin panel is a separate project that allows you to manage the Grinning Cat and its settings, plugins, and chatbots.
 It is built with Streamlit and is designed to be easy to use and customizable.
 
@@ -283,11 +283,11 @@ Please, refer to [COMPATIBILITY.md](docs/COMPATIBILITY.md) for more information.
 ## Custom endpoints and permissions
 
 When implementing custom endpoints, you can use the `@endpoint` decorator to create a new endpoint. Please, refer to the
-[documentation](https://deepwiki.com/matteocacciola/grinning-cat-core) for more information.
+[documentation](https://deepwiki.com/Grinning-Cat-RAG/grinning-cat-core) for more information.
 
 > [!IMPORTANT]
 > **Each implemented custom endpoint must use the `check_permissions` method to authenticate**. See this
-[`example`](https://github.com/matteocacciola/grinning-cat-core/blob/main/tests/mocks/mock_plugin/mock_endpoint.py#L28).
+[`example`](https://github.com/Grinning-Cat-RAG/grinning-cat-core/blob/main/tests/mocks/mock_plugin/mock_endpoint.py#L28).
 
 ## Minimal plugin example
 
@@ -416,17 +416,17 @@ def settings_schema():
 
 # Docs and Resources
 
-**For your PHP based projects**, I developed a [PHP SDK](https://www.github.com/matteocacciola/grinning-cat-php-sdk) that allows you to
-easily interact with the Cat. Please, refer to the [SDK documentation](https://www.github.com/matteocacciola/grinning-cat-php-sdk/blob/master/README.md) for more information.
+**For your PHP based projects**, I developed a [PHP SDK](https://www.github.com/Grinning-Cat-RAG/grinning-cat-php-sdk) that allows you to
+easily interact with the Cat. Please, refer to the [SDK documentation](https://www.github.com/Grinning-Cat-RAG/grinning-cat-php-sdk/blob/master/README.md) for more information.
 
-**For your Node.js / React.js / Vue.js based projects**, I developed a [Typescript library](https://www.github.com/matteocacciola/grinning-cat-typescript-client) that allows you to
-easily interact with the Grinning Cat. Please, refer to the [library documentation](https://www.github.com/matteocacciola/grinning-cat-typescript-client/blob/master/README.md) for more information.
+**For your Node.js / React.js / Vue.js based projects**, I developed a [Typescript library](https://www.github.com/Grinning-Cat-RAG/grinning-cat-typescript-client) that allows you to
+easily interact with the Grinning Cat. Please, refer to the [library documentation](https://www.github.com/Grinning-Cat-RAG/grinning-cat-typescript-client/blob/master/README.md) for more information.
 
 List of resources:
-- [Official Documentation](https://deepwiki.com/matteocacciola/grinning-cat-core) of the current fork
-- [PHP SDK](https://www.github.com/matteocacciola/grinning-cat-php-sdk)
-- [Typescript SDK](https://www.github.com/matteocacciola/grinning-cat-typescript-client)
-- [Python SDK](https://www.github.com/matteocacciola/grinning-cat-python-sdk)
+- [Official Documentation](https://deepwiki.com/Grinning-Cat-RAG/grinning-cat-core) of the current fork
+- [PHP SDK](https://www.github.com/Grinning-Cat-RAG/grinning-cat-php-sdk)
+- [Typescript SDK](https://www.github.com/Grinning-Cat-RAG/grinning-cat-typescript-client)
+- [Python SDK](https://www.github.com/Grinning-Cat-RAG/grinning-cat-python-sdk)
 - [Tutorial - Write your first plugin](https://cheshirecat.ai/write-your-first-plugin/)
 
 # Roadmap & Contributing
