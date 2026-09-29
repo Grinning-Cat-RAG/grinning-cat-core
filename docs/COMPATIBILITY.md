@@ -18,7 +18,7 @@ names of the plugins that the current plugin requires.
 ## List of available hooks
 The Grinning Cat provides a set of hooks that can be used to customize the behavior of the AI agent. Hooks are events that can be
 triggered at specific points in the conversation, allowing you to modify the behavior of the AI agent or to add custom functionality.
-The list of available hooks is available in the [documentation](https://deepwiki.com/matteocacciola/grinning-cat-core).
+The list of available hooks is available in the [documentation](https://deepwiki.com/Grinning-Cat-RAG/grinning-cat-core).
 The current version introduces also the following additional hooks:
 
 ### Bill The Lizard
