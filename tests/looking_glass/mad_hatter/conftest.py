@@ -1,10 +1,8 @@
 import json
 from pathlib import Path
-from typing import Callable, List, Dict, Any
+from typing import List
 from unittest.mock import patch
 import pytest
-
-from cat.looking_glass.mad_hatter.mad_hatter import MadHatter
 
 
 @pytest.fixture
