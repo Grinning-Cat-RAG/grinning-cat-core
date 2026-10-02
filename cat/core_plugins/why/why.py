@@ -1,7 +1,7 @@
 from cat import hook, MessageWhy, CatMessage, AgenticWorkflowOutput
 
 
-@hook(priority=1)
+@hook(priority=2)
 def before_cat_sends_message(message: CatMessage, agent_output: AgenticWorkflowOutput, cat) -> CatMessage:
     memory = [
         dict(d.document)

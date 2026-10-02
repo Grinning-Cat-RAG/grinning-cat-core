@@ -97,7 +97,7 @@ async def test_plugin_install(lizard, plugin_is_flat):
     # found tool and hook have been cached
     mock_hook_name = "before_cat_sends_message"
     assert len(plugin_manager.hooks[mock_hook_name]) == 6  # 3 in cores, 1 in analytics, two in mock plugin
-    expected_priorities = [3, 2, 1, 1, 1, 0]
+    expected_priorities = [3, 2, 2, 1, 1, 0]
     for hook_idx, cached_hook in enumerate(plugin_manager.hooks[mock_hook_name]):
         assert cached_hook.name == mock_hook_name
         assert (

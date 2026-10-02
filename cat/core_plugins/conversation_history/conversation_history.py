@@ -1,6 +1,4 @@
-from typing import Dict
-
-from cat import hook, UserMessage
+from cat import hook, UserMessage, CatMessage, AgenticWorkflowOutput
 from cat.db.cruds import conversations as crud_conversations
 
 
@@ -24,7 +22,7 @@ async def before_cat_reads_message(user_message: UserMessage, cat) -> UserMessag
 
 
 @hook(priority=1)
-async def before_cat_sends_message(message, agent_output, cat) -> Dict:
+async def before_cat_sends_message(message: CatMessage, agent_output: AgenticWorkflowOutput, cat) -> CatMessage:
     """
     Note: this hook runs before the cat processes the agent message. `cat` is the StrayCat instance.
     It updates the conversation history with the agent's message unless there was an LLM error.

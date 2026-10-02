@@ -5,5 +5,6 @@
     "plugin_url": "https://github.com/Grinning-Cat-RAG/grinning-cat-core",
     "tags": "core, default, conversation, history, context, reasoning, llm",
     "thumb": "",
-    "version": "0.0.1"
+    "version": "0.0.1",
+    "dependencies": ["why"]
 }

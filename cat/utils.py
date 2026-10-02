@@ -551,3 +551,7 @@ def get_nlp_object_name(nlp_object: Any, default: str) -> str:
         name = name.replace(v, "_")
 
     return name.lower()
+
+
+def deduplicate_list(items: List[Any]) -> List[Any]:
+    return list(dict.fromkeys(items))

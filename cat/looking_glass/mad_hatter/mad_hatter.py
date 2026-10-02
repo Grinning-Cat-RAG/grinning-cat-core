@@ -1,4 +1,5 @@
 import glob
+from graphlib import TopologicalSorter, CycleError
 from inspect import iscoroutinefunction
 import os
 import shutil
@@ -70,8 +71,8 @@ class MadHatter:
         # stored list was customized without them
         active_plugins.extend(self.get_non_toggleable_plugin_ids)
 
-        # Remove duplicates
-        active_plugins = list(set(active_plugins))
+        # Remove duplicates while preserving insertion order
+        active_plugins = utils.deduplicate_list(active_plugins)
 
         # ...except the ones BillTheLizard runs on its own behalf: an agent
         # carries neither them nor their `agents:<id>:plugins:*` keys
@@ -212,10 +213,39 @@ class MadHatter:
 
         await self.activate_plugin(plugin_id)
 
+    def _topological_sort_plugins(self, plugin_ids: List[str]) -> List[str]:
+        """
+        Sort plugin IDs topologically according to their manifest dependencies.
+        Ensures dependencies appear before the plugins that depend on them.
+        """
+        graph = {}
+        for p_id in plugin_ids:
+            plugin = self.plugins.get(p_id)
+            if plugin and hasattr(plugin, "manifest") and plugin.manifest.dependencies:
+                # Keep dependencies that are currently active
+                deps = [d for d in plugin.manifest.dependencies if d in plugin_ids]
+                graph[p_id] = set(deps)
+            else:
+                graph[p_id] = set()
+
+        try:
+            ts = TopologicalSorter(graph)
+            return list(ts.static_order())
+        except CycleError as e:
+            log.error(f"Circular dependency detected among active plugins: {e}. Falling back to original order.")
+            return plugin_ids
+
     async def _on_finish_discovering_plugins(self):
+        # Deduplicate active plugins preserving insertion order
+        self.active_plugins = utils.deduplicate_list(self.active_plugins)
+
+        # Sort active plugins topologically based on dependencies
+        self.active_plugins = self._topological_sort_plugins(self.active_plugins)
+
         # store active plugins in db
-        active_plugins = list(set(self.active_plugins))
-        await crud_settings.upsert_setting_by_name(self.agent_key, Setting(name="active_plugins", value=active_plugins))
+        await crud_settings.upsert_setting_by_name(
+            self.agent_key, Setting(name="active_plugins", value=self.active_plugins),
+        )
 
         log.debug(f"Agent '{self.agent_key}' - ACTIVE PLUGINS:")
         log.debug(self.active_plugins)
@@ -226,7 +256,10 @@ class MadHatter:
         self.endpoints = []
 
         for plugin_id in self.active_plugins:
-            plugin = self.plugins[plugin_id]
+            plugin = self.plugins.get(plugin_id)
+            if not plugin:
+                continue
+
             # Load local tools, forms and mcp clients as procedures
             self.procedures_registry |= {p.name: p for p in plugin.procedures}
             self.endpoints += plugin.endpoints
@@ -235,7 +268,7 @@ class MadHatter:
             for h in plugin.hooks:
                 self.hooks.setdefault(h.name, []).append(h)
 
-        # sort each hooks list by priority
+        # sort each hooks list by priority (stable sort in Python respects initial topological order for equal priorities)
         for hook_name in self.hooks.keys():
             self.hooks[hook_name].sort(key=lambda x: x.priority, reverse=True)
 
@@ -248,7 +281,7 @@ class MadHatter:
         Synchronous plugin hooks are called in-line (safe for typical I/O-light bodies).
 
         Use this instead of `execute_hook` whenever the caller is already inside
-        an `async` function.  Keep `execute_hook` for sync call sites (e.g. ``__init__``).
+        an `async` function. Keep `execute_hook` for sync call sites (e.g. ``__init__``).
         """
         if hook_name not in self.hooks:
             raise Exception(f"Hook {hook_name} not present in any plugin")
@@ -327,9 +360,9 @@ class MadHatter:
             return LoadedPlugin()
 
     def load_active_plugins_ids_from_folders(self):
-        all_plugin_folders = list(set(
+        all_plugin_folders = utils.deduplicate_list(
             glob.glob(f"{utils.get_core_plugins_path()}/*/") + glob.glob(f"{utils.get_plugins_path()}/*/")
-        ))
+        )
 
         plugins = [
             plugin_id
