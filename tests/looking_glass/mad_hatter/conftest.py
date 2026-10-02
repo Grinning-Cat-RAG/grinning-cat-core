@@ -46,7 +46,7 @@ def mock_plugins_env(tmp_path: Path):
             "dependencies": dependencies or [],
         }
 
-        manifest_path = plugin_dir / "plugin_manifest.json"
+        manifest_path = plugin_dir / "plugin.json"
         with open(manifest_path, "w", encoding="utf-8") as f:
             json.dump(manifest_data, f, indent=2)
 

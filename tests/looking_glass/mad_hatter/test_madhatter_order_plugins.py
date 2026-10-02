@@ -1,16 +1,46 @@
 import pytest
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
+
+from cat.looking_glass.mad_hatter.decorators.hook import CatHook
 from cat.looking_glass.mad_hatter.mad_hatter import MadHatter
 
 
+def _mock_plugin(plugin_id: str, dependencies=None, priority: int = 1) -> MagicMock:
+    plugin = MagicMock()
+    plugin.manifest.dependencies = dependencies or []
+    plugin.hooks = [
+        CatHook(
+            name="before_cat_sends_message",
+            func=lambda message, cat: message,
+            priority=priority,
+            plugin_id=plugin_id,
+        )
+    ]
+    plugin.procedures = []
+    plugin.endpoints = []
+    plugin.activate_settings = AsyncMock()
+    return plugin
+
+
+async def _discover_mock_plugins(mad_hatter: MadHatter, plugins: dict[str, MagicMock]) -> None:
+    mad_hatter.load_active_plugins_ids_from_db = AsyncMock(return_value=list(plugins))
+    mad_hatter.available_plugins = AsyncMock(return_value=plugins)
+    await mad_hatter.discover_plugins()
+
+
 @pytest.mark.asyncio
-async def test_hooks_execution_order_is_deterministic(mock_plugins_env, test_agent_key: str):
+async def test_hooks_execution_order_is_deterministic(test_agent_key: str):
     """
     Verify that plugin hooks with equal priorities execute in a deterministic order
     across repeated discoveries, avoiding issues caused by hash-randomized sets.
     """
     mad_hatter = MadHatter(test_agent_key)
-    await mad_hatter.discover_plugins()
+    plugins = {
+        "plugin_c": _mock_plugin("plugin_c", ["plugin_b"]),
+        "plugin_b": _mock_plugin("plugin_b", ["plugin_a"]),
+        "plugin_a": _mock_plugin("plugin_a"),
+    }
+    await _discover_mock_plugins(mad_hatter, plugins)
 
     hook_name = "before_cat_sends_message"
     assert hook_name in mad_hatter.hooks, f"Expected hook '{hook_name}' to be registered"
@@ -19,7 +49,7 @@ async def test_hooks_execution_order_is_deterministic(mock_plugins_env, test_age
 
     # Re-discover plugins multiple times to verify consistency across boots
     for _ in range(5):
-        await mad_hatter.discover_plugins()
+        await _discover_mock_plugins(mad_hatter, plugins)
         current_order = [h.plugin_id for h in mad_hatter.hooks[hook_name]]
         assert current_order == initial_order, (
             "Hook execution order changed across discoveries. Deduplication must be deterministic."
@@ -105,18 +135,17 @@ async def test_topological_sorting_with_filesystem_env(mock_plugins_env, test_ag
 
 
 @pytest.mark.asyncio
-async def test_why_hook_executes_before_conversation_history(mock_plugins_env, test_agent_key: str):
+async def test_why_hook_executes_before_conversation_history(test_agent_key: str):
     """
     Specific integration test ensuring that the 'why' plugin hook executes
     before the 'conversation_history' hook when sending messages.
     """
-    # Create why and conversation_history plugins on the mock filesystem
-    custom_dir = mock_plugins_env["custom_plugins_dir"]
-    mock_plugins_env["create_plugin"](custom_dir, "why", priority=2)
-    mock_plugins_env["create_plugin"](custom_dir, "conversation_history", priority=1)
-
     mad_hatter = MadHatter(test_agent_key)
-    await mad_hatter.discover_plugins()
+    plugins = {
+        "why": _mock_plugin("why", priority=2),
+        "conversation_history": _mock_plugin("conversation_history", priority=1),
+    }
+    await _discover_mock_plugins(mad_hatter, plugins)
 
     hooks = mad_hatter.hooks.get("before_cat_sends_message", [])
 
