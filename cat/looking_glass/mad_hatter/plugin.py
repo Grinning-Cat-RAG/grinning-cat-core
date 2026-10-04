@@ -27,7 +27,9 @@ from cat.looking_glass.mad_hatter.decorators.plugin_decorator import CatPluginDe
 from cat.looking_glass.mad_hatter.decorators.tool import CatTool
 from cat.looking_glass.mad_hatter.procedures import CatProcedure
 from cat.looking_glass.models import PluginSettingsModel, PluginManifest
-from cat.utils import inspect_calling_agent, get_base_path, get_core_plugins_path, get_project_path, to_camel_case
+from cat.utils import (
+    inspect_calling_agent, get_base_path, get_core_plugins_path, get_plugins_path, get_project_path, to_camel_case,
+)
 
 
 class Plugin:
@@ -338,6 +340,53 @@ class Plugin:
             if "version" in pkg
         ]
 
+    def _other_plugins_constraints(self, pinned: set[str]) -> List[str]:
+        """PEP 508 constraints pinning the packages locked by the other
+        installed plugins (their uv.lock), except the ones in *pinned* (the
+        root project's). The plugins share one virtual environment: a plugin
+        can never replace the version of a library another plugin installed —
+        it fails to resolve instead, at its installation.
+
+        Only the locks of the plugins installed in this environment count: the
+        ones whose `.requirements_hash` matches their pyproject.toml and the
+        current root uv.lock (not a lock shipped in a plugin's archive, nor one
+        compiled against an older root uv.lock)."""
+        own_lock = os.path.abspath(os.path.join(self.path, "uv.lock"))
+        root_lock = self._root_lock_path()
+        locks = sorted(
+            glob.glob(os.path.join(get_core_plugins_path(), "*", "uv.lock"))
+            + glob.glob(os.path.join(get_plugins_path(), "*", "uv.lock"))
+        )
+        constraints: Dict[str, str] = {}
+        for lock in locks:
+            if os.path.abspath(lock) == own_lock or not self._is_installed_here(os.path.dirname(lock), root_lock):
+                continue
+            try:
+                with open(lock, "rb") as f:
+                    packages = tomli.load(f).get("package", [])
+            except Exception as e:
+                log.warning(f"Ignoring unreadable {lock}: {e}")
+                continue
+            for pkg in packages:
+                # the plugin project itself (virtual / editable source) is not a library
+                if "version" not in pkg or {"virtual", "editable"} & set(pkg.get("source", {})):
+                    continue
+                if pkg["name"] in pinned or pkg["name"] in constraints:
+                    continue
+                constraints[pkg["name"]] = f"{pkg['name']}=={pkg['version']}"
+        return list(constraints.values())
+
+    @classmethod
+    def _is_installed_here(cls, plugin_dir: str, root_lock: str) -> bool:
+        """The plugin's dependencies were compiled and installed against the current root uv.lock."""
+        pyproject_file = os.path.join(plugin_dir, "pyproject.toml")
+        if not os.path.exists(pyproject_file):
+            return False
+        inputs = [pyproject_file] + ([root_lock] if os.path.exists(root_lock) else [])
+        return cls._should_exit_from_installing_requirements(
+            os.path.join(plugin_dir, ".requirements_hash"), cls._hash_files(inputs),
+        )
+
     def _requirements_source(self) -> str | None:
         """Path to the plugin's pyproject.toml, or None if the plugin has no
         dependencies to install. requirements.txt is not supported: plugins
@@ -403,10 +452,15 @@ class Plugin:
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env
         )
+        output = []
         if proc.stdout:
             for line in proc.stdout:
                 log.debug(line.strip())
+                output.append(line.rstrip())
         proc.wait()
+        if proc.returncode != 0:
+            # e.g. the dependency conflicting with the root project or with another plugin
+            log.error(f"`{' '.join(cmd[:2])}` failed:\n" + "\n".join(output[-50:]))
         return proc.returncode
 
     def _install_requirements_sync(
@@ -418,8 +472,10 @@ class Plugin:
         The plugin's pyproject.toml is compiled into a fresh uv.lock —
         replacing any existing one — constrained against the root project's
         own uv.lock, so uv refuses to resolve a dangerous upgrade or
-        downgrade of a system library. Dependencies are then installed
-        strictly from that lock into the active virtual environment.
+        downgrade of a system library, and against the uv.lock of the other
+        installed plugins, so it never replaces a library another plugin
+        installed. Dependencies are then installed strictly from that lock
+        into the active virtual environment.
 
         If *lock_fh* is given the lock is already held by the caller;
         otherwise a blocking flock is acquired.
@@ -446,6 +502,7 @@ class Plugin:
             with open(pyproject_file, "r") as f:
                 pyproject_text = f.read()
             constraints = self._root_lock_constraints()
+            constraints += self._other_plugins_constraints({c.split("==")[0] for c in constraints})
             constraint_block = (
                 "\n[tool.uv]\nconstraint-dependencies = [\n"
                 + "".join(f'    "{c}",\n' for c in constraints)
@@ -491,8 +548,9 @@ class Plugin:
             if own_lock:
                 fcntl.flock(lf, fcntl.LOCK_UN)
                 lf.close()
-            # Clean __pycache__ directories (cross-platform approach)
-            for pycache in Path("/app").rglob("__pycache__"):
+            # Clean the plugin's own __pycache__ directories: its bytecode is the only one a reinstall can make stale.
+            # Never the whole app: it holds the virtual environment (shared by the instances of a cluster) and the data
+            for pycache in Path(self.path).rglob("__pycache__"):
                 shutil.rmtree(pycache, ignore_errors=True)
 
     # lists of hooks and tools

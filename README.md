@@ -74,7 +74,7 @@ Everything can be done via the [Admin Panel](https://www.github.com/Grinning-Cat
 > - `Conversation History`: to store and retrieve the conversation history;
 > - `Factories`: extending objects like LLMs, Embedders, File Managers, Chunkers;
 > - `Interactions`: add the interaction handler to the language model;
-> - `March Hare`: handling events via RabbitMQ;
+> - `March Hare`: keeps the PODs aligned through a Redis Stream (installation, uninstallation and system-level toggle of the plugins);
 > - `Memory`: interacting with Working Memory and adding a handler to trace the activities of the Embedder;
 > - `Multimodality`: a plugin that adds multimodal capabilities to the Grinning Cat framework, enabling the processing of images;
 > - `White Rabbit`: cron and schedule tasks;

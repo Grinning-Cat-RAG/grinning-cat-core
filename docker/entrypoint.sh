@@ -4,7 +4,8 @@ set -e
 echo "--- 🐱 Grinning Cat Boot Sequence ---"
 
 echo "Running migrations..."
-uv run python migrations/manage_migrations.py upgrade head
+# the venv is on the PATH: `uv run` would sync (and build) the project at every start, which needs the network
+python migrations/manage_migrations.py upgrade head
 
 echo "--- 🐱 Starting Grinning Cat ---"
 

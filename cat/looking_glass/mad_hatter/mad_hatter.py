@@ -104,13 +104,14 @@ class MadHatter:
         # install the extracted plugin
         return await self.install_extracted_plugin(plugin_id)
 
-    async def install_extracted_plugin(self, plugin_id: str) -> str:
+    async def install_extracted_plugin(self, plugin_id: str, persist: bool = True) -> str:
         """
         Installs and activates a plugin if it is not already activated. This method verifies if the given plugin ID
         exists among core plugin IDs, and if not, activates the corresponding plugin.
 
         Args:
             plugin_id: Unique identifier for the plugin to be installed.
+            persist: False when another instance installed the plugin and already stored the active plugins.
 
         Returns:
             The plugin ID as a string, whether it was already installed or newly activated.
@@ -119,7 +120,7 @@ class MadHatter:
         if plugin_id in self.get_core_plugins_ids:
             return plugin_id
 
-        await self.activate_plugin(plugin_id)
+        await self.activate_plugin(plugin_id, persist=persist)
 
         return plugin_id
 
@@ -127,7 +128,8 @@ class MadHatter:
         """
         Uninstalls the specified plugin by its ID. This includes removing the plugin folder, deactivating the plugin if
         it is active, and clearing it from any stored metadata. If the plugin is a dependency of other plugins, the
-        operation is not performed and an exception is raised.
+        operation is not performed and an exception is raised. If its folder is already gone (another instance
+        uninstalled it), the plugin is only deactivated in memory.
 
         Args:
             plugin_id (str): The unique identifier of the plugin to be uninstalled.
@@ -136,7 +138,12 @@ class MadHatter:
             Exception: If the plugin is a dependency of other plugins, an exception is raised with the list of dependent
                 plugins.
         """
-        if not self.plugin_exists(plugin_id) or plugin_id in self.get_core_plugins_ids:
+        if plugin_id in self.get_core_plugins_ids:
+            return
+
+        if not self.plugin_exists(plugin_id):
+            # another instance already uninstalled it (folder and database): this one only forgets it
+            await self._forget_plugin(plugin_id)
             return
 
         # if the plugin is within the dependencies of other plugins, raise an exception
@@ -147,7 +154,8 @@ class MadHatter:
                 f"{', '.join(dependent_plugins)}"
             )
 
-        plugin_path = self.plugins[plugin_id].path
+        # from the folder: an installed but inactive plugin is not among the loaded ones
+        plugin_path = self._get_plugin_folder_path(plugin_id)
 
         # deactivate plugin if it is active (will sync cache)
         if plugin_id in self.active_plugins:
@@ -158,7 +166,25 @@ class MadHatter:
 
         await crud_plugins.destroy_plugin(plugin_id)
 
-    async def activate_plugin(self, plugin_id: str):
+    async def _forget_plugin(self, plugin_id: str):
+        """Deactivate in memory a plugin whose folder is gone, without touching the database: another instance
+        uninstalled it, and the active plugins it stored no longer contain it."""
+        if plugin_id not in self.plugins and plugin_id not in self.active_plugins:
+            return
+
+        if plugin := self.plugins.pop(plugin_id, None):
+            try:
+                await plugin.deactivate(self.agent_key)
+            except Exception as e:
+                log.error(f"Could not deactivate plugin {plugin_id}: {e}")
+        if plugin_id in self.active_plugins:
+            self.active_plugins.remove(plugin_id)
+
+        await self._on_finish_discovering_plugins(persist=False)
+
+    async def activate_plugin(self, plugin_id: str, persist: bool = True):
+        """Activate the plugin. With ``persist=False`` the list of the active plugins is not stored in the database:
+        another instance already stored it, this one is only catching up (see BillTheLizard.sync_system_plugins)."""
         if not self.plugin_exists(plugin_id):
             raise Exception(f"Plugin {plugin_id} not present in plugins folder")
 
@@ -166,9 +192,10 @@ class MadHatter:
             # Add the plugin in the list of active plugins
             self.active_plugins.append(plugin_id)
 
-        await self._on_finish_discovering_plugins()
+        await self._on_finish_discovering_plugins(persist=persist)
 
-    async def deactivate_plugin(self, plugin_id: str):
+    async def deactivate_plugin(self, plugin_id: str, persist: bool = True):
+        """Deactivate the plugin. ``persist``: as in :meth:`activate_plugin`."""
         if not self.plugin_exists(plugin_id):
             raise Exception(f"Plugin {plugin_id} not present in plugins folder")
 
@@ -195,7 +222,7 @@ class MadHatter:
             self.active_plugins.remove(plugin_id)
             self.plugins.pop(plugin_id, None)
 
-            await self._on_finish_discovering_plugins()
+            await self._on_finish_discovering_plugins(persist=persist)
         except Exception as e:
             log.error(f"Could not deactivate plugin {plugin_id}: {e}")
 
@@ -235,7 +262,7 @@ class MadHatter:
             log.error(f"Circular dependency detected among active plugins: {e}. Falling back to original order.")
             return plugin_ids
 
-    async def _on_finish_discovering_plugins(self):
+    async def _on_finish_discovering_plugins(self, persist: bool = True):
         # Deduplicate active plugins preserving insertion order
         self.active_plugins = utils.deduplicate_list(self.active_plugins)
 
@@ -243,9 +270,10 @@ class MadHatter:
         self.active_plugins = self._topological_sort_plugins(self.active_plugins)
 
         # store active plugins in db
-        await crud_settings.upsert_setting_by_name(
-            self.agent_key, Setting(name="active_plugins", value=self.active_plugins),
-        )
+        if persist:
+            await crud_settings.upsert_setting_by_name(
+                self.agent_key, Setting(name="active_plugins", value=self.active_plugins),
+            )
 
         log.debug(f"Agent '{self.agent_key}' - ACTIVE PLUGINS:")
         log.debug(self.active_plugins)

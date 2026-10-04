@@ -22,6 +22,8 @@ class MarchHareConfig:
     events = {
         "PLUGIN_INSTALLATION": "plugin_installation",
         "PLUGIN_UNINSTALLATION": "plugin_uninstallation",
+        # a plugin was toggled on a system level: the other PODs align their plugins with the database
+        "PLUGIN_SYSTEM_TOGGLE": "plugin_system_toggle",
     }
 
 
@@ -258,8 +260,15 @@ async def _handle_plugin_event(lizard, data: dict) -> None:
             return
 
         if event_type == MarchHareConfig.events["PLUGIN_INSTALLATION"]:
-            await lizard.plugin_manager.install_extracted_plugin(payload["plugin_id"])
+            # the instance that installed the plugin already stored the active plugins
+            await lizard.plugin_manager.install_extracted_plugin(payload["plugin_id"], persist=False)
             lizard.activate_plugin_endpoints(payload["plugin_id"])
+            return
+
+        if event_type == MarchHareConfig.events["PLUGIN_SYSTEM_TOGGLE"]:
+            # the event only says that something changed: the state is read from the database, so duplicated,
+            # late or out-of-order events cannot leave this POD behind
+            await lizard.sync_system_plugins()
             return
 
         if event_type == MarchHareConfig.events["PLUGIN_UNINSTALLATION"]:
@@ -312,6 +321,13 @@ async def after_lizard_bootstrap(lizard) -> None:
 
     _march_hare.mark_ready()
 
+    # the events published while this POD was starting were not handled (the listener reads only the new ones, and
+    # dispatches nothing until now): align once with the system plugins stored in the database
+    try:
+        await lizard.sync_system_plugins()
+    except Exception as e:
+        log.error(f"[March Hare] Could not align the system plugins with the database: {e}")
+
 
 @hook(priority=0)
 async def before_lizard_shutdown(lizard) -> None:
@@ -351,3 +367,14 @@ async def lizard_notify_plugin_uninstallation(plugin_id, lizard) -> None:
             payload={"plugin_id": plugin_id},
             stream_name=MarchHareConfig.streams["PLUGIN_EVENTS"],
         )
+
+
+@hook(priority=0)
+async def after_plugin_toggling_on_system(plugin_id: str, lizard) -> None:
+    global _march_hare
+
+    await _march_hare.notify_event(  # type: ignore[union-attr]
+        event_type=MarchHareConfig.events["PLUGIN_SYSTEM_TOGGLE"],
+        payload={"plugin_id": plugin_id},
+        stream_name=MarchHareConfig.streams["PLUGIN_EVENTS"],
+    )

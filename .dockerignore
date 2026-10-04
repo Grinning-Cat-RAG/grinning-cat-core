@@ -23,6 +23,11 @@ venv/
 **/local_vector_memory
 **/.install.lock
 **/.requirements_hash
+# per-plugin locks are compiled at build time: a developer's local ones must not override them
+cat/core_plugins/*/uv.lock
+# user plugins are installed at runtime (only the folder, with its readme, ships)
+cat/plugins/*
+!cat/plugins/readme.md
 **/dormouse
 .pod_id
 .welcome

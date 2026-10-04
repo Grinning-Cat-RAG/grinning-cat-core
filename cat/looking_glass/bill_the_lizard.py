@@ -50,6 +50,8 @@ class BillTheLizard(OrchestratorMixin, NonCopyableMixin):
         self._plugin_registry = None
         self._fastapi_app = None
         self._pending_endpoints = []
+        # one alignment with the database at a time: the last one reads the last state (see sync_system_plugins)
+        self._sync_lock = asyncio.Lock()
 
         # Minimal sync setup — plugin manager is created but NOT yet discovered.
         self.plugin_manager = MadHatter(self.agent_key)  # type: ignore[arg-type]
@@ -341,6 +343,48 @@ class BillTheLizard(OrchestratorMixin, NonCopyableMixin):
 
         await self.plugin_manager.execute_hook("after_plugin_toggling_on_system", plugin_id, caller=self)
 
+    async def sync_system_plugins(self) -> None:
+        """
+        Align the plugins this instance runs on a system level with the ones active in the database, after another
+        instance toggled one of them: only the plugins whose state differs are deactivated or activated, with their
+        endpoints; the others are left untouched. The list of the active plugins is not written back: the instance
+        that toggled the plugin already stored it, and the database is the source of truth.
+
+        The agents need nothing: their plugins are read from the database whenever a Cheshire Cat is created.
+
+        One alignment at a time (events are handled concurrently), and a plugin that fails does not stop the others.
+        """
+        async with self._sync_lock:
+            wanted = await self.plugin_manager.load_active_plugins_ids_from_db()
+            manager = self.plugin_manager
+
+            # dependents before their dependencies: the active plugins are sorted topologically
+            for plugin_id in reversed(list(manager.active_plugins)):
+                if plugin_id in wanted:
+                    continue
+                plugin = manager.plugins.get(plugin_id)
+                endpoints = list(plugin.endpoints) if plugin else []
+                try:
+                    if manager.plugin_exists(plugin_id):
+                        await manager.deactivate_plugin(plugin_id, persist=False)
+                    else:  # its folder is gone: uninstalled by another instance
+                        await manager.uninstall_plugin(plugin_id)
+                except Exception as e:
+                    log.error(f"Could not deactivate plugin {plugin_id} while aligning with the database: {e}")
+                if plugin_id not in manager.active_plugins:
+                    self._deactivate_endpoints(endpoints)
+
+            # dependencies before their dependents: the stored list is sorted topologically
+            for plugin_id in wanted:
+                if plugin_id in manager.active_plugins or not manager.plugin_exists(plugin_id):
+                    continue
+                try:
+                    await manager.activate_plugin(plugin_id, persist=False)
+                except Exception as e:
+                    log.error(f"Could not activate plugin {plugin_id} while aligning with the database: {e}")
+                if plugin_id in manager.active_plugins:
+                    self.activate_plugin_endpoints(plugin_id)
+
     def activate_plugin_endpoints(self, plugin_id: str):
         # Store endpoints for later activation
         self._pending_endpoints = safe_deepcopy(self.plugin_manager.plugins[plugin_id].endpoints)
@@ -357,11 +401,16 @@ class BillTheLizard(OrchestratorMixin, NonCopyableMixin):
                 continue
             await ccat.plugin_manager.activate_plugin(plugin_id)
 
+    def deactivate_plugin_endpoints(self, plugin_id: str) -> None:
+        self._deactivate_endpoints(self.plugin_manager.plugins[plugin_id].endpoints)
+
+    def _deactivate_endpoints(self, endpoints) -> None:
+        for endpoint in endpoints:
+            endpoint.deactivate(self.fastapi_app)
+
     async def on_plugin_deactivate(self, plugin_id: str):
         # deactivate the endpoints from the plugin
-        if endpoints := self.plugin_manager.plugins[plugin_id].endpoints:
-            for endpoint in endpoints:
-                endpoint.deactivate(self.fastapi_app)
+        self.deactivate_plugin_endpoints(plugin_id)
 
         for ccat_id in await crud_plugins.get_agents_plugin_keys(plugin_id):
             # if the plugin is not active for the Cheshire Cat, then skip it

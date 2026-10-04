@@ -62,7 +62,11 @@ def after_plugin_settings_update(plugin_id: str, settings: Dict[str, Any], cat) 
 @hook(priority=0)
 def after_plugin_toggling_on_system(plugin_id: str, lizard: BillTheLizard) -> None:
     """
-    Hook that gets executed immediately after toggling a plugin on a system level
+    Hook that gets executed immediately after toggling a plugin on a system level.
+
+    It runs only on the instance (POD) that received the toggle: the other PODs align their plugins with the
+    database (March Hare) without running it. For a per-POD reaction, use the `activated` / `deactivated` overrides of
+    `@plugin`, which run on every POD.
 
     Args:
         plugin_id (str): The unique identifier of the plugin being toggled.

@@ -7,7 +7,8 @@ pyproject.toml + uv).
 Each plugin's pyproject.toml is compiled into a fresh `uv.lock` — replacing any
 existing one — constrained against the root project's own `uv.lock`, so uv
 refuses to resolve a dangerous upgrade or downgrade of a system library the
-core app depends on. Dependencies are then installed strictly from that lock
+core app depends on, and against the `uv.lock` of the plugins compiled before it
+in this run, so it never replaces a library another plugin installed. Dependencies are then installed strictly from that lock
 into the active virtual environment, without removing packages unrelated to
 this plugin (`--inexact`).
 
@@ -42,6 +43,20 @@ def root_lock_constraints():
         f"{pkg['name']}=={pkg['version']}"
         for pkg in data.get("package", [])
         if "version" in pkg
+    ]
+
+
+def lock_pins(lock_file: str, pinned: set) -> list:
+    """Pins of the libraries in a plugin's uv.lock, except the ones in *pinned*
+    (mirrors Plugin._other_plugins_constraints)."""
+    with open(lock_file, "rb") as f:
+        packages = tomllib.load(f).get("package", [])
+    return [
+        f"{pkg['name']}=={pkg['version']}"
+        for pkg in packages
+        if "version" in pkg
+        and not {"virtual", "editable"} & set(pkg.get("source", {}))
+        and pkg["name"] not in pinned
     ]
 
 
@@ -86,6 +101,11 @@ for pattern in PLUGIN_GLOBS:
             continue
         print(f"Compiling and installing dependencies for {path}", file=sys.stderr)
         compile_and_install(path, constraints)
+        # the next plugins can never replace what this one installed (only the locks of this run: a stale uv.lock
+        # left in the folder may come from another root uv.lock)
+        constraints = constraints + lock_pins(
+            os.path.join(os.path.dirname(path), "uv.lock"), {c.split("==")[0] for c in constraints},
+        )
         found += 1
 
 if found == 0:

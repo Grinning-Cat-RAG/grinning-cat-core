@@ -178,6 +178,14 @@ class MigrationEnvironment:
         """Upgrade to target revision"""
         current = self.get_current_head()
 
+        # a revision this code does not know (e.g. applied by a newer image, before a rollback): the chain cannot be
+        # computed from it, and would restart from the base, re-applying every migration over migrated data
+        if current and current not in self.revisions:
+            raise RuntimeError(
+                f"The database is at revision {current}, unknown to these migrations: downgrade it first with the "
+                f"version that knows it (manage_migrations.py downgrade <revision>), or upgrade the application"
+            )
+
         if target == "head":
             target = self._get_head_revision()  # type: ignore[union-attr]
 

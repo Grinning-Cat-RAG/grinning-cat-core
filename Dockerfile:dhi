@@ -3,6 +3,13 @@
 # =============================================================================
 # Grinning Cat Core — Hardened image (Docker Hardened Images variant)
 #
+# Same installation path as the standard Dockerfile — pure uv, from pyproject.toml + uv.lock:
+#   - core dependencies: `uv sync --frozen` against the root uv.lock;
+#   - core plugins: scripts/install_plugin_requirements.py (each plugin's pyproject.toml compiled against the root
+#     uv.lock) + scripts/hash_plugin_requirements.py, so the plugins take the fast path at runtime;
+#   - migrations applied at startup by docker/entrypoint.sh.
+# On top of it, the NLP stack (spaCy + NLTK and their models) needed by plugins like grinning-cat-plus.
+#
 # Hardening applied:
 #   1. MULTI-STAGE: compilers & dev-headers (build-essential, libmagic-dev) live
 #      ONLY in the builder stage — they never appear in the final image layers.
@@ -18,20 +25,30 @@
 # apt-get used to install them. The `-dev` variant does NOT preinstall compilers
 # (gcc/make are absent by default), so confining `build-essential` to the builder
 # stage still keeps the toolchain out of the final image.
+#
+# PYTHON_IMAGE / UV_IMAGE can be overridden (--build-arg) to build without access to dhi.io, e.g. to test the
+# Dockerfile: the replacement must provide python3.13 with apt, a `nonroot` user (uid/gid 65532) and
+# /usr/local/bin/uv respectively.
 # =============================================================================
+
+ARG PYTHON_IMAGE=dhi.io/python:3.13-dev
+ARG UV_IMAGE=dhi.io/uv:0
 
 # Build-time proxy only — consumed during image construction, never baked in.
 ARG HTTP_PROXY
 ARG HTTPS_PROXY
 ARG NO_PROXY
 
+FROM ${UV_IMAGE} AS uv
+
 # ---------------------------------------------------------------------------
 # Stage 1 — BUILDER
 # ---------------------------------------------------------------------------
-FROM dhi.io/python:3.13-dev AS builder
+FROM ${PYTHON_IMAGE} AS builder
 
 ENV PYTHONUNBUFFERED=1 \
     UV_LINK_MODE=copy \
+    UV_PYTHON_DOWNLOADS=never \
     PYTHONDONTWRITEBYTECODE=1 \
     PATH="/app/.venv/bin:$PATH" \
     VIRTUAL_ENV=/app/.venv \
@@ -39,7 +56,7 @@ ENV PYTHONUNBUFFERED=1 \
     NLTK_ALLOW_PROXIED_URLOPEN=1
 
 # uv — fast deterministic installs (copied again into the runtime stage)
-COPY --from=dhi.io/uv:0 /usr/local/bin/uv /usr/local/bin/uvx /usr/local/bin/
+COPY --from=uv /usr/local/bin/uv /usr/local/bin/uvx /usr/local/bin/
 
 WORKDIR /app
 
@@ -52,56 +69,70 @@ RUN apt-get update && \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# 1) Early, cacheable model layer: COPY the pinned requirements file ALONE, then
-#    create the venv, install ONLY spacy+nltk, and pre-download the spaCy
-#    models + NLTK data. By keeping the other manifests (pyproject.toml,
-#    uv.lock, requirements.txt, requirements-plugins.txt) OUT of this layer's
-#    inputs, a dep bump or core_plugins change does NOT invalidate it — the
-#    heavy model downloads are reused across builds, rebuilding only when
-#    requirements-models.txt itself changes.
-# `uv pip install` never prunes the venv, so the preinstall set AND the models
-# downloaded by `spacy download` survive the subsequent core/plugins layers.
-# NLTK data stays under /app/nltk_data (survives the non-root switch) and egress
-#    uses the trusted build proxy (NLTK_ALLOW_PROXIED_URLOPEN=1).
-COPY requirements-models.txt ./
+# 1) Core layer: the core's dependencies, exactly as locked in uv.lock (same command as the standard Dockerfile).
+COPY ./pyproject.toml ./uv.lock ./LICENSE ./
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv venv --seed .venv && \
-    uv pip install --python .venv -r requirements-models.txt && \
-    spacy download it_core_news_lg && \
-    spacy download en_core_web_lg && \
-    spacy download en_core_web_sm && \
-    python -m nltk.downloader -d /app/nltk_data punkt averaged_perceptron_tagger
+    uv sync --frozen --no-install-project --no-upgrade --no-dev --python python3.13
 
-# 2) Core layer: framework deps only. Depends solely on requirements.txt, so a
-#    plugin bump never rebuilds it and a core bump never re-downloads models.
-COPY requirements.txt ./
-RUN --mount=type=cache,target=/root/.cache/uv \
-    uv pip install --python .venv -r requirements.txt
+# 2) NLP layer: spaCy + NLTK, their models and the NLTK data, for the plugins that need them (e.g. grinning-cat-plus,
+#    through unstructured[all-docs]). They are not dependencies of the core, so they are not in its pyproject.toml:
+#    like a plugin, they are declared in a throwaway project below, compiled against the root uv.lock — they can never
+#    move a library the core depends on — and installed into the venv without touching anything else (--inexact).
+#    NLTK data stays under /app/nltk_data (survives the non-root switch) and egress uses the trusted build proxy
+#    (NLTK_ALLOW_PROXIED_URLOPEN=1).
+#    TODO (to decide): the throwaway project and its uv.lock are removed below, so the NLP libraries the core does not
+#    lock itself (thinc, blis, srsly, weasel, typer, ...) are NOT among the constraints of the plugins compiled later
+#    (scripts/install_plugin_requirements.py at build time, Plugin._other_plugins_constraints at runtime): a plugin
+#    may replace them in the venv and break spaCy. Options: keep the lock (e.g. /app/.nlp/uv.lock) and make the core
+#    read it as extra constraints, or a generic folder of constraint locks in the core that this image fills.
+COPY <<'EOF' /build/nlp/pyproject.toml
+[project]
+name = "dhi-nlp-preinstall"
+version = "0"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    "spacy>=3.8,<3.9",
+    "nltk",
+    "it-core-news-lg @ https://github.com/explosion/spacy-models/releases/download/it_core_news_lg-3.8.0/it_core_news_lg-3.8.0-py3-none-any.whl",
+    "en-core-web-lg @ https://github.com/explosion/spacy-models/releases/download/en_core_web_lg-3.8.0/en_core_web_lg-3.8.0-py3-none-any.whl",
+    "en-core-web-sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl",
+]
+EOF
+RUN --mount=type=cache,target=/root/.cache/uv <<'EOF'
+set -eu
+# pin every package of the root uv.lock, as scripts/install_plugin_requirements.py does for the plugins
+python3 - <<'PY'
+import tomllib
 
-# 3) Plugins layer: everything plugin-related (libraries + their requirements
-#    hashes). Changes most often; isolated from 1) and 2).
-COPY requirements-plugins.txt ./
+with open("uv.lock", "rb") as f:
+    pins = [f"{p['name']}=={p['version']}" for p in tomllib.load(f).get("package", []) if "version" in p]
+with open("/build/nlp/pyproject.toml", "a") as f:
+    f.write("\n[tool.uv]\nconstraint-dependencies = [\n" + "".join(f'    "{c}",\n' for c in pins) + "]\n")
+PY
+uv lock --project /build/nlp
+uv sync --project /build/nlp --no-install-project --active --frozen --inexact
+python3 -m nltk.downloader -d /app/nltk_data punkt averaged_perceptron_tagger
+rm -rf /build
+EOF
+
+# 3) Core plugins layer: each plugin's pyproject.toml compiled against the root uv.lock and installed, then hashed
+#    (pyproject.toml + root uv.lock, as the runtime does) so their activation takes the fast path.
 COPY ./cat/core_plugins ./cat/core_plugins
-COPY ./scripts/hash_plugin_requirements.py ./scripts/hash_plugin_requirements.py
+COPY ./scripts ./scripts
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv pip install --python .venv -r requirements-plugins.txt && \
-    python3 scripts/hash_plugin_requirements.py
-
-# The project manifests must be present in /app for the RUNTIME stage: the
-# app (cat.main, plugin installs, `uv run` tooling) look for pyproject.toml
-# (and uv.lock) in the working directory. Copying them AFTER the 3 install
-# layers keeps their cache isolated: a pyproject/uv.lock change (i.e. ANY deps
-# bump) invalidates ONLY this layer, never the ~600 MB model/core/plugins layers.
-COPY pyproject.toml uv.lock ./
+    python3 scripts/install_plugin_requirements.py && \
+    python3 scripts/hash_plugin_requirements.py && \
+    find ./ -type d -name __pycache__ -exec rm -rf {} +
 
 # ---------------------------------------------------------------------------
 # Stage 2 — RUNTIME (final)
 # ---------------------------------------------------------------------------
-FROM dhi.io/python:3.13-dev AS final
+FROM ${PYTHON_IMAGE} AS final
 
 ENV PYTHONUNBUFFERED=1 \
     UV_NO_CACHE=1 \
     UV_LINK_MODE=copy \
+    UV_PYTHON_DOWNLOADS=never \
     PYTHONDONTWRITEBYTECODE=1 \
     PATH="/app/.venv/bin:$PATH" \
     VIRTUAL_ENV=/app/.venv \
@@ -127,31 +158,32 @@ RUN apt-get update && \
 # Required by unstructured[all-docs] in the grinning-cat-plus plugin
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-        libreoffice*nogui \
+        libreoffice-nogui \
         pandoc \
         ffmpeg \
-        tesseract-ocr-{ita,eng} \
+        tesseract-ocr-ita \
+        tesseract-ocr-eng \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
 # uv runtime binary — needed for on-demand plugin dependency installs
-COPY --from=dhi.io/uv:0 /usr/local/bin/uv /usr/local/bin/uvx /usr/local/bin/
+COPY --from=uv /usr/local/bin/uv /usr/local/bin/uvx /usr/local/bin/
 
 WORKDIR /app
 
-# Application, virtualenv, spaCy models and NLTK data — owned by the runtime user
+# Application, virtualenv, plugin hashes and NLTK data — owned by the runtime user
 COPY --from=builder --chown=nonroot:nonroot /app /app
 
-RUN chown nonroot:nonroot /app
-
-# Fresh source + migrations + license
+# Fresh source + data + migrations + entrypoint
 COPY --chown=nonroot:nonroot ./cat ./cat
+COPY --chown=nonroot:nonroot ./data ./data
 COPY --chown=nonroot:nonroot ./migrations ./migrations
-COPY --chown=nonroot:nonroot ./LICENSE ./
+COPY --chown=nonroot:nonroot --chmod=755 ./docker/entrypoint.sh ./docker/entrypoint.sh
 
 # WORKDIR /app created the directory as root; the COPY --chown above only owned
 # the copied CONTENTS. The app writes top-level files in /app at runtime
 # (.pod_id, .welcome, dormouse/, creates data/), so own /app itself too.
+RUN chown nonroot:nonroot /app
 
 # Drop privileges for the runtime process and everything it spawns.
 # `nonroot` (uid/gid 65532) is the pre-provisioned unprivileged user shipped by
@@ -165,5 +197,8 @@ STOPSIGNAL SIGTERM
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=45s --retries=3 \
     CMD ["python", "-c", "import urllib.request, sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:80/health/liveness', timeout=3).status == 200 else 1)"]
+
+# applies the Redis migrations, then runs the command
+ENTRYPOINT ["./docker/entrypoint.sh"]
 
 CMD ["python", "-m", "cat.main"]
