@@ -273,6 +273,15 @@ async def plugin(lizard):
 
 @pytest.fixture(scope="function")
 def mocked_default_llm_answer_prompt():
+    """
+    Makes a turn answered by the default (unconfigured) LLM count as a normal answer, so that it is stored in the
+    conversation history.
+
+    It works because only `cat.utils.default_llm_answer_prompt` is replaced: the default LLM imported the function by
+    name and keeps answering with the original text, so StrayCat no longer recognises that answer as "no LLM
+    configured" and does not flag the turn with `with_llm_error`. Do not patch the other reference too: the tests
+    using this fixture need the turn to be stored.
+    """
     def mock_default_llm_answer_prompt() -> str:
         return "Ops AI: You did not configure a Language Model. Do it in the settings!"
 

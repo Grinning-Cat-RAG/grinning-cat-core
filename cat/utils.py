@@ -24,6 +24,8 @@ from cat.log import log
 _T = TypeVar("_T")
 
 SUFFIX_TO_CRYPT = ["_key", "_secret", "_password"]
+# Seconds an image URL has to answer: the download happens while preparing the agent's input for a chat turn
+IMAGE_DOWNLOAD_TIMEOUT_SECONDS = 10
 
 
 class singleton(Generic[_T]):
@@ -396,7 +398,7 @@ def retrieve_image(content_image: str | None) -> str | None:
                 image_data = f.read()
             return image_data
         # If the image is a URL, download it and encode it as a data URI.
-        response = requests.get(content_image)  # type: ignore[union-attr]
+        response = requests.get(content_image, timeout=IMAGE_DOWNLOAD_TIMEOUT_SECONDS)  # type: ignore[union-attr]
         response.raise_for_status()
         return response.content
 

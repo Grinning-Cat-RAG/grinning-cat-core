@@ -2,7 +2,8 @@ import hashlib
 import hmac
 import json
 from typing import List, Literal, get_args, Dict, Any
-import requests
+import asyncio
+import httpx
 from pydantic import BaseModel, Field
 
 from cat import (
@@ -35,33 +36,53 @@ WEBHOOK_CHESHIRECAT_EVENTS = [
     "vector_memory_files_transferred",
 ]
 
+# Seconds a webhook has to answer: hooks await the notifications, so an unresponsive endpoint must not hold them
+WEBHOOK_TIMEOUT_SECONDS = 10
+
 crypto = StringCrypto()
 
 
 class WebhookResponse(BaseModel):
     url: str
     event: WEBHOOK_EVENT
-    header_key: str | None = Field(default="X-CheshireCat-Signature")
+    # the header carrying the signature: without it the receiver could never verify a notification
+    header_key: str = Field(default="X-CheshireCat-Signature")
 
 
 class WebhookPayload(WebhookResponse):
     secret: str
 
 
-def trigger_webhook(webhook_data: WebhookPayload, payload: Dict[str, Any]):
+async def trigger_webhook(webhook_data: WebhookPayload, payload: Dict[str, Any]):
     target_url = webhook_data.url
     custom_header_key = webhook_data.header_key
 
     secret = crypto.decrypt(webhook_data.secret)
 
-    signature = hmac.new(
-        secret.encode("utf-8"),
-        msg=json.dumps(payload, separators=(',', ':')).encode("utf-8"),
-        digestmod=hashlib.sha256,
-    ).hexdigest()
+    # the receiver verifies the signature against the bytes it gets: sign and send exactly the same body
+    body = json.dumps(payload, separators=(',', ':')).encode("utf-8")
+    signature = hmac.new(secret.encode("utf-8"), msg=body, digestmod=hashlib.sha256).hexdigest()
 
     headers = {"Content-Type": "application/json", custom_header_key: signature}
-    requests.post(target_url, json=payload, headers=headers)
+    # redirects are followed as requests did: 307/308 resend the signed POST, while 301/302/303 turn it into a GET
+    # without body, so a webhook URL answering with those never gets the notification
+    async with httpx.AsyncClient(timeout=WEBHOOK_TIMEOUT_SECONDS, follow_redirects=True) as client:
+        await client.post(target_url, content=body, headers=headers)
+
+
+async def trigger_webhooks(webhooks: List[Dict[str, Any]], payload: Dict[str, Any], what: str) -> None:
+    """
+    Notifies all the webhooks of an event concurrently, so that the caller waits at most one timeout. A failing or
+    unresponsive webhook is logged and does not prevent the others from being notified.
+    """
+    async def notify(webhook: Dict[str, Any]) -> None:
+        try:
+            await trigger_webhook(WebhookPayload(**webhook), payload)
+            log.info(f"Triggered the webhook '{webhook['url']}' {what}")
+        except Exception as e:
+            log.error(f"Failed to trigger the webhook '{webhook['url']}' {what}: {e}")
+
+    await asyncio.gather(*[notify(webhook) for webhook in webhooks])
 
 
 def parse_agent_key(info: AuthorizedInfo, webhook: WebhookPayload) -> str:
@@ -72,15 +93,9 @@ def parse_agent_key(info: AuthorizedInfo, webhook: WebhookPayload) -> str:
     return info.cheshire_cat.agent_key
 
 
-def notify_plugin_event_to_webhooks(plugin_id: str, webhooks: List[Dict[str, Any]], success: bool, what: str):
+async def notify_plugin_event_to_webhooks(plugin_id: str, webhooks: List[Dict[str, Any]], success: bool, what: str):
     payload = {"plugin_id": plugin_id, "success": success}
-
-    for webhook in webhooks:
-        try:
-            trigger_webhook(WebhookPayload(**webhook), payload)
-            log.info(f"Triggered webhook {webhook['url']} on plugin {what}")
-        except Exception as e:
-            log.error(f"Failed to trigger the webhook '{webhook['url']}' on plugin {what}: {e}")
+    await trigger_webhooks(webhooks, payload, f"on plugin {what}")
 
 
 @endpoint.get("/events", tags=["Webhooks"], prefix="/webhooks", response_model=List[str])
@@ -133,12 +148,7 @@ async def after_rabbithole_stored_documents(source, stored_points: List[PointStr
         "success": len(stored_points) > 0,
     }
 
-    for webhook in webhooks:
-        try:
-            trigger_webhook(WebhookPayload(**webhook), payload)
-            log.info(f"Triggered the webhook '{webhook['url']}' for the agent '{cat.agent_key}' on knowledge source loaded")
-        except Exception as e:
-            log.error(f"Failed to trigger the webhook '{webhook['url']}' for the agent '{cat.agent_key}' on knowledge source loaded: {e}")
+    await trigger_webhooks(webhooks, payload, f"for the agent '{cat.agent_key}' on knowledge source loaded")
 
 
 @hook(priority=0)
@@ -148,7 +158,7 @@ async def lizard_notify_plugin_installation(plugin_id: str, plugin_path: str, li
         return
 
     success = bool(plugin_id and lizard.plugin_manager.plugins.get(plugin_id))
-    notify_plugin_event_to_webhooks(plugin_id, webhooks, success, "installation")
+    await notify_plugin_event_to_webhooks(plugin_id, webhooks, success, "installation")
 
 
 @hook(priority=0)
@@ -158,7 +168,7 @@ async def lizard_notify_plugin_uninstallation(plugin_id: str, lizard) -> None:
         return
 
     success = lizard.plugin_manager.plugins.get(plugin_id) is None
-    notify_plugin_event_to_webhooks(plugin_id, webhooks, success, "uninstallation")
+    await notify_plugin_event_to_webhooks(plugin_id, webhooks, success, "uninstallation")
 
 
 @hook(priority=0)
@@ -169,12 +179,7 @@ async def after_all_cheshire_cats_embedded(success: bool, lizard) -> None:
 
     payload = {"success": success}
 
-    for webhook in webhooks:
-        try:
-            trigger_webhook(WebhookPayload(**webhook), payload)
-            log.info(f"Triggered webhook {webhook['url']} on embedder updated")
-        except Exception as e:
-            log.error(f"Failed to trigger the webhook '{webhook['url']}' on embedder updated: {e}")
+    await trigger_webhooks(webhooks, payload, "on embedder updated")
 
 
 @hook(priority=0)
@@ -185,12 +190,9 @@ async def after_file_manager_transfer_on_agent(success: bool, cat) -> None:
 
     payload = {"agent": cat.agent_key, "success": success}
 
-    for webhook in webhooks:
-        try:
-            trigger_webhook(WebhookPayload(**webhook), payload)
-            log.info(f"Triggered the webhook '{webhook['url']}' for the agent '{cat.agent_key}' on knowledge source files transferred")
-        except Exception as e:
-            log.error(f"Failed to trigger the webhook '{webhook['url']}' for the agent '{cat.agent_key}' on knowledge source files transferred: {e}")
+    await trigger_webhooks(
+        webhooks, payload, f"for the agent '{cat.agent_key}' on knowledge source files transferred",
+    )
 
 
 @hook(priority=0)
@@ -201,9 +203,6 @@ async def after_vector_memory_transfer_on_agent(success: bool, cat) -> None:
 
     payload = {"agent": cat.agent_key, "success": success}
 
-    for webhook in webhooks:
-        try:
-            trigger_webhook(WebhookPayload(**webhook), payload)
-            log.info(f"Triggered the webhook '{webhook['url']}' for the agent '{cat.agent_key}' on vector memory points transferred")
-        except Exception as e:
-            log.error(f"Failed to trigger the webhook '{webhook['url']}' for the agent '{cat.agent_key}' on vector memory points transferred: {e}")
+    await trigger_webhooks(
+        webhooks, payload, f"for the agent '{cat.agent_key}' on vector memory points transferred",
+    )

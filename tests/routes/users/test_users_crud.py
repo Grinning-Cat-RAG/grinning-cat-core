@@ -44,7 +44,9 @@ async def test_cannot_create_user_because_of_wrong_resource(client, secure_clien
         json=creds | {"permissions": {str(AuthResource.CHESHIRE_CAT): [str(AuthPermission.WRITE)]}},
         headers=secure_client_headers,
     )
+    # the request is valid: the permissions left once sanitized for a non-system agent are none (an app-level error)
     assert res.status_code == 400
+    assert res.json()["detail"] == "User must have at least one permission"
 
 
 async def test_cannot_create_duplicate_user(secure_client, secure_client_headers, cheshire_cat):
@@ -128,7 +130,7 @@ async def test_update_user(secure_client, secure_client_headers, cheshire_cat):
     # update unexisting attribute (bad request)
     updated_user = {"username": "Alice", "something": 42}
     response = await secure_client.put(f"/users/{user_id}", json=updated_user, headers=secure_client_headers)
-    assert response.status_code == 400
+    assert response.status_code == 422
 
     response = await secure_client.get(f"/users/{user_id}", headers=secure_client_headers)
     assert response.status_code == 200

@@ -197,6 +197,8 @@ class StrayCat(BotMixin, NonCopyableMixin):
             UserMessage
         )
 
+        # the error of a failed turn, sent in the answer so that a client can tell it without reading the text
+        error: str | None = None
         try:
             embedder = await self.lizard.embedder()
             config = RecallSettings(
@@ -227,12 +229,17 @@ class StrayCat(BotMixin, NonCopyableMixin):
                 agent_output = await self._run_agent(system_prompt, config, procedures_task)
         except Exception as e:
             log.error(f"Agent id: {self.agent_key}. Error: {e}")
+            error = str(e) or type(e).__name__
             agent_output = AgenticWorkflowOutput(
                 output=f"An error occurred: {e}. Please, contact your support service.", with_llm_error=True
             )
 
+        if agent_output.with_llm_error and error is None:
+            # e.g. no language model configured: the output is the notice to show
+            error = agent_output.output
+
         # prepare a final cat message
-        final_output = CatMessage(text=agent_output.output)  # type: ignore[arg-type]
+        final_output = CatMessage(text=agent_output.output, error=error)  # type: ignore[arg-type]
 
         # run a message through plugins
         final_output = utils.restore_original_model(
@@ -243,6 +250,14 @@ class StrayCat(BotMixin, NonCopyableMixin):
         )
 
         return final_output  # type: ignore[return-value]
+
+    @staticmethod
+    async def _langchain_history(history: List, latest_n: int) -> List:
+        """
+        Converts the latest messages of the history for the LLM. Converting a message may download its image (blocking
+        I/O), so it runs in a worker thread: the event loop keeps serving every other client.
+        """
+        return await asyncio.to_thread(lambda: [h.langchainfy() for h in history[-latest_n:]])
 
     async def _run_agent(
         self, system_prompt: str, config: RecallSettings, procedures_task: asyncio.Future
@@ -259,7 +274,7 @@ class StrayCat(BotMixin, NonCopyableMixin):
             system_prompt=system_prompt,
             user_prompt=self.working_memory.user_message.text,  # type: ignore[arg-type]
             context=[m.document for m in self.working_memory.context_memories],
-            history=[h.langchainfy() for h in self.working_memory.history[-config.latest_n_history:]],
+            history=await self._langchain_history(self.working_memory.history, config.latest_n_history),
             tools=tools,
         )
         agent_input = await plugin_manager.execute_hook("before_agentic_workflow", agent_input, caller=self)

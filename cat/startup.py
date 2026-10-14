@@ -1,5 +1,5 @@
+import json
 from contextlib import asynccontextmanager
-
 from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -72,6 +72,15 @@ def custom_generate_unique_id(route: APIRoute):
 
 
 # REST API
+def _json_safe(value):
+    """The value itself if it can be serialized to JSON, its string representation otherwise."""
+    try:
+        json.dumps(value, allow_nan=False)  # as strict as the JSONResponse that will serialize it
+        return value
+    except (TypeError, ValueError):
+        return str(value)
+
+
 def create_app() -> FastAPI:
     # fail fast: the process must not start with missing/invalid fundamental env variables (e.g. CAT_JWT_SECRET)
     ensure_valid_env()
@@ -140,18 +149,15 @@ def create_app() -> FastAPI:
                 "msg": str(error.get("msg", "")),
                 "type": str(error.get("type", ""))
             }
-            # Add context if it exists and is serializable
+            # Add the context, made serializable: a validator raising ValueError puts the exception object in it
             if "ctx" in error:
-                try:
-                    serializable_error["ctx"] = error["ctx"]
-                except (TypeError, ValueError):
-                    # If ctx is not serializable, convert to string
-                    serializable_error["ctx"] = str(error["ctx"])
+                serializable_error["ctx"] = {key: _json_safe(value) for key, value in error["ctx"].items()}
 
             serializable_errors.append(serializable_error)
 
+        # 422, the status FastAPI documents in the OpenAPI schema of every endpoint for request validation errors
         return JSONResponse(
-            status_code=400,
+            status_code=422,
             content={"detail": serializable_errors}
         )
 

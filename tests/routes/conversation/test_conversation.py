@@ -278,7 +278,7 @@ async def test_change_attributes_to_conversation(secure_client, secure_client_he
         f"/conversations/{chat_id}",
         headers={**secure_client_headers, **{"X-User-ID": user["id"]}},
     )
-    assert response.status_code == 400
+    assert response.status_code == 422
 
 
 async def test_get_empty_conversations(secure_client, secure_client_headers, cheshire_cat):
@@ -399,3 +399,30 @@ async def test_get_conversation(secure_client, secure_client_headers, mocked_def
     assert response.status_code == 200
     assert json_response["chat_id"] == json_response["name"]  # chat_id and name are the same
     assert json_response["num_messages"] == 4  # 2 mex + 2 reply
+
+
+async def test_a_turn_without_a_configured_llm_is_an_error_and_is_not_stored(secure_client, secure_client_headers, cheshire_cat):
+    import json as json_lib
+
+    from cat.utils import default_llm_answer_prompt
+
+    user = await create_new_user(
+        secure_client,
+        "user",
+        headers={"Authorization": f"Bearer {api_key}", "X-Agent-ID": agent_id},
+        permissions=get_base_permissions(),
+    )
+
+    res = await send_websocket_message(
+        {"text": "It's late! It's late!"}, secure_client, api_key, ch_id=chat_id, query_params={"user_id": user["id"]}
+    )
+
+    message = json_lib.loads(res["content"])["message"]
+    assert message["error"] == default_llm_answer_prompt()  # a client can tell the failure without reading the text
+
+    user = await crud_users.get_user_by_username(agent_id, "user")
+    response = await secure_client.get(
+        f"/conversations/{chat_id}/history", headers={**secure_client_headers, **{"X-User-ID": user["id"]}}
+    )
+    assert response.status_code == 200
+    assert response.json()["history"] == []  # a failed turn is not stored

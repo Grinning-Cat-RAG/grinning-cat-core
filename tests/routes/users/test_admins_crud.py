@@ -125,7 +125,7 @@ async def test_update_admin(client):
     # update unexisting attribute (bad request)
     updated_admin = {"username": "Alice", "something": 42}
     response = await client.put(f"/users/{admin_id}", json=updated_admin, headers=await get_client_admin_headers(client))
-    assert response.status_code == 400
+    assert response.status_code == 422
 
     response = await client.get(f"/users/{admin_id}", headers=await get_client_admin_headers(client))
     assert response.status_code == 200

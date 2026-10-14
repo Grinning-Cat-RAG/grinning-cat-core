@@ -41,7 +41,7 @@ async def test_webhooks_create_wrong_payloads(secure_client, secure_client_heade
         "event": "plugin_installed",
     }
     res = await secure_client.post("/webhooks/", json=payload_no_secret, headers=secure_client_headers)
-    assert res.status_code == 400
+    assert res.status_code == 422
 
     payload_wrong_event = {
         "url": "https://example.com",
@@ -49,7 +49,16 @@ async def test_webhooks_create_wrong_payloads(secure_client, secure_client_heade
         "secret": "secret",
     }
     res = await secure_client.post("/webhooks/", json=payload_wrong_event, headers=secure_client_headers)
-    assert res.status_code == 400
+    assert res.status_code == 422
+
+    payload_null_header_key = {
+        "url": "https://example.com",
+        "event": "plugin_installed",
+        "secret": "secret",
+        "header_key": None,
+    }
+    res = await secure_client.post("/webhooks/", json=payload_null_header_key, headers=secure_client_headers)
+    assert res.status_code == 422
 
 
 async def test_webhooks_create(secure_client, secure_client_headers, cheshire_cat):

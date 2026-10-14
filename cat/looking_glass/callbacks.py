@@ -216,12 +216,6 @@ class WebSocketCallbackManager(AsyncCallbackHandler):
             notification = ToolMessage(tool=tool_name, input=run_data.input, output=output, duration=duration)
             await self.notifier.send_tool_message(notification.model_dump_json())
 
-    async def on_tool_error(self, error: Exception, **kwargs: Any) -> None:
-        await self.notifier.send_error(error)
-
-    async def on_chain_error(self, error: Exception, **kwargs: Any) -> None:
-        await self.notifier.send_error(error)
-
     async def on_agent_action(self, action: AgentAction, **kwargs):
         await self.notifier.send_thought_message(action.log)
 

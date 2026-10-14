@@ -29,7 +29,7 @@ async def test_memory_recall_default_success(secure_client, secure_client_header
 # search without query should throw error
 async def test_memory_recall_without_query_error(secure_client, secure_client_headers, cheshire_cat):
     response = await secure_client.get("/memory/recall", headers=secure_client_headers)
-    assert response.status_code == 400
+    assert response.status_code == 422
 
 
 # search with query
