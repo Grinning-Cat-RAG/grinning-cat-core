@@ -130,7 +130,12 @@ async def store(
         if expire:
             await pipeline.expire(key, expire)
 
-        if not await pipeline.execute():
+        results = await pipeline.execute()
+        # A JSON.SET rejected by NX/XX returns ``None`` for that command while
+        # other pipelined commands (e.g. EXPIRE) still make the result list
+        # non-empty. Inspect the SET result itself: ``[None]`` is truthy, so the
+        # old ``if not results`` check reported a lost create as a success.
+        if not results or results[0] is None:
             return None
 
         log.debug(f"Stored key {key}, value {value}, TTL: {expire}")

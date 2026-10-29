@@ -119,20 +119,23 @@ async def test_b2_embedder_change_changes_the_embedding_phase_marker(cheshire_ca
 async def test_b2b_chunker_change_changes_the_parsing_phase_marker(cheshire_cat):
     """B2 (chunker): a rewritten chunker setting must mark parsing stale.
 
-    Chunker and embedder are system-level services, so the marker is resolved
-    from the ``DEFAULT_SYSTEM_KEY`` settings entry. Same config -> identical
-    marker; a material chunker change -> different marker -> stale phase.
+    The chunker is an AGENT-scoped service (``/chunking/settings`` writes under
+    the caller's agent key and ``CheshireCat.create`` resolves it from
+    ``cat.agent_key``), so the marker must be resolved from the SAME agent-scoped
+    settings entry — not the system key. Same config -> identical marker; a
+    material chunker change -> different marker -> stale phase.
     """
+    agent_key = cheshire_cat.agent_key
     base = {"encoding_name": "cl100k_base", "chunk_size": 256, "chunk_overlap": 64}
     await crud_settings.upsert_setting_by_category(
-        DEFAULT_SYSTEM_KEY,
+        agent_key,
         Setting(name="RecursiveTextChunkerSettings", value=dict(base), category="chunker"),
     )
     marker_before = await _marker("parsing_chunking", cheshire_cat)
     marker_same = await _marker("parsing_chunking", cheshire_cat)
 
     await crud_settings.upsert_setting_by_category(
-        DEFAULT_SYSTEM_KEY,
+        agent_key,
         Setting(
             name="RecursiveTextChunkerSettings",
             value={**base, "chunk_size": 512},
