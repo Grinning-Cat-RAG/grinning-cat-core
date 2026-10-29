@@ -39,6 +39,63 @@ def _delete_completion_enabled() -> bool:
     return (value or "").strip().lower() in ("true", "1", "yes")
 
 
+# The efficient ingestion engine and the core plugin that owns its phase hooks.
+# ``ingestion`` is a SYSTEM-level service (like ``embedder``): the plugin must be
+# a core plugin so every agent carries its hooks, and it must never be
+# system-only — that would strip it (and its phase hooks) from every agent.
+EFFICIENT_INGESTION_ENGINE = "EfficientIngestionConfiguration"
+EFFICIENT_INGESTION_PLUGIN = "cat_efficient_ingestion"
+
+
+def _efficient_ingestion_installation_error(plugin_manager, selected_engine_name) -> str | None:
+    """Return why the efficient ingestion installation is broken, if it is.
+
+    The check only applies when the system ``ingestion`` setting resolves to the
+    efficient engine: in that case the ``cat_efficient_ingestion`` core plugin
+    must be installed as a core plugin (its hooks are what drive the phases) and
+    must NOT be system-only (agents would lose those hooks). A ``None`` return
+    means the installation is consistent (or another engine is selected).
+    """
+    if selected_engine_name != EFFICIENT_INGESTION_ENGINE:
+        return None
+
+    core_plugins = plugin_manager.get_core_plugins_ids
+    system_only = plugin_manager.get_system_only_plugin_ids
+
+    if EFFICIENT_INGESTION_PLUGIN not in core_plugins:
+        reason = "is not installed as a core plugin (its phase hooks are missing)"
+    elif EFFICIENT_INGESTION_PLUGIN in system_only:
+        reason = "is listed in get_system_only_plugin_ids (its phase hooks would be stripped from every agent)"
+    else:
+        return None
+
+    return (
+        f"The system 'ingestion' setting resolves to the efficient engine "
+        f"('{EFFICIENT_INGESTION_ENGINE}'), but the '{EFFICIENT_INGESTION_PLUGIN}' "
+        f"plugin {reason}. Install it under cat/core_plugins/ and keep it out of "
+        f"get_system_only_plugin_ids, or select the core ingestion engine."
+    )
+
+
+async def _validate_efficient_ingestion_installation(
+    plugin_manager, selected_engine_name=None
+) -> str | None:
+    """Log an error when the efficient ingestion installation is broken.
+
+    Non-fatal by design: an inconsistent selection degrades (the phase hooks are
+    absent) but startup must continue. ``selected_engine_name`` can be passed to
+    keep the check hermetic; otherwise it is read from the system settings.
+    """
+    if selected_engine_name is None:
+        setting = await crud_settings.get_settings_by_category(DEFAULT_SYSTEM_KEY, "ingestion")
+        selected_engine_name = (setting or {}).get("name")
+
+    error = _efficient_ingestion_installation_error(plugin_manager, selected_engine_name)
+    if error:
+        log.error(error)
+    return error
+
+
 def _create_lock_budget(quiesce: int) -> int:
     """Budget for the ``agent-create:<id>`` lock.
 
@@ -118,6 +175,13 @@ class BillTheLizard(OrchestratorMixin, NonCopyableMixin):
         self.core_auth_handler = CoreAuthHandler()
 
         await self.service_provider.bootstrap_services(self.agent_key, self.plugin_manager)
+
+        # Validate the selected ingestion engine's installation. Non-fatal: a
+        # broken selection must be loud at boot, never block startup.
+        try:
+            await _validate_efficient_ingestion_installation(self.plugin_manager)
+        except Exception as e:  # noqa: BLE001 - validation must never break boot
+            log.warning(f"Could not validate the efficient ingestion installation: {e}")
 
         # Initialize the default admin if not present
         if not await crud_users.get_users(DEFAULT_SYSTEM_KEY, limit=1):
