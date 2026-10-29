@@ -36,6 +36,8 @@ def get_supported_env_variables():
         "CAT_INGESTION_NICENESS": "5",
         "CAT_INGESTION_RESUME_INTERVAL_SECONDS": "60",
         "CAT_INGESTION_HEARTBEAT_SECONDS": "30",
+        "CAT_INGESTION_DELETE_QUIESCE_SECONDS": "180",
+        "CAT_INGESTION_DELETE_POLL_SECONDS": "5",
     }
 
 

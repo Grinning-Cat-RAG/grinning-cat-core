@@ -102,14 +102,14 @@ class CheshireCat(BotMixin, NonCopyableMixin):
 
         Delegates the whole teardown to ``complete_agent_teardown``: write the
         deletion marker FIRST (so in-flight ingestion workers self-abort), then
-        quiesce, wipe the ``agents:<id>:*`` namespace, purge memory and files,
+        quiesce, purge memory and files, wipe the ``agents:<id>:*`` namespace,
         fire ``after_cheshire_cat_destroy`` and clear the marker LAST. The
         inline steps this method used to repeat (``destroy_memory``, the file
         folder, the ``crud_*.destroy_all`` calls, the destroy hook) are all
         owned by the protocol: every one of those key families lives under
         ``agents:<agent_id>:*`` (conversations.py:29, users.py:28, plugins.py:10,
-        settings.py:9) and is deleted by ``wipe_agent_namespace_excluding_marker``,
-        and the hook now fires inside ``_teardown_memory_and_files``.
+        settings.py:9) and is deleted by ``wipe_agent_namespace_excluding_marker``;
+        the hook fires after the wipe, in ``complete_agent_teardown``.
 
         Lazy imports: ``agent_deletion`` is imported by the core at startup and
         a top-level import here would widen the startup import graph.

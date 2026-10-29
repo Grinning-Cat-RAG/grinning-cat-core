@@ -2,8 +2,8 @@
 
 ``cat/looking_glass/agent_deletion.py`` owns the full delete-marker lifecycle:
 marker -> bounded ingestion quiesce -> memory/file cascade over the sources
-captured BEFORE the wipe -> namespace wipe (marker preserved) -> marker clear
-LAST. These tests cover the marker schema, the wipe, the end-to-end run on a
+captured BEFORE the wipe -> namespace wipe (marker preserved) -> destroy hook
+(after the wipe) -> marker clear LAST. These tests cover the marker schema, the wipe, the end-to-end run on a
 real cat, idempotency, the quiesce semantics, the resumable orphan path, and
 the per-source cascade ordering.
 """
@@ -317,16 +317,80 @@ async def test_teardown_cascades_each_source_before_wipe(unique_agent_id, monkey
             # Per source, in order, and strictly before the namespace wipe.
             assert before < delete < after < wipe_index
 
-        assert "hook:after_cheshire_cat_destroy:" + unique_agent_id in log
+        hook_index = log.index("hook:after_cheshire_cat_destroy:" + unique_agent_id)
         assert fake.file_manager.removed == [unique_agent_id]
         assert len(fake.vector_memory_handler.calls) == len(sources)
 
-        # The marker is cleared LAST: after the cascade and after the wipe.
-        assert log.index("clear_marker") > wipe_index
+        # Full order around the wipe: cascade < wipe < destroy hook < clear.
+        assert log.index("destroy_memory") < wipe_index
+        assert log.index("remove_folder") < wipe_index
+        assert wipe_index < hook_index
+        assert hook_index < log.index("clear_marker")
+
+        # The marker is cleared LAST: after the cascade, the wipe and the hook.
         assert log[-1] == "clear_marker"
         assert await has_delete_marker(unique_agent_id) is False
     finally:
         await crud.delete(_delete_marker_key(unique_agent_id))
+
+
+async def test_destroy_hook_sees_only_the_marker_after_the_wipe(unique_agent_id, monkeypatch):
+    """At hook time the namespace is already wiped, so a plugin cannot half-delete.
+
+    Mirrors EffING's ``clear_agent``: delete the marker, then re-store it. If
+    the hook fired before the wipe that would lose the marker while the master
+    key/settings/conversations still existed; firing it after the wipe makes
+    the delete/re-store harmless and the teardown still ends clean.
+    """
+    agent_id = unique_agent_id
+    marker_key = _delete_marker_key(agent_id)
+    prefix = f"{DEFAULT_AGENTS_KEY}:{_escape_glob(agent_id)}:*"
+    fake = _FakeCat(agent_id, sources=[])
+    observed_at_hook = []
+
+    async def simulate_efficient_ingestion(name, *args, caller=None):
+        if name == "after_cheshire_cat_destroy":
+            observed_at_hook.append(await crud.scan_keys(prefix))
+            # Plugin handler does destroy("agents:<id>:ingestion:*") then re-stores.
+            await agent_deletion.clear_delete_marker(agent_id)
+            await set_delete_marker(agent_id)
+        fake.log.append(f"hook:{name}:{args[0] if args else None}")
+
+    monkeypatch.setattr(fake.plugin_manager, "execute_hook", simulate_efficient_ingestion)
+
+    try:
+        await set_delete_marker(agent_id)
+        # A fully-provisioned agent: master key, settings, conversations and a
+        # terminal ingestion row. The real wipe must remove all of them.
+        await crud.store(f"{DEFAULT_AGENTS_KEY}:{agent_id}:agent", {"id": agent_id})
+        await crud.store(f"{DEFAULT_AGENTS_KEY}:{agent_id}:settings:foo", {"x": 1})
+        await crud.store(f"{DEFAULT_AGENTS_KEY}:{agent_id}:conversations:1", {"x": 1})
+        await crud.store(
+            f"{DEFAULT_AGENTS_KEY}:{agent_id}:ingestion:row", {"status": "completed"}
+        )
+
+        await complete_agent_teardown(agent_id, ccat=fake)
+
+        # The hook ran when the namespace held ONLY the marker.
+        assert observed_at_hook == [[marker_key]]
+        assert "hook:after_cheshire_cat_destroy:" + agent_id in fake.log
+        # Despite the plugin deleting and re-storing the marker, the teardown
+        # still ends with no namespace and no marker.
+        assert await crud.scan_keys(prefix) == []
+        assert await has_delete_marker(agent_id) is False
+    finally:
+        await crud.delete(marker_key)
+        for key in await crud.scan_keys(prefix):
+            await crud.delete(key)
+
+
+def test_delete_env_vars_are_registered():
+    """Both delete knobs are part of the canonical env registry."""
+    from cat.env import get_supported_env_variables
+
+    supported = get_supported_env_variables()
+    assert supported["CAT_INGESTION_DELETE_QUIESCE_SECONDS"] == "180"
+    assert supported["CAT_INGESTION_DELETE_POLL_SECONDS"] == "5"
 
 
 async def test_teardown_keeps_marker_when_cascade_raises(unique_agent_id, monkeypatch):

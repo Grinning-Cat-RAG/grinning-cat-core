@@ -12,9 +12,10 @@ This module owns the whole protocol, not just the marker:
    wipe (``before_file_manager_file_delete`` while the point metadata is still
    present -> delete the source's points -> ``after_file_manager_file_deleted``),
    then purge all remaining vector memory as the catch-all;
-3. remove the file storage folder and fire ``after_cheshire_cat_destroy``;
+3. remove the file storage folder;
 4. wipe the agent's Redis namespace, preserving the marker;
-5. clear the marker LAST, so a crash at any point leaves a resumable marker
+5. fire ``after_cheshire_cat_destroy`` once the namespace is already wiped;
+6. clear the marker LAST, so a crash at any point leaves a resumable marker
    that ``complete_pending_deletes`` can pick up.
 
 The cascade runs BEFORE the wipe: the wipe deletes the stored file settings, so
@@ -23,6 +24,12 @@ would leave only a marker while points and files still exist — which the
 marker-only short-circuit would then silently clear. With this order, "only the
 marker remains" genuinely means the cascade already ran and there is nothing
 left to purge.
+
+The destroy hook fires AFTER the wipe: a plugin handler may delete and
+re-store the marker (EffING's ``clear_agent``), which is harmless once the
+namespace holds nothing else. Firing it before the wipe would let a crash
+between the plugin's delete and re-store lose the marker while the master
+key, settings and conversations still exist.
 
 The marker key format mirrors the ``ingestion_status`` plugin registry
 (EffING's ``registry.delete_marker_key``): the plugin owns the single source
@@ -236,7 +243,7 @@ async def _boot_light_cat(agent_id: str):
 
 
 async def _teardown_memory_and_files(ccat, sources) -> None:
-    """Cascade per source, purge remaining memory, remove files, notify plugins.
+    """Cascade per source, purge remaining memory, remove the file folder.
 
     ``sources`` is the file list captured BEFORE the namespace wipe: the wipe
     deletes the stored file settings, so it must not be read from storage at
@@ -253,7 +260,9 @@ async def _teardown_memory_and_files(ccat, sources) -> None:
     This whole function runs BEFORE the namespace wipe: a crash here leaves the
     marker plus the namespace, so recovery boots a cat and retries the cascade.
     Reaching the marker-only state is therefore only possible once this has
-    completed.
+    completed. The ``after_cheshire_cat_destroy`` hook is NOT fired here; the
+    caller fires it after the wipe so a plugin that deletes and re-stores the
+    marker cannot leave a half-deleted agent.
     """
     # Lazy imports keep the startup import graph small and avoid cycles.
     from cat.routes.routes_utils import sanitize_source_name
@@ -288,14 +297,6 @@ async def _teardown_memory_and_files(ccat, sources) -> None:
     await ccat.destroy_memory()
 
     ccat.file_manager.remove_folder(ccat.agent_key)
-
-    # Plugin-owned namespaces get their final cleanup while the plugin manager
-    # is still alive; fired even when no files were captured.
-    await ccat.plugin_manager.execute_hook(
-        "after_cheshire_cat_destroy",
-        ccat.agent_key,
-        caller=ccat,
-    )
 
 
 def _env_int(name: str, default: int) -> int:
@@ -372,6 +373,16 @@ async def complete_agent_teardown(agent_id: str, ccat=None) -> None:
                 # Wipe the remaining Redis namespace, preserving the marker, only
                 # once memory and files are actually gone.
                 await wipe_agent_namespace_excluding_marker(agent_id)
+
+                # Fire the destroy hook AFTER the wipe: a plugin handler may
+                # delete and re-store the marker, which is harmless once nothing
+                # else remains. Firing it earlier could lose the marker mid-way
+                # while the master key/settings/conversations still existed.
+                await ccat.plugin_manager.execute_hook(
+                    "after_cheshire_cat_destroy",
+                    ccat.agent_key,
+                    caller=ccat,
+                )
 
                 # Last: the marker means "teardown incomplete", so it can only go
                 # away once memory, files and the namespace are gone. A crash
