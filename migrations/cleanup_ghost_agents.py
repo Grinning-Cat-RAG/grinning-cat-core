@@ -18,6 +18,8 @@ Safety contract
 * Exit codes: ``0`` ok, ``1`` partial failure, ``2`` aborted / nothing done.
 * Each agent is processed in isolation: one failure never aborts the others.
 * Agents that still own their master key or a delete marker are never touched.
+* Namespaces whose id contains ``:`` are reported as ``ambiguous_id`` and are
+  never classified or deleted, in dry-run and in ``--apply``.
 * Only ``cat.db.crud`` is used (``scan_keys``, ``destroy``, ``read``): no raw
   Redis client, no ``get_async_db``.
 
@@ -47,6 +49,11 @@ MASTER_KEY = DEFAULT_AGENT_KEY
 
 #: Suffix of the persistent delete-progress marker owned by the boot path.
 DELETE_MARKER_SUFFIX = "ingestion:delete"
+
+#: Key segments that can legally follow ``agents:<id>:`` for a colon-free id.
+#: Any other second segment means the actual id may continue past the first
+#: segment, so the namespace cannot be parsed safely.
+KNOWN_FAMILIES = frozenset({"agent", "settings", "conversations", "users", "plugins", "ingestion"})
 
 
 def _escape_glob(agent_id: str) -> str:
@@ -82,18 +89,49 @@ def is_protected_id(agent_id: str) -> bool:
     return not agent_id or agent_id == DEFAULT_SYSTEM_KEY or agent_id.startswith(f"{DEFAULT_SYSTEM_KEY}:")
 
 
-def group_keys_by_agent(keys: list[str]) -> dict[str, list[str]]:
-    """Group scanned ``agents:<id>:*`` keys by agent id."""
+def _ambiguous_namespace(segments: list[str]) -> str:
+    """Name the namespace a malformed key belongs to.
+
+    For an id containing ``:`` the family is the segment right before the
+    trailing payload (``agents:a:b:agent`` -> id ``a:b``), so the id is every
+    segment before the last known family. When no family is present, fall back
+    to the first two segments. The exact name only affects reporting: the
+    namespace is never classified or deleted.
+    """
+    for index in range(len(segments) - 1, 0, -1):
+        if segments[index] in KNOWN_FAMILIES:
+            return ":".join(segments[:index])
+    return ":".join(segments[:2])
+
+
+def group_keys_by_agent(keys: list[str]) -> tuple[dict[str, list[str]], set[str]]:
+    """Group scanned ``agents:<id>:*`` keys into safe and ambiguous namespaces.
+
+    The id is taken from the first segment, and the second segment must be a
+    known family. An agent id containing ``:`` produces a key whose second
+    segment is part of the id (e.g. live ``a:b`` -> ``agents:a:b:agent``), so
+    that segment can never be a known family. Such a namespace cannot be
+    classified safely: skipping it is the only safe action while the id
+    charset is unvalidated (that decision is tracked separately). Returns the
+    grouped safe namespaces and the set of ambiguous namespace names.
+    """
     grouped: dict[str, list[str]] = {}
+    ambiguous: set[str] = set()
+
     for key in keys:
-        parts = key.split(":")
-        if len(parts) < 2 or parts[0] != DEFAULT_AGENTS_KEY:
+        prefix = f"{DEFAULT_AGENTS_KEY}:"
+        if not key.startswith(prefix):
             continue
-        agent_id = parts[1]
+        segments = key[len(prefix):].split(":")
+        agent_id = segments[0]
         if is_protected_id(agent_id):
             continue
+        if len(segments) < 2 or segments[1] not in KNOWN_FAMILIES:
+            ambiguous.add(_ambiguous_namespace(segments))
+            continue
         grouped.setdefault(agent_id, []).append(key)
-    return {agent_id: sorted(keys) for agent_id, keys in sorted(grouped.items())}
+
+    return {agent_id: sorted(agent_keys) for agent_id, agent_keys in sorted(grouped.items())}, ambiguous
 
 
 async def classify_agent(agent_id: str, keys: list[str]) -> str:
@@ -123,7 +161,12 @@ async def plan(apply: bool) -> dict[str, Any]:
     }
 
     keys = await crud.scan_keys(f"{DEFAULT_AGENTS_KEY}:*")
-    grouped = group_keys_by_agent(keys)
+    grouped, ambiguous = group_keys_by_agent(keys)
+
+    # Ambiguous namespaces (ids containing ``:``) are never classified and never
+    # deleted, in dry-run and in --apply alike.
+    for namespace in sorted(ambiguous):
+        report["skipped"].append({"agent_id": namespace, "reason": "ambiguous_id"})
 
     for agent_id, agent_keys in grouped.items():
         try:

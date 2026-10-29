@@ -124,6 +124,35 @@ def test_apply_reports_skipped_agents(capsys):
         _cleanup(keys)
 
 
+def test_ambiguous_colon_ids_are_skipped_and_never_deleted(capsys):
+    keys: dict[str, dict] = {
+        "agents:a:agent": {"name": "metadata-a"},
+        "agents:a:b:agent": {"name": "metadata-a-b"},
+        "agents:a:b:conversations:u1": {"chat": 1},
+        "agents:g:users:u1": {"user": 1},
+    }
+
+    try:
+        _run(_seed(keys))
+
+        assert _run_main(["--json"]) == 2
+        report = json.loads(capsys.readouterr().out)
+        reasons = {entry["agent_id"]: entry["reason"] for entry in report["skipped"]}
+        assert reasons.get("a:b") == "ambiguous_id"
+
+        for key in keys:
+            assert _run(_read(key)) is not None
+
+        assert _run_main(["--apply"]) == 0
+
+        assert _run(_read("agents:a:agent")) is not None
+        assert _run(_read("agents:a:b:agent")) is not None
+        assert _run(_read("agents:a:b:conversations:u1")) is not None
+        assert _run(_read("agents:g:users:u1")) is None
+    finally:
+        _cleanup(keys)
+
+
 def test_partial_failure_returns_1(capsys, monkeypatch):
     failing_ghost = _agent_id("ghost-fail")
     succeeding_ghost = _agent_id("ghost-ok")
