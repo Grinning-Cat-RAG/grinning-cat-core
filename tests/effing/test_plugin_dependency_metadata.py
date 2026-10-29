@@ -103,3 +103,21 @@ async def test_plugin_manager_loads_effing_with_dependency_resolved(lizard, monk
         f"plugin failed to load; missing dependencies: {loaded.missing_dependencies}"
     )
     assert loaded.missing_dependencies == []
+
+def _host_version() -> str:
+    """The host CAT version this plugin is running against."""
+    from cat import utils
+
+    root = Path(utils.__file__).resolve().parent.parent
+    return tomllib.loads((root / "pyproject.toml").read_text())["project"]["version"]
+
+
+def test_manifest_version_matches_pyproject():
+    """``plugin.json`` and ``pyproject.toml`` must advertise the same version."""
+    data = tomllib.loads((_plugin_dir() / "pyproject.toml").read_text())
+    assert _manifest()["version"] == data["project"]["version"]
+
+
+def test_manifest_min_cat_version_matches_the_host_it_needs():
+    """The manifest pins the minimum host version the plugin actually needs."""
+    assert _manifest()["min_cat_version"] == _host_version()
