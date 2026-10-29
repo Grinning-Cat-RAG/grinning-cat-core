@@ -14,6 +14,7 @@ from cat.db.models import Setting
 from cat.env import get_env
 from cat.exceptions import UnknownAgentException
 from cat.log import log
+from cat.looking_glass.agent_deletion import complete_pending_deletes
 from cat.looking_glass.cheshire_cat import CheshireCat
 from cat.looking_glass.mad_hatter.mad_hatter import MadHatter
 from cat.looking_glass.mad_hatter.registry import PluginRegistry
@@ -22,6 +23,12 @@ from cat.rabbit_hole import RabbitHole
 from cat.services.factory.auth_handler import CoreAuthHandler
 from cat.services.websocket_manager import WebSocketManager
 from cat.utils import safe_deepcopy, sanitize_permissions, singleton
+
+
+def _delete_completion_enabled() -> bool:
+    """Whether pending agent deletions should be completed at startup."""
+    value = get_env("CAT_DELETE_COMPLETION_ON_BOOT")
+    return (value or "").strip().lower() in ("true", "1", "yes")
 
 
 @singleton
@@ -52,6 +59,8 @@ class BillTheLizard(OrchestratorMixin, NonCopyableMixin):
         self._pending_endpoints = []
         # one alignment with the database at a time: the last one reads the last state (see sync_system_plugins)
         self._sync_lock = asyncio.Lock()
+        # Fire-and-forget recovery of interrupted agent deletions (see bootstrap).
+        self._delete_completion_task = None
 
         # Minimal sync setup — plugin manager is created but NOT yet discovered.
         self.plugin_manager = MadHatter(self.agent_key)  # type: ignore[arg-type]
@@ -104,6 +113,24 @@ class BillTheLizard(OrchestratorMixin, NonCopyableMixin):
         await self.websocket_manager.start()
 
         await self.plugin_manager.execute_hook("after_lizard_bootstrap", caller=self)
+
+        # Recover deletions interrupted mid-teardown. Fire-and-forget: startup
+        # must never block on (or fail because of) this background work.
+        self._schedule_delete_completion()
+
+    def _schedule_delete_completion(self) -> None:
+        """Schedule the pending-delete recovery if enabled, keeping the handle."""
+        if not _delete_completion_enabled():
+            return
+
+        self._delete_completion_task = asyncio.create_task(self._complete_pending_deletes_safely())
+
+    async def _complete_pending_deletes_safely(self) -> None:
+        """Run the recovery without ever surfacing an unhandled task exception."""
+        try:
+            await complete_pending_deletes()
+        except Exception as e:
+            log.error(f"Could not complete pending agent deletions at boot: {e}")
 
     async def create_cheshire_cat(self, agent_id: str, metadata: Dict | None = None) -> CheshireCat:
         """
