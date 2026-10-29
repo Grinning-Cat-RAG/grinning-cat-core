@@ -641,6 +641,93 @@ async def test_effing_blocked_plugin_imports_and_classic_builds_without_phases(m
 
 
 # ---------------------------------------------------------------------------
+# Scenario 4b - classic re-ingest after an efficient ingest (deterministic
+# regression: the empty-pass discriminator must not fire on the classic path)
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_classic_reingest_after_efficient_ingest_builds_graph(app_client, agent_key, monkeypatch):
+    """EffING ingest -> switch the system engine to core -> classic re-ingest.
+
+    The efficient ingest leaves the source's status row with
+    ``phase=parsing_chunking`` and the phase-machine ``resume_owner`` lease
+    (the host never clears that lease on a terminal status). The core ingest
+    rewrites ``phase=parsing_chunking`` for every ingestion, so a discriminator
+    keyed on ``parsing_chunking + resume_owner`` mistook the classic re-ingest
+    for the empty-vector staging pass and silently skipped the graph.
+
+    The fixed discriminator additionally requires the intrinsic empty mapping
+    ``vector={}``, which the classic core never writes (it always stores the
+    embedder's list). Assert the graph is rebuilt and the classic callback fires
+    exactly once, while the efficient graph phases do not run again.
+    """
+    await _assert_neo4j_reachable()
+    try:
+        await _configure_agent(app_client, agent_key, EFFICIENT_ENGINE)
+        counts = _install_spies(monkeypatch)
+
+        # 1) efficient ingest: the phase machine claims the source and builds
+        # the graph; the classic callback stays inert.
+        response = await _ingest_sample(app_client, agent_key)
+        assert response.status_code == 200, response.text
+        await _drain_recorded_handlers(SAMPLE_NAME)
+        first_graph = await _settle_counts(agent_key)
+        first_status = await _status(agent_key)
+        assert first_graph["nodes"] > 0, first_graph
+        assert counts["classic"] == 0, counts
+        assert counts["spacy_phase"] == 1, counts
+        assert counts["llm_phase"] == 1, counts
+        # bug precondition: the claim lease survives the terminal status
+        assert first_status.get("resume_owner"), first_status
+
+        # 2) switch the SYSTEM ingestion engine to the core one.
+        await _set_engine(app_client, agent_key, CORE_ENGINE)
+
+        # 3) wipe the tenant's data nodes (keep the Collection the handler
+        # initialized) so any Document/entity/SourceFile after this point can
+        # only come from the classic re-ingest.
+        driver = _neo4j_driver()
+        try:
+            async with driver.session(database=NEO4J_DATABASE) as session:
+                result = await session.run(
+                    "MATCH (n {tenant_id: $tenant}) WHERE NOT n:Collection "
+                    "DETACH DELETE n",
+                    tenant=agent_key,
+                )
+                await result.consume()
+        finally:
+            await driver.close()
+        wiped = await _neo4j_counts(agent_key)
+        assert wiped["documents"] == 0, wiped
+
+        # 4) classic re-ingest of the SAME source.
+        response = await _ingest_sample(app_client, agent_key)
+        assert response.status_code == 200, response.text
+        await _drain_recorded_handlers(SAMPLE_NAME)
+        second_graph = await _settle_counts(agent_key)
+        second_status = await _status(agent_key)
+
+        assert second_graph["nodes"] > 0, second_graph
+        assert second_graph["documents"] > 0, second_graph
+        # the ENTITY extraction is what the stale discriminator silently
+        # skipped; Documents alone would also be created by a skipped pass.
+        assert second_graph["entities"] > 0, second_graph
+        assert second_graph["relationships"] > 0, second_graph
+        assert counts["classic"] == 1, counts
+        # the classic callback is the only writer on this ingest: the phase
+        # machine must not have run again.
+        assert counts["spacy_phase"] == 1, counts
+        assert counts["llm_phase"] == 1, counts
+        # the stale claim lease is still on the row -> the old discriminator
+        # would have skipped this graph build.
+        assert second_status.get("resume_owner"), second_status
+
+        print("REINGEST", {"first": first_graph, "second": second_graph}, counts, second_status)
+    finally:
+        leftover = await _wipe_tenant(agent_key)
+        assert leftover == {"nodes": 0, "relationships": 0, "documents": 0, "entities": 0, "source_files": 0}, leftover
+
+
+# ---------------------------------------------------------------------------
 # Scenario 5 - cleanup receipt (runs last)
 # ---------------------------------------------------------------------------
 @pytest.mark.asyncio

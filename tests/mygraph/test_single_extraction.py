@@ -15,8 +15,11 @@ non-multimodal embedder). These tests count the extraction calls per pass:
 - efficient flow (staging pass + embedding pass): exactly 1 per document;
 - classic flow (a single pass, no ingestion status): exactly 1;
 - payload-only document in the embedding pass: MUST build the graph once;
-- the discriminator reads the recorded phase AND the phase-machine claim
-  (parsing_chunking + `resume_owner` -> staging; classic is unclaimed -> build).
+- the discriminator requires the intrinsic empty mapping `vector={}` AND the
+  recorded `parsing_chunking` phase (the staging pass only). The phase-machine
+  `resume_owner` lease is NOT used: the host never clears it on a terminal
+  status, so it survived into a classic re-ingest (see the app-level regression
+  `test_dual_mode.py::test_classic_reingest_after_efficient_ingest_builds_graph`).
 
 Only ``add_point_to_tenant`` / ``add_points_to_tenant`` are exercised; Neo4j is
 replaced by an accepting fake session and the spaCy extractor by a counter, so
@@ -130,7 +133,7 @@ def _make_handler(enabled_derived_graph=False):
     # discriminator reads the recorded EffING phase).
     handler.staging_sources = set()
 
-    async def _is_staging(source, metadata):
+    async def _is_staging(source, metadata, vector=None):
         return source in handler.staging_sources
 
     handler._is_empty_vector_staging_pass = _is_staging
@@ -238,37 +241,57 @@ async def test_payload_only_document_still_builds_the_graph():
 
 
 @pytest.mark.asyncio
-async def test_staging_discriminator_reads_recorded_ingestion_phase(monkeypatch):
-    """B2: the real discriminator is the recorded phase, not vector validity."""
+async def test_staging_discriminator_requires_empty_mapping_and_phase(monkeypatch):
+    """The real discriminator needs BOTH intrinsic signals.
+
+    Staging = the empty mapping ``vector={}`` AND the recorded
+    ``parsing_chunking`` phase. Neither alone is enough: a classic write during
+    ``parsing_chunking`` carries a list vector (even a zero-norm fallback), and
+    the ``embedding`` pass can legitimately carry ``{}`` for a payload-only
+    image. ``resume_owner`` is ignored (a stale lease survives into a classic
+    re-ingest and used to skip the graph silently).
+    """
     from cat.core_plugins.cat_efficient_ingestion import registry
 
     handler = _make_handler()
     del handler._is_empty_vector_staging_pass  # reveal the real class method
 
-    async def _claimed_staging(agent_id, scope, source):
+    async def _parsing_chunking_claimed(agent_id, scope, source):
         assert agent_id == "tenant_test"
         assert scope == "agent"
-        # the phase machine claimed the source before staging
         return {"phase": "parsing_chunking", "resume_owner": "reembed-1"}
 
-    monkeypatch.setattr(registry, "get_status", _claimed_staging)
+    monkeypatch.setattr(registry, "get_status", _parsing_chunking_claimed)
+    # staging pass: empty mapping + parsing_chunking
     assert await handler._is_empty_vector_staging_pass(
-        "file.pdf", {"source": "file.pdf"}
+        "file.pdf", {"source": "file.pdf"}, {}
     ) is True
-
-    async def _classic_unclaimed(agent_id, scope, source):
-        # classic core also has a parsing_chunking row, but no phase-machine claim
-        return {"phase": "parsing_chunking"}
-
-    monkeypatch.setattr(registry, "get_status", _classic_unclaimed)
+    # classic re-ingest after an EffING ingest: the SAME stale row, but the
+    # core always writes a list vector -> must build the graph
     assert await handler._is_empty_vector_staging_pass(
-        "file.pdf", {"source": "file.pdf"}
+        "file.pdf", {"source": "file.pdf"}, [0.0, 0.0, 0.0]
+    ) is False
+    assert await handler._is_empty_vector_staging_pass(
+        "file.pdf", {"source": "file.pdf"}, [0.1, 0.2, 0.3]
     ) is False
 
     async def _embedding(agent_id, scope, source):
         return {"phase": "embedding", "resume_owner": "reembed-1"}
 
     monkeypatch.setattr(registry, "get_status", _embedding)
+    # payload-only image in the embedding pass: still builds the graph
     assert await handler._is_empty_vector_staging_pass(
-        "file.pdf", {"source": "file.pdf"}
+        "file.pdf", {"source": "file.pdf"}, {}
     ) is False
+
+    async def _no_doc(agent_id, scope, source):
+        return None
+
+    monkeypatch.setattr(registry, "get_status", _no_doc)
+    assert await handler._is_empty_vector_staging_pass(
+        "file.pdf", {"source": "file.pdf"}, {}
+    ) is False
+
+    # no source at all -> never staging
+    monkeypatch.setattr(registry, "get_status", _parsing_chunking_claimed)
+    assert await handler._is_empty_vector_staging_pass(None, {}, {}) is False
