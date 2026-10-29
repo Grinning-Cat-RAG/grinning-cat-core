@@ -335,6 +335,30 @@ async def get_agents_main_keys(pattern: str | None = None) -> List[str]:
         raise
 
 
+async def get_ingestion_status_keys(agent_id: str) -> List[str]:
+    """
+    List the ingestion status keys belonging to a single agent.
+
+    This is a READ-ONLY, agent-scoped API intended for ingestion plugins: it only enumerates the
+    ``agents:<agent_id>:ingestion:*`` rows of the given agent and never writes or deletes anything. It does not filter
+    the delete marker (``agents:<agent_id>:ingestion:delete``); callers decide what to do with it.
+
+    The agent id is untrusted and is escaped with :func:`cat.db.crud.escape_glob`, so metacharacters cannot widen the
+    scope to other agents. This is deliberately narrow and must NOT be used as a general key-enumeration API.
+
+    Args:
+        agent_id: Agent whose ingestion status keys to list.
+
+    Returns:
+        Sorted list of matching keys (empty when the agent has none).
+
+    Raises:
+        RedisError: If Redis connection fails.
+    """
+    pattern = f"{DEFAULT_AGENTS_KEY}:{crud.escape_glob(agent_id)}:ingestion:*"
+    return await crud.scan_keys(pattern)
+
+
 async def get_agents() -> List[Dict[str, Any]]:
     """
     Get all agents with their metadata.

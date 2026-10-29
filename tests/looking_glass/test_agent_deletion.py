@@ -12,11 +12,11 @@ import time
 import pytest
 
 from cat.db import crud
+from cat.db.crud import escape_glob
 from cat.db.database import DEFAULT_AGENTS_KEY
 from cat.looking_glass import agent_deletion
 from cat.looking_glass.agent_deletion import (
     _delete_marker_key,
-    _escape_glob,
     complete_agent_teardown,
     complete_pending_deletes,
     has_delete_marker,
@@ -159,7 +159,7 @@ async def test_wipe_removes_namespace_but_preserves_marker(unique_agent_id):
             assert await crud.read(key) is None
         assert await has_delete_marker(unique_agent_id) is True
         assert await crud.scan_keys(
-            f"{DEFAULT_AGENTS_KEY}:{_escape_glob(unique_agent_id)}:*"
+            f"{DEFAULT_AGENTS_KEY}:{escape_glob(unique_agent_id)}:*"
         ) == [marker_key]
     finally:
         await crud.delete(marker_key)
@@ -194,7 +194,7 @@ async def test_complete_teardown_end_to_end(cheshire_cat):
         await complete_agent_teardown(agent_id, ccat=cheshire_cat)
 
         assert await has_delete_marker(agent_id) is False
-        assert await crud.scan_keys(f"{DEFAULT_AGENTS_KEY}:{_escape_glob(agent_id)}:*") == []
+        assert await crud.scan_keys(f"{DEFAULT_AGENTS_KEY}:{escape_glob(agent_id)}:*") == []
     finally:
         await crud.delete(_delete_marker_key(agent_id))
 
@@ -271,7 +271,7 @@ async def test_complete_pending_deletes_recovers_orphan_marker(lizard):
         await complete_pending_deletes()
 
         assert await has_delete_marker(agent_id) is False
-        assert await crud.scan_keys(f"{DEFAULT_AGENTS_KEY}:{_escape_glob(agent_id)}:*") == []
+        assert await crud.scan_keys(f"{DEFAULT_AGENTS_KEY}:{escape_glob(agent_id)}:*") == []
     finally:
         await crud.delete(marker_key)
 
@@ -344,7 +344,7 @@ async def test_destroy_hook_sees_only_the_marker_after_the_wipe(unique_agent_id,
     """
     agent_id = unique_agent_id
     marker_key = _delete_marker_key(agent_id)
-    prefix = f"{DEFAULT_AGENTS_KEY}:{_escape_glob(agent_id)}:*"
+    prefix = f"{DEFAULT_AGENTS_KEY}:{escape_glob(agent_id)}:*"
     fake = _FakeCat(agent_id, sources=[])
     observed_at_hook = []
 
@@ -493,7 +493,7 @@ async def test_destroy_clears_marker_and_namespace(cheshire_cat, monkeypatch):
         assert "after_cheshire_cat_destroy" in hooks
         assert removed_folders == [agent_id]
         assert await has_delete_marker(agent_id) is False
-        assert await crud.scan_keys(f"{DEFAULT_AGENTS_KEY}:{_escape_glob(agent_id)}:*") == []
+        assert await crud.scan_keys(f"{DEFAULT_AGENTS_KEY}:{escape_glob(agent_id)}:*") == []
     finally:
         await crud.delete(_delete_marker_key(agent_id))
 
@@ -514,7 +514,7 @@ async def test_destroy_is_idempotent():
 
         assert fake.shutdown_calls == 2
         assert await has_delete_marker(agent_id) is False
-        assert await crud.scan_keys(f"{DEFAULT_AGENTS_KEY}:{_escape_glob(agent_id)}:*") == []
+        assert await crud.scan_keys(f"{DEFAULT_AGENTS_KEY}:{escape_glob(agent_id)}:*") == []
     finally:
         await crud.delete(_delete_marker_key(agent_id))
 
@@ -559,7 +559,7 @@ async def test_marker_only_recovery_clears_without_booting_cat(unique_agent_id, 
         assert boot_calls == []
         assert await has_delete_marker(unique_agent_id) is False
         assert await crud.scan_keys(
-            f"{DEFAULT_AGENTS_KEY}:{_escape_glob(unique_agent_id)}:*"
+            f"{DEFAULT_AGENTS_KEY}:{escape_glob(unique_agent_id)}:*"
         ) == []
     finally:
         await crud.delete(_delete_marker_key(unique_agent_id))

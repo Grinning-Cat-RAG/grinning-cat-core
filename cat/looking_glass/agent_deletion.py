@@ -45,6 +45,7 @@ import contextvars
 import time
 
 from cat.db import crud
+from cat.db.crud import escape_glob
 from cat.db.database import DEFAULT_AGENTS_KEY
 from cat.db.models import generate_timestamp
 from cat.env import get_env_int
@@ -114,21 +115,6 @@ def _delete_marker_key(agent_id: str) -> str:
     return f"{DEFAULT_AGENTS_KEY}:{agent_id}:ingestion:delete"
 
 
-def _escape_glob(agent_id: str) -> str:
-    """Escape Redis glob metacharacters in a user-controlled agent id.
-
-    ``agent_id`` comes straight from ``POST /agents/create``, so it is
-    untrusted: an id like ``a*`` must not turn a teardown pattern into a
-    wildcard that wipes unrelated agents. Every pattern built from an agent id
-    MUST go through this helper. Backslash is escaped first so it cannot
-    neutralize the escapes added afterwards.
-    """
-    escaped = agent_id
-    for char in ("\\", "*", "?", "[", "]"):
-        escaped = escaped.replace(char, "\\" + char)
-    return escaped
-
-
 async def set_delete_marker(agent_id: str) -> None:
     """Write the deletion marker for an agent (idempotent).
 
@@ -186,7 +172,7 @@ async def wait_for_ingestion_quiesce(
     makes workers self-abort, so this is bounded assurance, not a hard gate.
     """
     marker_key = _delete_marker_key(agent_id)
-    pattern = f"{DEFAULT_AGENTS_KEY}:{_escape_glob(agent_id)}:ingestion:*"
+    pattern = f"{DEFAULT_AGENTS_KEY}:{escape_glob(agent_id)}:ingestion:*"
     deadline = time.monotonic() + quiesce_seconds
     poll = max(float(poll_seconds), 0.01)
 
@@ -226,7 +212,7 @@ async def wipe_agent_namespace_excluding_marker(agent_id: str) -> int:
     number of keys actually deleted.
     """
     return await crud.destroy(
-        f"{DEFAULT_AGENTS_KEY}:{_escape_glob(agent_id)}:*",
+        f"{DEFAULT_AGENTS_KEY}:{escape_glob(agent_id)}:*",
         exclude={_delete_marker_key(agent_id)},
     )
 
@@ -306,7 +292,7 @@ def _env_int(name: str, default: int) -> int:
 
 async def _namespace_has_only_marker(agent_id: str) -> bool:
     """Whether the agent namespace is empty apart from the delete marker."""
-    keys = await crud.scan_keys(f"{DEFAULT_AGENTS_KEY}:{_escape_glob(agent_id)}:*")
+    keys = await crud.scan_keys(f"{DEFAULT_AGENTS_KEY}:{escape_glob(agent_id)}:*")
     return keys == [_delete_marker_key(agent_id)]
 
 

@@ -28,7 +28,7 @@ def _agent_id(prefix: str) -> str:
 async def _cleanup_namespace(agent_id: str) -> None:
     """Delete every key under the agent's namespace (and its marker)."""
     await crud.delete(agent_deletion._delete_marker_key(agent_id))
-    for key in await crud.scan_keys(f"agents:{agent_deletion._escape_glob(agent_id)}:*"):
+    for key in await crud.scan_keys(f"agents:{crud.escape_glob(agent_id)}:*"):
         await crud.delete(key)
 
 
@@ -153,7 +153,7 @@ async def test_cancellation_mid_create_rolls_back_fully(lizard, monkeypatch):
         assert await crud.read(f"agents:{agent_id}:agent") is None
         assert await has_pending_delete(agent_id) is False
         assert await crud.scan_keys(
-            f"agents:{agent_deletion._escape_glob(agent_id)}:*"
+            f"agents:{crud.escape_glob(agent_id)}:*"
         ) == []
     finally:
         await _cleanup_namespace(agent_id)

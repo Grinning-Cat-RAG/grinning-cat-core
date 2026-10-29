@@ -162,6 +162,26 @@ async def delete(key: str, path: str | None = "$"):
         raise
 
 
+def escape_glob(value: str) -> str:
+    """
+    Escape Redis glob metacharacters so a user-controlled value matches literally.
+
+    Agent ids come straight from the API and are untrusted: an id like ``a*`` must not turn a key pattern into a
+    wildcard that reaches unrelated agents. Backslash is escaped first so it cannot neutralize the escapes added
+    afterwards.
+
+    Args:
+        value: Raw value (e.g., an agent id) to embed in a glob pattern.
+
+    Returns:
+        The value with ``\\ * ? [ ]`` escaped.
+    """
+    escaped = value
+    for char in ("\\", "*", "?", "[", "]"):
+        escaped = escaped.replace(char, "\\" + char)
+    return escaped
+
+
 async def scan_keys(pattern: str) -> List[str]:
     """
     List all keys matching a glob pattern, sorted for deterministic output.
