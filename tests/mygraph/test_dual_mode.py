@@ -476,6 +476,9 @@ async def test_efficient_mode_runs_both_phases_and_never_the_classic_callback(ap
         status = await _status(agent_key)
         recorded = status.get("completed_phases") or {}
 
+        # B1: a phase that has nothing to do (or reports done) must leave the
+        # source COMPLETED, never ERROR.
+        assert status.get("status") == "completed", status
         assert graph["nodes"] > 0
         assert graph["relationships"] > 0
         assert graph["documents"] > 0

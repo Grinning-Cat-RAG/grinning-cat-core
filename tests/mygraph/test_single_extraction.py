@@ -6,12 +6,17 @@ the real vectors after the ``embedding`` phase deletes and re-adds the points.
 Entity extraction is vector-independent, so an ungated ``add_point_to_tenant``
 runs the whole graph build on BOTH passes — twice per document.
 
-The fix gates all graph work on a REAL vector (the handler's single normalized
-``_is_valid_vector`` check). These tests count the extraction calls per pass:
+The fix gates graph work on the PASS, not on vector validity: the staging pass
+is the recorded ``parsing_chunking`` phase (``_is_empty_vector_staging_pass``),
+while the ``embedding`` pass owns the graph. Vector validity would wrongly drop
+legitimate payload-only / zero-vector documents (e.g. an image under a
+non-multimodal embedder). These tests count the extraction calls per pass:
 
-- efficient flow (empty pass + real pass): exactly 1 per document;
-- classic flow (a single real-vector pass): exactly 1, unchanged from before
-  the fix (pinned baseline).
+- efficient flow (staging pass + embedding pass): exactly 1 per document;
+- classic flow (a single pass, no ingestion status): exactly 1;
+- payload-only document in the embedding pass: MUST build the graph once;
+- the discriminator reads the recorded phase AND the phase-machine claim
+  (parsing_chunking + `resume_owner` -> staging; classic is unclaimed -> build).
 
 Only ``add_point_to_tenant`` / ``add_points_to_tenant`` are exercised; Neo4j is
 replaced by an accepting fake session and the spaCy extractor by a counter, so
@@ -120,6 +125,15 @@ def _make_handler(enabled_derived_graph=False):
     handler._pending_source_tasks = {}
     handler.extraction_calls = 0
     handler.derived_calls = 0
+    # Sources whose write belongs to the empty-vector staging pass. The tests
+    # toggle this instead of relying on vector validity (the production
+    # discriminator reads the recorded EffING phase).
+    handler.staging_sources = set()
+
+    async def _is_staging(source, metadata):
+        return source in handler.staging_sources
+
+    handler._is_empty_vector_staging_pass = _is_staging
 
     async def _ensure_connected():
         return None
@@ -153,21 +167,23 @@ async def _drain(handler):
 
 @pytest.mark.asyncio
 async def test_efficient_flow_extracts_exactly_once_per_document():
-    """Empty-vector staging pass does nothing; the real-vector pass extracts
+    """Empty-vector staging pass does nothing; the embedding pass extracts
     once. Ungated, the same counters would be 1 + 1 = 2."""
     handler = _make_handler()
 
+    handler.staging_sources.add("file.pdf")
     await handler.add_points_to_tenant(
         "declarative", [_Point("p-empty", content="same document chunk", vector={})]
     )
     await _drain(handler)
-    assert handler.extraction_calls == 0  # empty-vector pass: no graph work
+    assert handler.extraction_calls == 0  # staging pass: no graph work
 
+    handler.staging_sources.clear()
     await handler.add_points_to_tenant(
         "declarative", [_Point("p-real", content="same document chunk", vector=[0.1, 0.2, 0.3])]
     )
     await _drain(handler)
-    assert handler.extraction_calls == 1  # real-vector pass: exactly once
+    assert handler.extraction_calls == 1  # embedding pass: exactly once
 
 
 @pytest.mark.asyncio
@@ -187,17 +203,72 @@ async def test_classic_flow_extraction_count_is_unchanged():
 @pytest.mark.asyncio
 async def test_efficient_flow_builds_derived_graph_exactly_once():
     """The derived graph (incl. step-8 LLM concept extraction) also runs once:
-    skipped for the empty-vector batch, run for the real-vector batch."""
+    skipped for the staging batch, run for the embedding batch."""
     handler = _make_handler(enabled_derived_graph=True)
 
+    handler.staging_sources.add("file.pdf")
     await handler.add_points_to_tenant(
         "declarative", [_Point("p-empty", content="chunk", vector={})]
     )
     await _drain(handler)
     assert handler.derived_calls == 0
 
+    handler.staging_sources.clear()
     await handler.add_points_to_tenant(
         "declarative", [_Point("p-real", content="chunk", vector=[0.1, 0.2, 0.3])]
     )
     await _drain(handler)
     assert handler.derived_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_payload_only_document_still_builds_the_graph():
+    """B2: a legitimate payload-only point (empty/zero vector) in the embedding
+    pass MUST build the derived graph and extract once — vector validity is no
+    longer a gate."""
+    handler = _make_handler(enabled_derived_graph=True)
+
+    await handler.add_points_to_tenant(
+        "declarative", [_Point("p-image", content="[Image] file.pdf", vector={})]
+    )
+    await _drain(handler)
+
+    assert handler.extraction_calls == 1, "payload-only document must extract once"
+    assert handler.derived_calls == 1, "payload-only document must build the graph once"
+
+
+@pytest.mark.asyncio
+async def test_staging_discriminator_reads_recorded_ingestion_phase(monkeypatch):
+    """B2: the real discriminator is the recorded phase, not vector validity."""
+    from cat.core_plugins.cat_efficient_ingestion import registry
+
+    handler = _make_handler()
+    del handler._is_empty_vector_staging_pass  # reveal the real class method
+
+    async def _claimed_staging(agent_id, scope, source):
+        assert agent_id == "tenant_test"
+        assert scope == "agent"
+        # the phase machine claimed the source before staging
+        return {"phase": "parsing_chunking", "resume_owner": "reembed-1"}
+
+    monkeypatch.setattr(registry, "get_status", _claimed_staging)
+    assert await handler._is_empty_vector_staging_pass(
+        "file.pdf", {"source": "file.pdf"}
+    ) is True
+
+    async def _classic_unclaimed(agent_id, scope, source):
+        # classic core also has a parsing_chunking row, but no phase-machine claim
+        return {"phase": "parsing_chunking"}
+
+    monkeypatch.setattr(registry, "get_status", _classic_unclaimed)
+    assert await handler._is_empty_vector_staging_pass(
+        "file.pdf", {"source": "file.pdf"}
+    ) is False
+
+    async def _embedding(agent_id, scope, source):
+        return {"phase": "embedding", "resume_owner": "reembed-1"}
+
+    monkeypatch.setattr(registry, "get_status", _embedding)
+    assert await handler._is_empty_vector_staging_pass(
+        "file.pdf", {"source": "file.pdf"}
+    ) is False
