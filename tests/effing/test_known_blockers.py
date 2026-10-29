@@ -10,8 +10,10 @@ corresponding todo lands:
 - **B2** the built-in ``ingestion_phase_settings_marker`` hook returns ``None``
   for every phase, so a rewritten embedder setting is judged "not material"
   and the ``embedding`` phase stays fresh -> no re-embed.
-- **B3** a source stuck in ``downloaded`` is not in the claimable status set,
-  so ``claim_source_for_resume`` refuses it -> permanent dead end.
+- **B3** a source stuck in ``downloaded`` used to be absent from the claimable
+  status set, so ``claim_source_for_resume`` refused it -> permanent dead end.
+  The registry now treats ``downloading``/``downloaded`` as resumable, gated by
+  the existing ``updated_at`` staleness threshold.
 - **B4** the completion veto used to be swallowed: the dispatcher
   (``PluginManager._run_hooks``) re-raised only ``ManagementModeException``;
   every other exception was logged and swallowed. The dedicated
@@ -164,9 +166,9 @@ async def test_b2b_chunker_change_changes_the_parsing_phase_marker(cheshire_cat)
 async def test_b3_downloaded_source_can_be_resumed():
     """B3: a stale ``downloaded`` source is claimable for a retry.
 
-    ``downloaded`` is terminal in practice today: the claim guard only accepts
-    ``uploaded``/``processing``/``error``, so the resume sweep never picks it
-    up and the source is a permanent dead end.
+    The claim guard accepts ``downloading``/``downloaded`` too, so the resume
+    sweep reclaims a download that crashed before processing instead of leaving
+    the source a permanent dead end.
     """
     agent = _agent_id()
     source = "https://example.com/stuck.pdf"
@@ -191,6 +193,34 @@ async def test_b3_downloaded_source_can_be_resumed():
             "B3: a stale 'downloaded' source is never claimed -> permanent dead end"
         )
         assert claimed["status"] == IngestionStatus.PROCESSING.value
+    finally:
+        await _drop(agent)
+
+
+async def test_b3b_active_download_is_not_stolen():
+    """B3 (guard): a fresh ``downloading`` row is never stolen.
+
+    The resumable policy must not reclaim a row that is still actively
+    downloading: the existing ``updated_at`` staleness gate protects it.
+    """
+    agent = _agent_id()
+    source = "https://example.com/active.pdf"
+    try:
+        await _seed_master_key(agent)
+        await set_status(
+            agent, "agent", source, type_="url", status=IngestionStatus.DOWNLOADING
+        )
+
+        claimed = await claim_source_for_resume(
+            agent, "agent", source, stale_after=300, owner="b3b-test"
+        )
+
+        assert claimed is None, (
+            "B3: a fresh 'downloading' source was stolen by the resume sweep"
+        )
+        doc = await get_status(agent, "agent", source)
+        assert doc is not None
+        assert doc["status"] == IngestionStatus.DOWNLOADING.value
     finally:
         await _drop(agent)
 
