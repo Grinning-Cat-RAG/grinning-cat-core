@@ -11,10 +11,14 @@ from cat.db.cruds import settings as crud_settings
 from cat.db.cruds import users as crud_users
 from cat.db.database import DEFAULT_CONVERSATIONS_KEY, DEFAULT_SYSTEM_KEY
 from cat.db.models import Setting
-from cat.env import get_env
+from cat.env import get_env, get_env_int
 from cat.exceptions import UnknownAgentException
 from cat.log import log
-from cat.looking_glass.agent_deletion import complete_pending_deletes
+from cat.looking_glass.agent_deletion import (
+    complete_agent_teardown,
+    complete_pending_deletes,
+    has_pending_delete,
+)
 from cat.looking_glass.cheshire_cat import CheshireCat
 from cat.looking_glass.mad_hatter.mad_hatter import MadHatter
 from cat.looking_glass.mad_hatter.registry import PluginRegistry
@@ -146,30 +150,55 @@ class BillTheLizard(OrchestratorMixin, NonCopyableMixin):
         if agent_id == DEFAULT_SYSTEM_KEY:
             raise ValueError(f"{agent_id} is not allowed as name for agents")
 
-        if agent_id in await crud_settings.get_agents_main_keys():
-            return await self.get_cheshire_cat(agent_id)  # type: ignore[return-value]
+        # Policy A: a pending delete wins, an in-flight create waits. The whole
+        # critical section is serialised per agent so that:
+        #   * a create landing during a teardown never builds on a half-torn-down
+        #     namespace (the wipe deletes the master key early);
+        #   * two concurrent creates of the same id cannot both pass the
+        #     existence check and produce two agents.
+        #
+        # Lock ordering: create takes `agent-create:<id>` and, through the
+        # teardown it triggers, `agent-delete:<id>`. The delete path NEVER takes
+        # `agent-create:<id>`, so there is no lock cycle.
+        #
+        # Re-entrancy: a plugin hook fired inside create/destroy
+        # (`after_cheshire_cat_creation`, `after_cheshire_cat_destroy`) must never
+        # call create/destroy for the SAME agent id, or it self-blocks on the
+        # nested lock until the timeout.
+        quiesce = get_env_int("CAT_INGESTION_DELETE_QUIESCE_SECONDS") or 180
+        budget = quiesce + 120
+        async with crud.distributed_lock(
+            f"agent-create:{agent_id}",
+            timeout=budget,
+            blocking_timeout=budget,
+        ):
+            if await has_pending_delete(agent_id):
+                await complete_agent_teardown(agent_id)
 
-        ccat = None
-        try:
-            ccat = await CheshireCat.create(agent_id)
-            if metadata is not None:
-                await crud_settings.upsert_setting_by_name(
-                    ccat.agent_key,
-                    Setting(name="metadata", value=metadata),
-                )
+            if agent_id in await crud_settings.get_agents_main_keys():
+                return await self.get_cheshire_cat(agent_id)  # type: ignore[return-value]
 
-            embedder = await self.embedder()
-            await ccat.vector_memory_handler.initialize(embedder.name, await embedding_size(embedder))
-            await ccat.embed_procedures()
+            ccat = None
+            try:
+                ccat = await CheshireCat.create(agent_id)
+                if metadata is not None:
+                    await crud_settings.upsert_setting_by_name(
+                        ccat.agent_key,
+                        Setting(name="metadata", value=metadata),
+                    )
 
-            await self.plugin_manager.execute_hook("after_cheshire_cat_creation", ccat, caller=self)
+                embedder = await self.embedder()
+                await ccat.vector_memory_handler.initialize(embedder.name, await embedding_size(embedder))
+                await ccat.embed_procedures()
 
-            return ccat
-        except Exception as e:
-            log.error(f"Error creating Cheshire Cat `{agent_id}`: {e}")
-            await self.rollback_cheshire_cat_creation(agent_id, ccat)
+                await self.plugin_manager.execute_hook("after_cheshire_cat_creation", ccat, caller=self)
 
-            raise
+                return ccat
+            except Exception as e:
+                log.error(f"Error creating Cheshire Cat `{agent_id}`: {e}")
+                await self.rollback_cheshire_cat_creation(agent_id, ccat)
+
+                raise
 
     async def rollback_cheshire_cat_creation(self, agent_id: str, cat: CheshireCat | None) -> None:
         """
