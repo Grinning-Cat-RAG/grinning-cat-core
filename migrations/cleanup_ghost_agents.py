@@ -20,6 +20,10 @@ Safety contract
 * Agents that still own their master key or a delete marker are never touched.
 * Namespaces whose id contains ``:`` are reported as ``ambiguous_id`` and are
   never classified or deleted, in dry-run and in ``--apply``.
+* A candidate namespace that is a strict prefix of an ambiguous namespace is
+  also reported as ``ambiguous_id`` and never deleted: the wipe glob
+  ``agents:<id>:*`` matches ``:``, so a shorter namespace cannot be reaped
+  without also destroying a longer (possibly live) one.
 * Only ``cat.db.crud`` is used (``scan_keys``, ``destroy``, ``read``): no raw
   Redis client, no ``get_async_db``.
 
@@ -130,6 +134,15 @@ def group_keys_by_agent(keys: list[str]) -> tuple[dict[str, list[str]], set[str]
             ambiguous.add(_ambiguous_namespace(segments))
             continue
         grouped.setdefault(agent_id, []).append(key)
+
+    # A shorter namespace can never be reaped safely while a longer ambiguous
+    # one exists: ``agents:<id>:*`` matches ``:``, so ``agents:a:*`` would also
+    # destroy ``agents:a:b:*``. Promote every candidate that is a strict prefix
+    # of an ambiguous namespace to ambiguous as well, so it is skipped too.
+    for candidate in list(grouped):
+        if any(namespace.startswith(f"{candidate}:") for namespace in ambiguous):
+            ambiguous.add(candidate)
+            grouped.pop(candidate)
 
     return {agent_id: sorted(agent_keys) for agent_id, agent_keys in sorted(grouped.items())}, ambiguous
 

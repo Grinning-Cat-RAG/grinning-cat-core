@@ -196,3 +196,62 @@ async def test_reentrant_create_for_same_id_fails_fast(lizard, monkeypatch):
         assert log.count(f"create:{agent_id}") == 1
     finally:
         await _cleanup_namespace(agent_id)
+
+
+async def test_create_lock_outlives_slow_nested_teardown(lizard, monkeypatch):
+    """The create lock must survive a teardown slower than the teardown budget.
+
+    The teardown budget is shrunk to ``0.2s`` and the nested teardown sleeps
+    ``0.3s`` — longer than that budget but well under the create budget (which
+    is derived from it plus a margin). The create lock is still held when the
+    teardown returns, so create completes and builds the agent. If
+    ``_create_lock_budget`` were not strictly greater than
+    ``_teardown_lock_budget`` the lock would have expired mid-teardown and the
+    TTL sampled at the end of the sleep would not be positive.
+    """
+    agent_id = _agent_id("agent_slow_teardown")
+    log = []
+    teardown_budget = 0.2
+    sleep_seconds = 0.3
+    observed: dict[str, int] = {}
+
+    monkeypatch.setattr(bill_the_lizard, "_teardown_lock_budget", lambda quiesce: teardown_budget)
+
+    async def slow_teardown(target_id):
+        log.append(f"teardown:{target_id}")
+        await asyncio.sleep(sleep_seconds)
+        lock_key = "lock:" + f"agent-create:{target_id}".replace("*", "_").replace(":", "_")
+        observed["lock_ttl"] = await crud.get_async_db().ttl(lock_key)
+        await crud.delete(agent_deletion._delete_marker_key(target_id))
+
+    async def fake_embedder():
+        return type("E", (), {"name": "stub-embedder"})()
+
+    async def fake_embedding_size(embedder):
+        return 3
+
+    async def fake_execute_hook(name, *args, caller=None):
+        return None
+
+    monkeypatch.setattr(bill_the_lizard, "complete_agent_teardown", slow_teardown)
+    monkeypatch.setattr(bill_the_lizard, "CheshireCat", _StubCatFactory(log))
+    monkeypatch.setattr(bill_the_lizard, "embedding_size", fake_embedding_size)
+    monkeypatch.setattr(lizard, "embedder", fake_embedder)
+    monkeypatch.setattr(lizard.plugin_manager, "execute_hook", fake_execute_hook)
+
+    try:
+        quiesce = 180
+        assert bill_the_lizard._create_lock_budget(quiesce) > teardown_budget
+
+        await set_delete_marker(agent_id)
+        assert await has_pending_delete(agent_id) is True
+
+        cat = await lizard.create_cheshire_cat(agent_id)
+
+        assert cat.agent_key == agent_id
+        assert log == [f"teardown:{agent_id}", f"create:{agent_id}"]
+        assert observed["lock_ttl"] > 0
+        assert await has_pending_delete(agent_id) is False
+        assert agent_id in await crud_settings.get_agents_main_keys()
+    finally:
+        await _cleanup_namespace(agent_id)

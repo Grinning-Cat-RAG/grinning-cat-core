@@ -124,9 +124,13 @@ def test_apply_reports_skipped_agents(capsys):
         _cleanup(keys)
 
 
-def test_ambiguous_colon_ids_are_skipped_and_never_deleted(capsys):
+def test_prefix_ghost_cannot_delete_ambiguous_live_agent(capsys):
+    # Dangerous shape: ghost ``a`` has ONLY ``settings`` (no master key, no
+    # marker), while live ``a:b`` owns a master key and a conversation. The glob
+    # ``agents:a:*`` matches ``agents:a:b:*`` too, so on the pre-fix logic the
+    # CLI reaps ghost ``a`` and destroys live ``a:b`` — this test fails there.
     keys: dict[str, dict] = {
-        "agents:a:agent": {"name": "metadata-a"},
+        "agents:a:settings:x": {"value": 1},
         "agents:a:b:agent": {"name": "metadata-a-b"},
         "agents:a:b:conversations:u1": {"chat": 1},
         "agents:g:users:u1": {"user": 1},
@@ -135,19 +139,26 @@ def test_ambiguous_colon_ids_are_skipped_and_never_deleted(capsys):
     try:
         _run(_seed(keys))
 
+        # Dry run: exit 2 and not a single key touched.
+        assert _run_main([]) == 2
+        capsys.readouterr()
+        for key in keys:
+            assert _run(_read(key)) is not None
+
+        # Machine-readable dry run names the ambiguous live namespace.
         assert _run_main(["--json"]) == 2
         report = json.loads(capsys.readouterr().out)
         reasons = {entry["agent_id"]: entry["reason"] for entry in report["skipped"]}
         assert reasons.get("a:b") == "ambiguous_id"
-
-        for key in keys:
-            assert _run(_read(key)) is not None
+        assert reasons.get("a") == "ambiguous_id"
 
         assert _run_main(["--apply"]) == 0
 
-        assert _run(_read("agents:a:agent")) is not None
+        # The live agent and the prefix-guarded ghost survive; only the genuine
+        # ghost is removed.
         assert _run(_read("agents:a:b:agent")) is not None
         assert _run(_read("agents:a:b:conversations:u1")) is not None
+        assert _run(_read("agents:a:settings:x")) is not None
         assert _run(_read("agents:g:users:u1")) is None
     finally:
         _cleanup(keys)
