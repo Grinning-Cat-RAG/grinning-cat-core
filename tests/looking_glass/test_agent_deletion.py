@@ -380,3 +380,59 @@ async def test_destroy_is_idempotent():
         assert await crud.scan_keys(f"{DEFAULT_AGENTS_KEY}:{_escape_glob(agent_id)}:*") == []
     finally:
         await crud.delete(_delete_marker_key(agent_id))
+
+
+# 9. rollback resiliency / recovery ------------------------------------------
+async def test_teardown_keeps_marker_when_wipe_raises(unique_agent_id, monkeypatch):
+    """A failing wipe must leave the marker behind, so boot recovery can retry."""
+    fake = _FakeCat(unique_agent_id, sources=[])
+
+    async def boom(*args, **kwargs):
+        raise RuntimeError("wipe failed")
+
+    monkeypatch.setattr(agent_deletion.crud, "destroy", boom)
+
+    try:
+        await set_delete_marker(unique_agent_id)
+
+        with pytest.raises(RuntimeError):
+            await complete_agent_teardown(unique_agent_id, ccat=fake)
+
+        assert await has_delete_marker(unique_agent_id) is True
+    finally:
+        await crud.delete(_delete_marker_key(unique_agent_id))
+
+
+async def test_marker_only_recovery_clears_without_booting_cat(unique_agent_id, monkeypatch):
+    """A crash after the wipe leaves only the marker: clear it, do not boot."""
+    boot_calls = []
+
+    async def fail_boot(agent_id):
+        boot_calls.append(agent_id)
+        raise AssertionError("light cat must not be booted for a marker-only namespace")
+
+    monkeypatch.setattr(agent_deletion, "_boot_light_cat", fail_boot)
+
+    try:
+        await set_delete_marker(unique_agent_id)
+        assert await has_delete_marker(unique_agent_id) is True
+
+        await complete_agent_teardown(unique_agent_id)
+
+        assert boot_calls == []
+        assert await has_delete_marker(unique_agent_id) is False
+        assert await crud.scan_keys(
+            f"{DEFAULT_AGENTS_KEY}:{_escape_glob(unique_agent_id)}:*"
+        ) == []
+    finally:
+        await crud.delete(_delete_marker_key(unique_agent_id))
+
+
+# 10. lock-budget ordering ---------------------------------------------------
+def test_create_lock_budget_outlives_teardown_budget():
+    """The create lock wraps a nested teardown, so it must be strictly larger."""
+    from cat.looking_glass import bill_the_lizard
+    from cat.looking_glass.agent_deletion import _teardown_lock_budget
+
+    for quiesce in (0, 180, 600):
+        assert bill_the_lizard._create_lock_budget(quiesce) > _teardown_lock_budget(quiesce)

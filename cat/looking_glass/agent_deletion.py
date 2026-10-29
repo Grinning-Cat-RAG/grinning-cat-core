@@ -9,11 +9,16 @@ This module owns the whole protocol, not just the marker:
 
 1. wait (bounded) for the agent's ingestion rows to reach a terminal state;
 2. wipe the agent's Redis namespace, preserving the marker;
-3. purge vector memory and run the per-source deletion cascade for the files
-   captured *before* the wipe;
+3. run the per-source deletion cascade for the files captured *before* the
+   wipe (``before_file_manager_file_delete`` while the point metadata is still
+   present -> delete the source's points -> ``after_file_manager_file_deleted``),
+   then purge all remaining vector memory as the catch-all;
 4. remove the file storage folder and fire ``after_cheshire_cat_destroy``;
 5. clear the marker LAST, so a crash at any point leaves a resumable marker
    that ``complete_pending_deletes`` can pick up.
+
+A marker whose namespace is otherwise empty means a previous run crashed after
+the wipe: it is cleared without booting a light cat (nothing left to purge).
 
 The marker key format mirrors the ``ingestion_status`` plugin registry
 (EffING's ``registry.delete_marker_key``): the plugin owns the single source
@@ -25,6 +30,7 @@ Import-safe: this module is imported by the core at startup; it performs no
 network/Redis/filesystem work at import time.
 """
 import asyncio
+import contextvars
 import time
 
 from cat.db import crud
@@ -45,6 +51,51 @@ _DEFAULT_POLL_SECONDS = 5
 #: The file-manager scope passed to the deletion hooks for agent-root files
 #: (mirrors ``DELETE /file_manager/files`` for an agent-level path).
 _AGENT_FILE_SCOPE = "agent"
+
+#: Task-local set of ``(operation, agent_id)`` pairs currently executing.
+#: ``ContextVar`` is per-task (and copied into child tasks), so a plugin hook
+#: that re-enters create/destroy for the SAME id is caught immediately instead
+#: of self-blocking on the nested distributed lock until its timeout. A
+#: create -> teardown transition for the same id is legitimate: they are
+#: different operations. delete -> delete and create -> create are not.
+_ACTIVE_OPERATIONS: contextvars.ContextVar[frozenset[tuple[str, str]]] = contextvars.ContextVar(
+    "agent_deletion_active_operations", default=frozenset()
+)
+
+
+def _enter_operation(operation: str, agent_id: str) -> contextvars.Token[frozenset[tuple[str, str]]]:
+    """Register ``(operation, agent_id)`` and reject a re-entrant same pair.
+
+    Returns the token to pass to :func:`_exit_operation` in a ``finally``.
+    Raises ``RuntimeError`` immediately (no lock wait) when the same operation
+    is already running for this agent in the current context.
+    """
+    active = _ACTIVE_OPERATIONS.get()
+    pair = (operation, agent_id)
+    if pair in active:
+        raise RuntimeError(
+            f"Re-entrant `{operation}` for agent `{agent_id}`: a plugin hook "
+            "fired during create/destroy must not call the same operation for "
+            "the same agent id."
+        )
+    return _ACTIVE_OPERATIONS.set(active | {pair})
+
+
+def _exit_operation(token: contextvars.Token[frozenset[tuple[str, str]]]) -> None:
+    """Undo the registration performed by :func:`_enter_operation`."""
+    _ACTIVE_OPERATIONS.reset(token)
+
+
+def _teardown_lock_budget(quiesce: int) -> int:
+    """Worst-case wall-clock budget for one full agent teardown.
+
+    Phases covered: the ingestion quiesce window (``quiesce``), the namespace
+    wipe, the per-source memory/file cascade, the blanket memory purge, the
+    light-cat boot/shutdown, and the plugin hooks. Doubled to leave headroom
+    over a slow-but-healthy run, plus a fixed 300s for the phases that are not
+    governed by the quiesce window.
+    """
+    return 2 * quiesce + 300
 
 
 def _delete_marker_key(agent_id: str) -> str:
@@ -180,27 +231,24 @@ async def _boot_light_cat(agent_id: str):
     return await module.CheshireCat.create(agent_id)
 
 
-async def purge_agent_memory(agent_id: str) -> None:
-    """Purge an agent's vector memory without an existing cat instance."""
-    ccat = await _boot_light_cat(agent_id)
-    try:
-        await ccat.destroy_memory()
-    finally:
-        await ccat.shutdown()
-
-
 async def _teardown_memory_and_files(ccat, sources) -> None:
-    """Purge vector memory, cascade per source, remove files, notify plugins.
+    """Cascade per source, purge remaining memory, remove files, notify plugins.
 
     ``sources`` is the file list captured BEFORE the namespace wipe: the wipe
     deletes the stored file settings, so it must not be read from storage at
     this point.
+
+    For each source the order is: ``before_file_manager_file_delete`` (the
+    point metadata is still present, so plugins can e.g. drop extracted images
+    tied to the source) -> ``delete_tenant_points`` for that source ->
+    ``after_file_manager_file_deleted``. Only afterwards is ``destroy_memory``
+    run as the catch-all purge for everything not covered by a source; the
+    ``before`` hook must fire while the points still exist for the cascade to
+    have any effect.
     """
     # Lazy imports keep the startup import graph small and avoid cycles.
     from cat.routes.routes_utils import sanitize_source_name
     from cat.services.memory.models import VectorMemoryType
-
-    await ccat.destroy_memory()
 
     for source in sources:
         sanitized_source = sanitize_source_name(source, ccat.agent_key)
@@ -226,6 +274,10 @@ async def _teardown_memory_and_files(ccat, sources) -> None:
             caller=ccat,
         )
 
+    # Catch-all purge for any memory not tied to a captured source. Runs after
+    # the per-source cascade, and always, even when no sources were captured.
+    await ccat.destroy_memory()
+
     ccat.file_manager.remove_folder(ccat.agent_key)
 
     # Plugin-owned namespaces get their final cleanup while the plugin manager
@@ -242,6 +294,12 @@ def _env_int(name: str, default: int) -> int:
     return default if value is None else value
 
 
+async def _namespace_has_only_marker(agent_id: str) -> bool:
+    """Whether the agent namespace is empty apart from the delete marker."""
+    keys = await crud.scan_keys(f"{DEFAULT_AGENTS_KEY}:{_escape_glob(agent_id)}:*")
+    return keys == [_delete_marker_key(agent_id)]
+
+
 async def complete_agent_teardown(agent_id: str, ccat=None) -> None:
     """Finish an agent teardown, resumably and idempotently.
 
@@ -250,46 +308,63 @@ async def complete_agent_teardown(agent_id: str, ccat=None) -> None:
     arrived late), so re-running on a half-torn-down agent is safe.
 
     ``ccat`` may be a live cat owned by the caller (it is left running) or
-    ``None``, in which case a light cat is booted and shut down here.
+    ``None``, in which case a light cat is booted and shut down here — unless
+    the namespace already holds only the marker (a previous run crashed after
+    the wipe), in which case there is nothing left to purge and the marker is
+    simply cleared without booting a cat.
+
+    Re-entrant calls for the same agent are rejected with ``RuntimeError``
+    before touching the lock (see :func:`_enter_operation`).
     """
-    quiesce_seconds = _env_int("CAT_INGESTION_DELETE_QUIESCE_SECONDS", _DEFAULT_QUIESCE_SECONDS)
-    poll_seconds = _env_int("CAT_INGESTION_DELETE_POLL_SECONDS", _DEFAULT_POLL_SECONDS)
-    lock_budget = quiesce_seconds + 120
+    token = _enter_operation("teardown", agent_id)
+    try:
+        quiesce_seconds = _env_int("CAT_INGESTION_DELETE_QUIESCE_SECONDS", _DEFAULT_QUIESCE_SECONDS)
+        poll_seconds = _env_int("CAT_INGESTION_DELETE_POLL_SECONDS", _DEFAULT_POLL_SECONDS)
+        lock_budget = _teardown_lock_budget(quiesce_seconds)
 
-    async with crud.distributed_lock(
-        f"agent-delete:{agent_id}",
-        timeout=lock_budget,
-        blocking_timeout=lock_budget,
-    ):
-        if not await has_delete_marker(agent_id):
-            return None
+        async with crud.distributed_lock(
+            f"agent-delete:{agent_id}",
+            timeout=lock_budget,
+            blocking_timeout=lock_budget,
+        ):
+            if not await has_delete_marker(agent_id):
+                return None
 
-        booted = False
-        if ccat is None:
-            ccat = await _boot_light_cat(agent_id)
-            booted = True
+            # Crash recovery: the wipe already ran, so only the marker is left.
+            # Clear it without booting a light cat, otherwise a crash after the
+            # wipe would leave a permanently stuck marker.
+            if ccat is None and await _namespace_has_only_marker(agent_id):
+                await clear_delete_marker(agent_id)
+                return None
 
-        try:
-            # ORDERING FIX: the per-file cascade needs the file list, but the
-            # namespace wipe deletes the stored file settings. Capture the
-            # sources from the live cat BEFORE the wipe; read them afterwards
-            # and they are gone. (MyCAT captured after the wipe and lost the
-            # cascade on every fully-provisioned agent.)
-            sources = [f.name for f in ccat.file_manager.list_files(ccat.agent_key)]
+            booted = False
+            if ccat is None:
+                ccat = await _boot_light_cat(agent_id)
+                booted = True
 
-            await wait_for_ingestion_quiesce(agent_id, quiesce_seconds, poll_seconds)
-            await wipe_agent_namespace_excluding_marker(agent_id)
-            await _teardown_memory_and_files(ccat, sources)
+            try:
+                # ORDERING FIX: the per-file cascade needs the file list, but the
+                # namespace wipe deletes the stored file settings. Capture the
+                # sources from the live cat BEFORE the wipe; read them afterwards
+                # and they are gone. (MyCAT captured after the wipe and lost the
+                # cascade on every fully-provisioned agent.)
+                sources = [f.name for f in ccat.file_manager.list_files(ccat.agent_key)]
 
-            # Last: the marker means "teardown incomplete", so it can only go
-            # away once memory and files are actually gone. A crash before
-            # this line leaves a resumable marker.
-            await clear_delete_marker(agent_id)
-        finally:
-            if booted:
-                # Only a cat booted here is ours to shut down: the caller owns
-                # a live ``ccat``.
-                await ccat.shutdown()
+                await wait_for_ingestion_quiesce(agent_id, quiesce_seconds, poll_seconds)
+                await wipe_agent_namespace_excluding_marker(agent_id)
+                await _teardown_memory_and_files(ccat, sources)
+
+                # Last: the marker means "teardown incomplete", so it can only go
+                # away once memory and files are actually gone. A crash before
+                # this line leaves a resumable marker.
+                await clear_delete_marker(agent_id)
+            finally:
+                if booted:
+                    # Only a cat booted here is ours to shut down: the caller owns
+                    # a live ``ccat``.
+                    await ccat.shutdown()
+    finally:
+        _exit_operation(token)
 
     return None
 

@@ -15,9 +15,13 @@ from cat.env import get_env, get_env_int
 from cat.exceptions import UnknownAgentException
 from cat.log import log
 from cat.looking_glass.agent_deletion import (
+    _enter_operation,
+    _exit_operation,
+    _teardown_lock_budget,
     complete_agent_teardown,
     complete_pending_deletes,
     has_pending_delete,
+    set_delete_marker,
 )
 from cat.looking_glass.cheshire_cat import CheshireCat
 from cat.looking_glass.mad_hatter.mad_hatter import MadHatter
@@ -33,6 +37,20 @@ def _delete_completion_enabled() -> bool:
     """Whether pending agent deletions should be completed at startup."""
     value = get_env("CAT_DELETE_COMPLETION_ON_BOOT")
     return (value or "").strip().lower() in ("true", "1", "yes")
+
+
+def _create_lock_budget(quiesce: int) -> int:
+    """Budget for the ``agent-create:<id>`` lock.
+
+    The create lock is held across the create work AND, when a delete is
+    pending, the nested teardown it triggers. It must therefore outlive the
+    teardown's own worst-case budget (:func:`_teardown_lock_budget`, which is
+    ``2 * quiesce + 300`` covering quiesce + wipe + cascade + purge + boot);
+    add 60s for the create work itself (cat creation, metadata, embedder
+    initialisation, procedure embedding, hooks). Otherwise the create lock can
+    auto-expire mid-teardown and let another create interleave.
+    """
+    return _teardown_lock_budget(quiesce) + 60
 
 
 @singleton
@@ -163,42 +181,52 @@ class BillTheLizard(OrchestratorMixin, NonCopyableMixin):
         #
         # Re-entrancy: a plugin hook fired inside create/destroy
         # (`after_cheshire_cat_creation`, `after_cheshire_cat_destroy`) must never
-        # call create/destroy for the SAME agent id, or it self-blocks on the
-        # nested lock until the timeout.
-        quiesce = get_env_int("CAT_INGESTION_DELETE_QUIESCE_SECONDS") or 180
-        budget = quiesce + 120
-        async with crud.distributed_lock(
-            f"agent-create:{agent_id}",
-            timeout=budget,
-            blocking_timeout=budget,
-        ):
-            if await has_pending_delete(agent_id):
-                await complete_agent_teardown(agent_id)
+        # call the same operation for the SAME agent id, or it self-blocks on the
+        # nested lock until the timeout. This is enforced by the task-local guard
+        # in `agent_deletion`: a re-entrant same pair raises RuntimeError at once.
+        quiesce = get_env_int("CAT_INGESTION_DELETE_QUIESCE_SECONDS")
+        if quiesce is None:
+            quiesce = 180
+        budget = _create_lock_budget(quiesce)
 
-            if agent_id in await crud_settings.get_agents_main_keys():
-                return await self.get_cheshire_cat(agent_id)  # type: ignore[return-value]
+        token = _enter_operation("create", agent_id)
+        try:
+            async with crud.distributed_lock(
+                f"agent-create:{agent_id}",
+                timeout=budget,
+                blocking_timeout=budget,
+            ):
+                if await has_pending_delete(agent_id):
+                    await complete_agent_teardown(agent_id)
 
-            ccat = None
-            try:
-                ccat = await CheshireCat.create(agent_id)
-                if metadata is not None:
-                    await crud_settings.upsert_setting_by_name(
-                        ccat.agent_key,
-                        Setting(name="metadata", value=metadata),
-                    )
+                if agent_id in await crud_settings.get_agents_main_keys():
+                    return await self.get_cheshire_cat(agent_id)  # type: ignore[return-value]
 
-                embedder = await self.embedder()
-                await ccat.vector_memory_handler.initialize(embedder.name, await embedding_size(embedder))
-                await ccat.embed_procedures()
+                ccat = None
+                try:
+                    ccat = await CheshireCat.create(agent_id)
+                    if metadata is not None:
+                        await crud_settings.upsert_setting_by_name(
+                            ccat.agent_key,
+                            Setting(name="metadata", value=metadata),
+                        )
 
-                await self.plugin_manager.execute_hook("after_cheshire_cat_creation", ccat, caller=self)
+                    embedder = await self.embedder()
+                    await ccat.vector_memory_handler.initialize(embedder.name, await embedding_size(embedder))
+                    await ccat.embed_procedures()
 
-                return ccat
-            except Exception as e:
-                log.error(f"Error creating Cheshire Cat `{agent_id}`: {e}")
-                await self.rollback_cheshire_cat_creation(agent_id, ccat)
+                    await self.plugin_manager.execute_hook("after_cheshire_cat_creation", ccat, caller=self)
 
-                raise
+                    return ccat
+                except BaseException as e:
+                    # BaseException (not Exception): a CancelledError mid-create
+                    # must still roll back, or a half-built agent survives.
+                    log.error(f"Error creating Cheshire Cat `{agent_id}`: {e}")
+                    await self.rollback_cheshire_cat_creation(agent_id, ccat)
+
+                    raise
+        finally:
+            _exit_operation(token)
 
     async def rollback_cheshire_cat_creation(self, agent_id: str, cat: CheshireCat | None) -> None:
         """
@@ -211,12 +239,25 @@ class BillTheLizard(OrchestratorMixin, NonCopyableMixin):
         Returns:
             None
         """
-        # rollback
+        # A live cat owns its own teardown.
         if cat:
             await cat.destroy()
             return
 
-        await crud.delete(agent_id)
+        # No cat instance: route the cleanup through the teardown protocol so
+        # the whole ``agents:<id>:*`` namespace is removed (``crud.delete(id)``
+        # deleted a literal key named after the id and left the namespace
+        # behind). The marker is written FIRST, so a failure here leaves a
+        # resumable marker that boot recovery (``complete_pending_deletes``)
+        # will finish instead of a half-built agent.
+        await set_delete_marker(agent_id)
+        try:
+            await complete_agent_teardown(agent_id)
+        except Exception as e:
+            log.error(
+                f"Rollback teardown for agent `{agent_id}` failed; "
+                f"leaving the delete marker for boot recovery: {e}"
+            )
 
     async def _get_cheshire_cat_on_plugin_event(self, agent_id: str, plugin_id: str) -> CheshireCat | None:
         """

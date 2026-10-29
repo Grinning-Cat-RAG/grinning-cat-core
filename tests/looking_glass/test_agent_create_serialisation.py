@@ -10,7 +10,10 @@ Covers:
 """
 
 import asyncio
+import time
 import uuid
+
+import pytest
 
 from cat.db import crud
 from cat.db.cruds import settings as crud_settings
@@ -131,4 +134,65 @@ async def test_reset_path_destroy_then_create(lizard):
         cat = await lizard.get_cheshire_cat(agent_id)
         if cat is not None:
             await cat.destroy()
+        await _cleanup_namespace(agent_id)
+
+
+async def test_cancellation_mid_create_rolls_back_fully(lizard, monkeypatch):
+    """A CancelledError mid-create must not leave a half-built agent or marker."""
+    agent_id = _agent_id("agent_cancel_create")
+
+    async def cancelled_create(target_id):
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(bill_the_lizard.CheshireCat, "create", cancelled_create)
+
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await lizard.create_cheshire_cat(agent_id)
+
+        assert await crud.read(f"agents:{agent_id}:agent") is None
+        assert await has_pending_delete(agent_id) is False
+        assert await crud.scan_keys(
+            f"agents:{agent_deletion._escape_glob(agent_id)}:*"
+        ) == []
+    finally:
+        await _cleanup_namespace(agent_id)
+
+
+async def test_reentrant_create_for_same_id_fails_fast(lizard, monkeypatch):
+    """A create hook that re-enters create for the same id raises at once."""
+    agent_id = _agent_id("agent_reentrant_create")
+    log = []
+    captured = {}
+
+    async def fake_embedder():
+        return type("E", (), {"name": "stub-embedder"})()
+
+    async def fake_embedding_size(embedder):
+        return 3
+
+    async def reentering_hook(name, *args, caller=None):
+        if name != "after_cheshire_cat_creation":
+            return None
+
+        started = time.monotonic()
+        try:
+            await lizard.create_cheshire_cat(agent_id)
+        except RuntimeError as e:
+            captured["error"] = e
+            captured["elapsed"] = time.monotonic() - started
+
+    monkeypatch.setattr(bill_the_lizard, "CheshireCat", _StubCatFactory(log))
+    monkeypatch.setattr(bill_the_lizard, "embedding_size", fake_embedding_size)
+    monkeypatch.setattr(lizard, "embedder", fake_embedder)
+    monkeypatch.setattr(lizard.plugin_manager, "execute_hook", reentering_hook)
+
+    try:
+        await lizard.create_cheshire_cat(agent_id)
+
+        assert isinstance(captured.get("error"), RuntimeError)
+        # Fast rejection, nowhere near the lock budget.
+        assert captured["elapsed"] < bill_the_lizard._create_lock_budget(180)
+        assert log.count(f"create:{agent_id}") == 1
+    finally:
         await _cleanup_namespace(agent_id)
