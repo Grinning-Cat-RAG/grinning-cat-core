@@ -311,3 +311,72 @@ async def test_teardown_cascades_each_source_after_wipe(unique_agent_id, monkeyp
         assert await has_delete_marker(unique_agent_id) is False
     finally:
         await crud.delete(_delete_marker_key(unique_agent_id))
+
+
+# 8. CheshireCat.destroy() entry point ---------------------------------------
+async def test_destroy_clears_marker_and_namespace(cheshire_cat, monkeypatch):
+    """``CheshireCat.destroy()`` runs the whole protocol, not just the marker."""
+    from cat.looking_glass.cheshire_cat import CheshireCat
+
+    agent_id = cheshire_cat._id
+    file_manager = cheshire_cat.file_manager
+    plugin_manager = cheshire_cat.plugin_manager
+
+    assert isinstance(cheshire_cat, CheshireCat)
+
+    hooks = []
+    original_execute_hook = plugin_manager.execute_hook
+
+    async def spy_execute_hook(name, *args, caller=None):
+        hooks.append(name)
+        return await original_execute_hook(name, *args, caller=caller)
+
+    memory_destroyed = []
+    original_destroy_memory = cheshire_cat.destroy_memory
+
+    async def spy_destroy_memory():
+        memory_destroyed.append(True)
+        return await original_destroy_memory()
+
+    removed_folders = []
+    original_remove_folder = file_manager.remove_folder
+
+    def spy_remove_folder(remote_root_dir):
+        removed_folders.append(remote_root_dir)
+        return original_remove_folder(remote_root_dir)
+
+    monkeypatch.setattr(plugin_manager, "execute_hook", spy_execute_hook)
+    monkeypatch.setattr(cheshire_cat, "destroy_memory", spy_destroy_memory)
+    monkeypatch.setattr(file_manager, "remove_folder", spy_remove_folder)
+
+    try:
+        await cheshire_cat.destroy()
+
+        assert memory_destroyed == [True]
+        assert "after_cheshire_cat_destroy" in hooks
+        assert removed_folders == [agent_id]
+        assert await has_delete_marker(agent_id) is False
+        assert await crud.scan_keys(f"{DEFAULT_AGENTS_KEY}:{_escape_glob(agent_id)}:*") == []
+    finally:
+        await crud.delete(_delete_marker_key(agent_id))
+
+
+async def test_destroy_is_idempotent():
+    """Calling the entry point twice does not raise and leaves nothing behind."""
+    from cat.looking_glass.cheshire_cat import CheshireCat
+
+    agent_id = "agent_destroy_twice_4a7d"
+    fake = _FakeCat(agent_id, sources=["doc.txt"])
+    try:
+        await CheshireCat.destroy(fake)
+        assert await has_delete_marker(agent_id) is False
+
+        # Second call: it writes the marker again, runs the (now empty)
+        # teardown and clears it again — no error.
+        await CheshireCat.destroy(fake)
+
+        assert fake.shutdown_calls == 2
+        assert await has_delete_marker(agent_id) is False
+        assert await crud.scan_keys(f"{DEFAULT_AGENTS_KEY}:{_escape_glob(agent_id)}:*") == []
+    finally:
+        await crud.delete(_delete_marker_key(agent_id))
