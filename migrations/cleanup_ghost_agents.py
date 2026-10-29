@@ -18,6 +18,12 @@ Safety contract
 * Exit codes: ``0`` ok, ``1`` partial failure, ``2`` aborted / nothing done.
 * Each agent is processed in isolation: one failure never aborts the others.
 * Agents that still own their master key or a delete marker are never touched.
+* In ``--apply`` every candidate is re-classified and destroyed while holding
+  the same ``agent-create:<id>`` lock ``create_cheshire_cat`` takes. A create
+  that lands between the initial classification and the destroy would otherwise
+  leave a live agent hollowed out (its master key is excluded from the wipe but
+  its settings/conversations are deleted). If the lock cannot be acquired the
+  candidate is reported as failed and nothing is deleted.
 * Namespaces whose id contains ``:`` are reported as ``ambiguous_id`` and are
   never classified or deleted, in dry-run and in ``--apply``.
 * A candidate namespace that is a strict prefix of an ambiguous namespace is
@@ -58,6 +64,11 @@ DELETE_MARKER_SUFFIX = "ingestion:delete"
 #: Any other second segment means the actual id may continue past the first
 #: segment, so the namespace cannot be parsed safely.
 KNOWN_FAMILIES = frozenset({"agent", "settings", "conversations", "users", "plugins", "ingestion"})
+
+#: Lock timeout for the ``agent-create:<id>`` guard. Modest by design: a create
+#: completing a full agent build is the contention we must survive, and the
+#: per-candidate work here is a couple of Redis reads plus one ``DESTROY``.
+CREATE_LOCK_TIMEOUT = 60.0
 
 
 def _escape_glob(agent_id: str) -> str:
@@ -163,6 +174,33 @@ async def classify_agent(agent_id: str, keys: list[str]) -> str:
     return "ghost" if peripheral else "healthy"
 
 
+async def _reap_ghost_under_create_lock(agent_id: str, agent_keys: list[str]) -> dict[str, Any]:
+    """Re-classify and delete one candidate while holding ``agent-create:<id>``.
+
+    ``create_cheshire_cat`` holds ``agent-create:<id>`` for its whole critical
+    section, so taking the same lock closes the window where a create completes
+    between the initial classification and the destroy (the master key would be
+    excluded from the wipe while settings/conversations were deleted, leaving a
+    hollow live agent). The classification is repeated INSIDE the lock so a
+    create that landed first wins.
+
+    Returns ``{"deleted": <int>}`` on deletion, or ``{"skipped": <reason>}`` when
+    the agent is no longer a ghost. Raises on lock/destroy failure; the caller
+    reports the candidate as failed.
+    """
+    async with crud.distributed_lock(
+        f"agent-create:{agent_id}",
+        timeout=CREATE_LOCK_TIMEOUT,
+        blocking_timeout=CREATE_LOCK_TIMEOUT,
+    ):
+        classification = await classify_agent(agent_id, agent_keys)
+        if classification != "ghost":
+            return {"skipped": classification}
+
+        exclude = {master_key(agent_id), delete_marker_key(agent_id)}
+        return {"deleted": await crud.destroy(delete_pattern(agent_id), exclude=exclude)}
+
+
 async def plan(apply: bool) -> dict[str, Any]:
     """Build the full report, deleting only when ``apply`` is true."""
     report: dict[str, Any] = {
@@ -182,24 +220,25 @@ async def plan(apply: bool) -> dict[str, Any]:
         report["skipped"].append({"agent_id": namespace, "reason": "ambiguous_id"})
 
     for agent_id, agent_keys in grouped.items():
+        action = {"agent_id": agent_id, "keys": agent_keys, "deleted": None}
         try:
-            classification = await classify_agent(agent_id, agent_keys)
+            if apply:
+                # Classify + destroy atomically against a concurrent create.
+                outcome = await _reap_ghost_under_create_lock(agent_id, agent_keys)
+            else:
+                # Dry-run takes no lock (it writes nothing) and only reports.
+                classification = await classify_agent(agent_id, agent_keys)
+                outcome = {"deleted": None} if classification == "ghost" else {"skipped": classification}
         except Exception as exc:  # noqa: BLE001 - one bad agent must not abort the run
             report["failed"].append({"agent_id": agent_id, "error": str(exc)})
             continue
 
-        if classification != "ghost":
-            report["skipped"].append({"agent_id": agent_id, "reason": classification})
+        if "skipped" in outcome:
+            report["skipped"].append({"agent_id": agent_id, "reason": outcome["skipped"]})
             continue
 
-        action = {"agent_id": agent_id, "keys": agent_keys, "deleted": None}
         if apply:
-            exclude = {master_key(agent_id), delete_marker_key(agent_id)}
-            try:
-                action["deleted"] = await crud.destroy(delete_pattern(agent_id), exclude=exclude)
-            except Exception as exc:  # noqa: BLE001 - per-agent isolation
-                report["failed"].append({"agent_id": agent_id, "error": str(exc)})
-                continue
+            action["deleted"] = outcome["deleted"]
 
         report["actions"].append(action)
 

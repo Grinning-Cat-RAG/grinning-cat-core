@@ -8,17 +8,21 @@ still running. Invariant: marker present <=> teardown incomplete.
 This module owns the whole protocol, not just the marker:
 
 1. wait (bounded) for the agent's ingestion rows to reach a terminal state;
-2. wipe the agent's Redis namespace, preserving the marker;
-3. run the per-source deletion cascade for the files captured *before* the
+2. run the per-source deletion cascade for the files captured *before* the
    wipe (``before_file_manager_file_delete`` while the point metadata is still
    present -> delete the source's points -> ``after_file_manager_file_deleted``),
    then purge all remaining vector memory as the catch-all;
-4. remove the file storage folder and fire ``after_cheshire_cat_destroy``;
+3. remove the file storage folder and fire ``after_cheshire_cat_destroy``;
+4. wipe the agent's Redis namespace, preserving the marker;
 5. clear the marker LAST, so a crash at any point leaves a resumable marker
    that ``complete_pending_deletes`` can pick up.
 
-A marker whose namespace is otherwise empty means a previous run crashed after
-the wipe: it is cleared without booting a light cat (nothing left to purge).
+The cascade runs BEFORE the wipe: the wipe deletes the stored file settings, so
+the sources are captured first, and a crash between the wipe and the cascade
+would leave only a marker while points and files still exist — which the
+marker-only short-circuit would then silently clear. With this order, "only the
+marker remains" genuinely means the cascade already ran and there is nothing
+left to purge.
 
 The marker key format mirrors the ``ingestion_status`` plugin registry
 (EffING's ``registry.delete_marker_key``): the plugin owns the single source
@@ -245,6 +249,11 @@ async def _teardown_memory_and_files(ccat, sources) -> None:
     run as the catch-all purge for everything not covered by a source; the
     ``before`` hook must fire while the points still exist for the cascade to
     have any effect.
+
+    This whole function runs BEFORE the namespace wipe: a crash here leaves the
+    marker plus the namespace, so recovery boots a cat and retries the cascade.
+    Reaching the marker-only state is therefore only possible once this has
+    completed.
     """
     # Lazy imports keep the startup import graph small and avoid cycles.
     from cat.routes.routes_utils import sanitize_source_name
@@ -310,8 +319,8 @@ async def complete_agent_teardown(agent_id: str, ccat=None) -> None:
     ``ccat`` may be a live cat owned by the caller (it is left running) or
     ``None``, in which case a light cat is booted and shut down here — unless
     the namespace already holds only the marker (a previous run crashed after
-    the wipe), in which case there is nothing left to purge and the marker is
-    simply cleared without booting a cat.
+    the cascade AND the wipe), in which case there is nothing left to purge and
+    the marker is simply cleared without booting a cat.
 
     Re-entrant calls for the same agent are rejected with ``RuntimeError``
     before touching the lock (see :func:`_enter_operation`).
@@ -330,9 +339,11 @@ async def complete_agent_teardown(agent_id: str, ccat=None) -> None:
             if not await has_delete_marker(agent_id):
                 return None
 
-            # Crash recovery: the wipe already ran, so only the marker is left.
-            # Clear it without booting a light cat, otherwise a crash after the
-            # wipe would leave a permanently stuck marker.
+            # Crash recovery: the cascade and the wipe already ran, so only the
+            # marker is left. This is only reachable AFTER the cascade, i.e. the
+            # memory purge and folder removal already completed; clear the
+            # marker without booting a light cat, otherwise a crash at the very
+            # end would leave a permanently stuck marker.
             if ccat is None and await _namespace_has_only_marker(agent_id):
                 await clear_delete_marker(agent_id)
                 return None
@@ -345,18 +356,26 @@ async def complete_agent_teardown(agent_id: str, ccat=None) -> None:
             try:
                 # ORDERING FIX: the per-file cascade needs the file list, but the
                 # namespace wipe deletes the stored file settings. Capture the
-                # sources from the live cat BEFORE the wipe; read them afterwards
-                # and they are gone. (MyCAT captured after the wipe and lost the
-                # cascade on every fully-provisioned agent.)
+                # sources from the live cat BEFORE anything is destroyed; read
+                # them afterwards and they are gone. (MyCAT captured after the
+                # wipe and lost the cascade on every fully-provisioned agent.)
                 sources = [f.name for f in ccat.file_manager.list_files(ccat.agent_key)]
 
                 await wait_for_ingestion_quiesce(agent_id, quiesce_seconds, poll_seconds)
-                await wipe_agent_namespace_excluding_marker(agent_id)
+
+                # Cascade BEFORE the wipe: memory and files must be gone while
+                # the marker still marks the teardown incomplete. If this raises,
+                # the marker stays and the namespace is untouched, so recovery
+                # can retry the cascade.
                 await _teardown_memory_and_files(ccat, sources)
 
+                # Wipe the remaining Redis namespace, preserving the marker, only
+                # once memory and files are actually gone.
+                await wipe_agent_namespace_excluding_marker(agent_id)
+
                 # Last: the marker means "teardown incomplete", so it can only go
-                # away once memory and files are actually gone. A crash before
-                # this line leaves a resumable marker.
+                # away once memory, files and the namespace are gone. A crash
+                # before this line leaves a resumable marker.
                 await clear_delete_marker(agent_id)
             finally:
                 if booted:

@@ -1,8 +1,8 @@
 """Tests for the complete agent-teardown protocol.
 
 ``cat/looking_glass/agent_deletion.py`` owns the full delete-marker lifecycle:
-marker -> bounded ingestion quiesce -> namespace wipe (marker preserved) ->
-memory/file cascade over the sources captured BEFORE the wipe -> marker clear
+marker -> bounded ingestion quiesce -> memory/file cascade over the sources
+captured BEFORE the wipe -> namespace wipe (marker preserved) -> marker clear
 LAST. These tests cover the marker schema, the wipe, the end-to-end run on a
 real cat, idempotency, the quiesce semantics, the resumable orphan path, and
 the per-source cascade ordering.
@@ -277,7 +277,7 @@ async def test_complete_pending_deletes_recovers_orphan_marker(lizard):
 
 
 # 7. per-source cascade ordering ---------------------------------------------
-async def test_teardown_cascades_each_source_after_wipe(unique_agent_id, monkeypatch):
+async def test_teardown_cascades_each_source_before_wipe(unique_agent_id, monkeypatch):
     sources = ["doc_one.txt", "doc_two.pdf"]
     fake = _FakeCat(unique_agent_id, sources=sources)
 
@@ -285,7 +285,14 @@ async def test_teardown_cascades_each_source_after_wipe(unique_agent_id, monkeyp
         fake.log.append("wipe")
         return 0
 
+    real_clear = agent_deletion.clear_delete_marker
+
+    async def spy_clear(agent_id):
+        fake.log.append("clear_marker")
+        return await real_clear(agent_id)
+
     monkeypatch.setattr(agent_deletion, "wipe_agent_namespace_excluding_marker", fake_wipe)
+    monkeypatch.setattr(agent_deletion, "clear_delete_marker", spy_clear)
 
     try:
         await set_delete_marker(unique_agent_id)
@@ -294,20 +301,86 @@ async def test_teardown_cascades_each_source_after_wipe(unique_agent_id, monkeyp
 
         log = fake.log
         wipe_index = log.index("wipe")
+
+        # Source capture happens while it is still readable; the whole cascade
+        # (per-source deletes, blanket purge, folder removal) runs BEFORE the
+        # namespace wipe.
         assert log.index("list_files") < wipe_index
-        assert log.index("destroy_memory") > wipe_index
+        assert log.index("destroy_memory") < wipe_index
+        assert log.index("remove_folder") < wipe_index
 
         for source in sources:
             before = log.index(f"hook:before_file_manager_file_delete:{source}")
             delete = log.index(f"delete_tenant_points:{source}")
             after = log.index(f"hook:after_file_manager_file_deleted:{source}")
 
-            # Per source, in order, and only after the namespace wipe.
-            assert wipe_index < before < delete < after
+            # Per source, in order, and strictly before the namespace wipe.
+            assert before < delete < after < wipe_index
 
         assert "hook:after_cheshire_cat_destroy:" + unique_agent_id in log
         assert fake.file_manager.removed == [unique_agent_id]
         assert len(fake.vector_memory_handler.calls) == len(sources)
+
+        # The marker is cleared LAST: after the cascade and after the wipe.
+        assert log.index("clear_marker") > wipe_index
+        assert log[-1] == "clear_marker"
+        assert await has_delete_marker(unique_agent_id) is False
+    finally:
+        await crud.delete(_delete_marker_key(unique_agent_id))
+
+
+async def test_teardown_keeps_marker_when_cascade_raises(unique_agent_id, monkeypatch):
+    """A failing cascade must leave the marker AND the namespace for retry."""
+    fake = _FakeCat(unique_agent_id, sources=["doc.txt"])
+
+    async def boom():
+        raise RuntimeError("cascade failed")
+
+    monkeypatch.setattr(fake, "destroy_memory", boom)
+
+    async def fail_wipe(agent_id):
+        raise AssertionError("namespace must not be wiped when the cascade failed")
+
+    monkeypatch.setattr(agent_deletion, "wipe_agent_namespace_excluding_marker", fail_wipe)
+
+    try:
+        await set_delete_marker(unique_agent_id)
+
+        with pytest.raises(RuntimeError):
+            await complete_agent_teardown(unique_agent_id, ccat=fake)
+
+        # Resumable: the marker is still there, and the wipe never ran.
+        assert await has_delete_marker(unique_agent_id) is True
+    finally:
+        await crud.delete(_delete_marker_key(unique_agent_id))
+
+
+async def test_successful_teardown_purges_memory_before_clearing_marker(unique_agent_id, monkeypatch):
+    """At the moment the marker is cleared, memory and folder are already gone."""
+    fake = _FakeCat(unique_agent_id, sources=["doc.txt"])
+    observed = []
+    real_clear = agent_deletion.clear_delete_marker
+
+    async def spy_clear(agent_id):
+        observed.append(
+            {
+                "marker_present": await has_delete_marker(agent_id),
+                "memory_purged": "destroy_memory" in fake.log,
+                "folder_removed": "remove_folder" in fake.log,
+            }
+        )
+        return await real_clear(agent_id)
+
+    monkeypatch.setattr(agent_deletion, "clear_delete_marker", spy_clear)
+
+    try:
+        await set_delete_marker(unique_agent_id)
+
+        await complete_agent_teardown(unique_agent_id, ccat=fake)
+
+        assert observed == [
+            {"marker_present": True, "memory_purged": True, "folder_removed": True}
+        ]
         assert await has_delete_marker(unique_agent_id) is False
     finally:
         await crud.delete(_delete_marker_key(unique_agent_id))

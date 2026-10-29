@@ -5,6 +5,7 @@ The suite runs against the dedicated test Redis db forced by ``tests/conftest.py
 """
 import asyncio
 import json
+from contextlib import asynccontextmanager
 from uuid import uuid4
 
 import migrations.cleanup_ghost_agents as cleanup_ghost_agents
@@ -200,3 +201,77 @@ def test_partial_failure_returns_1(capsys, monkeypatch):
         monkeypatch.setattr(cleanup_ghost_agents.crud, "destroy", real_destroy)
         _cleanup(keys)
 
+
+def test_apply_acquires_create_lock_before_destroy(capsys, monkeypatch):
+    ghost = _agent_id("ghost-lock")
+    ghost_key = f"agents:{ghost}:conversations:alice:chat"
+    keys: dict[str, dict] = {ghost_key: {"value": 1}}
+    events: list[tuple[str, str]] = []
+
+    real_lock = cleanup_ghost_agents.crud.distributed_lock
+    real_destroy = cleanup_ghost_agents.crud.destroy
+
+    def spy_lock(key_pattern, timeout=10.0, blocking_timeout=15.0):
+        events.append(("lock", key_pattern))
+        return real_lock(key_pattern, timeout=timeout, blocking_timeout=blocking_timeout)
+
+    async def spy_destroy(pattern, exclude=None):
+        events.append(("destroy", pattern))
+        return await real_destroy(pattern, exclude=exclude)
+
+    monkeypatch.setattr(cleanup_ghost_agents.crud, "distributed_lock", spy_lock)
+    monkeypatch.setattr(cleanup_ghost_agents.crud, "destroy", spy_destroy)
+
+    try:
+        _run(_seed(keys))
+
+        assert _run_main(["--apply", "--json"]) == 0
+
+        report = json.loads(capsys.readouterr().out)
+        assert [action["agent_id"] for action in report["actions"]] == [ghost]
+
+        # The create lock is taken first; the destroy only runs afterwards.
+        # (``crud.destroy`` itself also takes a lock on the wipe pattern.)
+        assert events[0] == ("lock", f"agent-create:{ghost}")
+        destroy_index = events.index(("destroy", f"agents:{ghost}:*"))
+        assert destroy_index > 0
+        assert _run(_read(ghost_key)) is None
+    finally:
+        monkeypatch.setattr(cleanup_ghost_agents.crud, "distributed_lock", real_lock)
+        monkeypatch.setattr(cleanup_ghost_agents.crud, "destroy", real_destroy)
+        _cleanup(keys)
+
+
+def test_late_master_key_inside_lock_is_reported_and_not_deleted(capsys, monkeypatch):
+    ghost = _agent_id("ghost-race")
+    ghost_key = f"agents:{ghost}:settings:llm"
+    master = f"agents:{ghost}:agent"
+    keys: dict[str, dict] = {ghost_key: {"value": 1}, master: {"name": "late-create"}}
+
+    real_lock = cleanup_ghost_agents.crud.distributed_lock
+
+    @asynccontextmanager
+    async def lock_then_create(key_pattern, timeout=10.0, blocking_timeout=15.0):
+        # Simulate a create that lands after the scan but before we re-classify.
+        async with real_lock(key_pattern, timeout=timeout, blocking_timeout=blocking_timeout) as lock:
+            if key_pattern == f"agent-create:{ghost}":
+                await cleanup_ghost_agents.crud.store(master, {"name": "late-create"})
+            yield lock
+
+    monkeypatch.setattr(cleanup_ghost_agents.crud, "distributed_lock", lock_then_create)
+
+    try:
+        _run(_seed({ghost_key: {"value": 1}}))
+
+        assert _run_main(["--apply", "--json"]) == 0
+
+        report = json.loads(capsys.readouterr().out)
+        assert report["actions"] == []
+        assert report["skipped"] == [{"agent_id": ghost, "reason": "has_master_key"}]
+
+        # Nothing was deleted: the late master key and its settings survive.
+        assert _run(_read(master)) is not None
+        assert _run(_read(ghost_key)) is not None
+    finally:
+        monkeypatch.setattr(cleanup_ghost_agents.crud, "distributed_lock", real_lock)
+        _cleanup(keys)
