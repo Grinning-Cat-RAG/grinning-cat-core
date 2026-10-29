@@ -12,11 +12,12 @@ corresponding todo lands:
   and the ``embedding`` phase stays fresh -> no re-embed.
 - **B3** a source stuck in ``downloaded`` is not in the claimable status set,
   so ``claim_source_for_resume`` refuses it -> permanent dead end.
-- **B4** BLOCKED-SEAM: the completion veto has no exception seam yet. The
-  dispatcher (``PluginManager._run_hooks``) re-raises only
-  ``ManagementModeException``; every other exception is logged and swallowed,
-  so no honest behavioural test can be written before the dedicated
-  ``CustomHookVetoException`` lands in ``cat/exceptions.py``.
+- **B4** the completion veto used to be swallowed: the dispatcher
+  (``PluginManager._run_hooks``) re-raised only ``ManagementModeException``;
+  every other exception was logged and swallowed. The dedicated
+  ``CustomHookVetoException`` now lands in ``cat/exceptions.py`` and is
+  re-raised, so a vetoing ``before_ingestion_status_completed`` hook forces the
+  source to ``error`` instead of ``completed``.
 
 Every seeded key lives under ``agents:effingtest_<uuid>:`` and is destroyed in
 ``finally``. The host ``tests/conftest.py`` forces ``CAT_REDIS_DB=1``.
@@ -25,13 +26,13 @@ import inspect
 import time
 import uuid
 
-import pytest
-
 from cat.core_plugins.cat_efficient_ingestion import hooks
+from cat.core_plugins.cat_efficient_ingestion import plugin as ingestion_plugin
 from cat.core_plugins.cat_efficient_ingestion.phases import PHASES, is_phase_stale
 from cat.core_plugins.cat_efficient_ingestion.registry import (
     IngestionStatus,
     claim_source_for_resume,
+    get_status,
     list_statuses,
     set_status,
     status_key,
@@ -194,14 +195,63 @@ async def test_b3_downloaded_source_can_be_resumed():
         await _drop(agent)
 
 
-@pytest.mark.skip(
-    reason="BLOCKED-SEAM: no CustomHookVetoException yet; _run_hooks swallows every "
-    "non-ManagementModeException, so the veto cannot be observed behaviourally."
-)
-async def test_b4_completion_veto_must_survive_the_hook_dispatcher():
+async def test_b4_completion_veto_must_survive_the_hook_dispatcher(stray):
     """B4: a vetoing completion hook must force the source to ``error``.
 
-    Cannot be written honestly until the dedicated veto exception exists and
-    ``PluginManager._run_hooks`` re-raises it (plan todo 6).
+    Drives the plugin's real completion handler through the real
+    ``PluginManager._run_hooks`` dispatcher. The built-in
+    ``before_ingestion_status_completed`` vetoes because the caller reports
+    pending source tasks; the dedicated ``CustomHookVetoException`` must cross
+    the dispatcher instead of being swallowed, so the source ends in ``error``
+    (never ``completed``) with the veto reason recorded.
     """
-    raise AssertionError("blocked seam")
+    agent = _agent_id()
+    pm = stray.plugin_manager
+    original_pending = pm.hooks.get("ingestion_phase_pending")
+    original_gate = pm.hooks.get("before_ingestion_status_completed")
+
+    class _VetoingCat:
+        """Agent-scoped caller that reports pending ingestion tasks."""
+
+        def __init__(self, agent_key):
+            self.agent_key = agent_key
+            self.plugin_manager = pm
+
+        def has_pending_source_tasks(self, source):
+            return True
+
+    cat = _VetoingCat(agent)
+
+    try:
+        await _seed_master_key(agent)
+        # Real EffING hooks, dispatched by the real _run_hooks implementation.
+        pm.hooks["ingestion_phase_pending"] = [hooks.ingestion_phase_pending]
+        pm.hooks["before_ingestion_status_completed"] = [
+            hooks.before_ingestion_status_completed
+        ]
+
+        await ingestion_plugin.rabbithole_ingestion_start.function(
+            "doc.pdf", {}, False, cat
+        )
+        await ingestion_plugin.after_rabbithole_stored_documents.function(
+            "doc.pdf", [object()], cat
+        )
+
+        doc = await get_status(agent, "agent", "doc.pdf")
+        assert doc is not None
+        assert doc["status"] == IngestionStatus.ERROR.value, (
+            "B4: a vetoing completion hook was swallowed -> source completed "
+            f"instead of erroring (status={doc.get('status')!r})"
+        )
+        assert doc["status"] != IngestionStatus.COMPLETED.value
+        assert "Pending ingestion tasks" in doc["error"]
+    finally:
+        if original_pending is None:
+            pm.hooks.pop("ingestion_phase_pending", None)
+        else:
+            pm.hooks["ingestion_phase_pending"] = original_pending
+        if original_gate is None:
+            pm.hooks.pop("before_ingestion_status_completed", None)
+        else:
+            pm.hooks["before_ingestion_status_completed"] = original_gate
+        await _drop(agent)
