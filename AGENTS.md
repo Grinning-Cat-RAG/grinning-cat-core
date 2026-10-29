@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Operating manual for this repository (MyCAT core). Read this before changing agent lifecycle code.
+Operating manual for this repository (Grinning Cat core — CAT). Read this before changing agent lifecycle code.
 
 ## Agent deletion protocol
 
