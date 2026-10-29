@@ -113,6 +113,53 @@ async def test_b2_embedder_change_changes_the_embedding_phase_marker(cheshire_ca
     )
 
 
+async def test_b2b_chunker_change_changes_the_parsing_phase_marker(cheshire_cat):
+    """B2 (chunker): a rewritten chunker setting must mark parsing stale.
+
+    Chunker and embedder are system-level services, so the marker is resolved
+    from the ``DEFAULT_SYSTEM_KEY`` settings entry. Same config -> identical
+    marker; a material chunker change -> different marker -> stale phase.
+    """
+    base = {"encoding_name": "cl100k_base", "chunk_size": 256, "chunk_overlap": 64}
+    await crud_settings.upsert_setting_by_category(
+        DEFAULT_SYSTEM_KEY,
+        Setting(name="RecursiveTextChunkerSettings", value=dict(base), category="chunker"),
+    )
+    marker_before = await _marker("parsing_chunking", cheshire_cat)
+    marker_same = await _marker("parsing_chunking", cheshire_cat)
+
+    await crud_settings.upsert_setting_by_category(
+        DEFAULT_SYSTEM_KEY,
+        Setting(
+            name="RecursiveTextChunkerSettings",
+            value={**base, "chunk_size": 512},
+            category="chunker",
+        ),
+    )
+    marker_after = await _marker("parsing_chunking", cheshire_cat)
+
+    assert marker_before is not None, (
+        "B2: the built-in parsing_chunking marker is None -> a chunker change cannot be detected"
+    )
+    assert marker_same == marker_before, (
+        "B2: the parsing_chunking marker is not deterministic for an unchanged chunker"
+    )
+    assert marker_after != marker_before, (
+        "B2: changing the chunker left the parsing_chunking marker unchanged -> no re-parse"
+    )
+
+    diary = {
+        "parsing_chunking": {
+            "marker": marker_before,
+            "settings_version": "stale-token",
+            "deps": {},
+        },
+    }
+    assert is_phase_stale(PHASES["parsing_chunking"], diary, "current-token", marker_after) is True, (
+        "B2: parsing_chunking is deemed fresh after a chunker change"
+    )
+
+
 async def test_b3_downloaded_source_can_be_resumed():
     """B3: a stale ``downloaded`` source is claimable for a retry.
 
