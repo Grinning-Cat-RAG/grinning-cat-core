@@ -655,6 +655,99 @@ async def test_derived_image_file_is_excluded_from_prompt_list(app_client, agent
 
 
 # ---------------------------------------------------------------------------
+# Scenario 6b — card id is tenant/chat scoped (B1) and survives a re-embed (B2)
+# ---------------------------------------------------------------------------
+async def test_same_source_in_two_agents_gets_distinct_card_ids(app_client):
+    """The same file name uploaded to two agents must not collide (B1, phase)."""
+    agent_a = f"catalog_dual_agents_a_{uuid.uuid4().hex[:8]}"
+    agent_b = f"catalog_dual_agents_b_{uuid.uuid4().hex[:8]}"
+
+    cat_a = await _configure_agent(app_client, agent_a, EFFICIENT_ENGINE)
+    cat_b = await _configure_agent(app_client, agent_b, EFFICIENT_ENGINE)
+
+    assert (await _ingest_sample(app_client, agent_a)).status_code == 200
+    assert (await _ingest_sample(app_client, agent_b)).status_code == 200
+
+    cards_a = await _card_points(cat_a, DECLARATIVE, SAMPLE_NAME)
+    cards_b = await _card_points(cat_b, DECLARATIVE, SAMPLE_NAME)
+    assert len(cards_a) == 1, [(_meta(c), c.id) for c in cards_a]
+    assert len(cards_b) == 1, [(_meta(c), c.id) for c in cards_b]
+
+    ids_a = {c.id for c in cards_a}
+    ids_b = {c.id for c in cards_b}
+    assert ids_a.isdisjoint(ids_b), (ids_a, ids_b)
+
+    print("TENANT_SCOPED_CATALOG", {"agent_a": sorted(ids_a), "agent_b": sorted(ids_b)})
+
+
+async def test_same_source_in_two_chats_gets_distinct_card_ids(app_client, agent_key):
+    """Two chats of ONE agent get two distinct cards (B1, classic hooks)."""
+    cat = await _configure_agent(app_client, agent_key, CORE_ENGINE)
+    chat_1 = f"catalog_chat_{uuid.uuid4().hex[:8]}"
+    chat_2 = f"catalog_chat_{uuid.uuid4().hex[:8]}"
+
+    assert (await _ingest_sample(app_client, agent_key, chat_id=chat_1)).status_code == 200
+    assert (await _ingest_sample(app_client, agent_key, chat_id=chat_2)).status_code == 200
+
+    cards = await _card_points(cat, EPISODIC, SAMPLE_NAME)
+    assert len(cards) == 2, [(_meta(c).get("chat_id"), c.id) for c in cards]
+    by_chat = {_meta(c).get("chat_id"): c.id for c in cards}
+    assert set(by_chat) == {chat_1, chat_2}, by_chat
+    assert len(set(by_chat.values())) == 2, by_chat
+
+    print("CHAT_SCOPED_CATALOG", by_chat)
+
+
+async def test_reembed_keeps_card_id_and_does_not_duplicate(app_client, agent_key):
+    """A re-embed rebuild keeps the card id, so it never becomes a duplicate (B2)."""
+    from cat.core_plugins.cat_efficient_ingestion import reembed
+
+    cat = await _configure_agent(app_client, agent_key, EFFICIENT_ENGINE)
+    assert (await _ingest_sample(app_client, agent_key)).status_code == 200
+
+    cards = await _card_points(cat, DECLARATIVE, SAMPLE_NAME)
+    assert len(cards) == 1, [(_meta(c), c.id) for c in cards]
+    original_ids = {c.id for c in cards}
+
+    # Emulate the re-embed rebuild the embedding phase performs: it reconstructs
+    # every stored point of the source from its payload and re-stores it.
+    points = await _points(cat, DECLARATIVE, {"source": SAMPLE_NAME})
+    embedder = await cat.embedder()
+    rebuilt = await reembed._embed_phase(
+        cat, DECLARATIVE, SAMPLE_NAME, points, embedder, None, cat, rabbit_hole=None,
+    )
+    rebuilt_cards = [
+        p for p in rebuilt
+        if (p.payload or {}).get("metadata", {}).get("is_catalogue_card") is True
+    ]
+    assert len(rebuilt_cards) == 1, [(_meta(p), p.id) for p in rebuilt_cards]
+    assert {p.id for p in rebuilt_cards} == original_ids, (
+        "the re-embed rebuild lost the card id",
+        original_ids,
+        {p.id for p in rebuilt_cards},
+    )
+
+    # After an embedding change the catalog_cards phase is stale and re-runs: it
+    # must UPSERT the same id, never add a second card.
+    run_hook = next(
+        h for h in cat.plugin_manager.plugins["cat_alog"].hooks
+        if h.name == "ingestion_phase_run"
+    )
+    result = await run_hook.function("catalog_cards", SAMPLE_NAME, {}, cat)
+    assert result == {"status": "done"}, result
+
+    cards = await _card_points(cat, DECLARATIVE, SAMPLE_NAME)
+    assert len(cards) == 1, [(_meta(c), c.id) for c in cards]
+    assert {c.id for c in cards} == original_ids, (
+        "re-embed + phase re-run changed the card id",
+        original_ids,
+        {c.id for c in cards},
+    )
+
+    print("REEMBED_CATALOG", {"cards": len(cards), "ids": sorted(original_ids)})
+
+
+# ---------------------------------------------------------------------------
 # Scenario 7 — cleanup receipt (runs last)
 # ---------------------------------------------------------------------------
 async def test_zz_cleanup_receipt():
