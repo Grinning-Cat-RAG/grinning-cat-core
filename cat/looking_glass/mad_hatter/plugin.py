@@ -321,6 +321,36 @@ class Plugin:
         return data.get("project", {}).get("dependencies", [])
 
     @staticmethod
+    def _read_requirements_dependencies(requirements_file: str) -> List[str]:
+        """The dependency specs of a legacy requirements.txt, one per line.
+
+        Comments and pip options (`-r`, `--index-url`, ...) are not PEP 508
+        dependencies and cannot be expressed in a pyproject, so they are
+        skipped: the fallback exists for plugins that ship plain requirement
+        lines."""
+        dependencies = []
+        with open(requirements_file, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.split("#", 1)[0].strip()
+                if line and not line.startswith("-"):
+                    dependencies.append(line)
+        return dependencies
+
+    @staticmethod
+    def _requirements_to_pyproject(plugin_id: str, dependencies: List[str]) -> str:
+        """A minimal pyproject.toml for a legacy requirements.txt, so the same
+        uv lock/sync path the pyproject plugins use can install it."""
+        deps = "".join(f"    {json.dumps(dep)},\n" for dep in dependencies)
+        return (
+            "[project]\n"
+            f"name = {json.dumps(plugin_id)}\n"
+            'version = "0.0.0"\n'
+            "dependencies = [\n"
+            f"{deps}"
+            "]\n"
+        )
+
+    @staticmethod
     def _root_lock_path() -> str:
         return os.path.join(get_project_path(), "uv.lock")
 
@@ -380,21 +410,53 @@ class Plugin:
     def _is_installed_here(cls, plugin_dir: str, root_lock: str) -> bool:
         """The plugin's dependencies were compiled and installed against the current root uv.lock."""
         pyproject_file = os.path.join(plugin_dir, "pyproject.toml")
-        if not os.path.exists(pyproject_file):
-            return False
-        inputs = [pyproject_file] + ([root_lock] if os.path.exists(root_lock) else [])
+        if os.path.exists(pyproject_file) and cls._read_pyproject_dependencies(pyproject_file):
+            source = pyproject_file
+        else:
+            requirements_file = os.path.join(plugin_dir, "requirements.txt")
+            if not os.path.exists(requirements_file):
+                return False
+            source = requirements_file
         return cls._should_exit_from_installing_requirements(
-            os.path.join(plugin_dir, ".requirements_hash"), cls._hash_files(inputs),
+            os.path.join(plugin_dir, ".requirements_hash"), cls._requirements_hash(source),
         )
 
     def _requirements_source(self) -> str | None:
-        """Path to the plugin's pyproject.toml, or None if the plugin has no
-        dependencies to install. requirements.txt is not supported: plugins
-        install exclusively through pyproject.toml + uv."""
+        """Path to the plugin's dependency source, or None if it declares none.
+
+        pyproject.toml is the primary source; requirements.txt is the legacy
+        fallback for plugins that still ship it."""
         pyproject_file = os.path.join(self.path, "pyproject.toml")
         if os.path.exists(pyproject_file) and self._read_pyproject_dependencies(pyproject_file):
             return pyproject_file
+        requirements_file = os.path.join(self.path, "requirements.txt")
+        if os.path.exists(requirements_file) and self._read_requirements_dependencies(requirements_file):
+            return requirements_file
         return None
+
+    @classmethod
+    def _requirements_hash(cls, source: str) -> str:
+        """Hash of the dependency source the installer reads.
+
+        The pyproject.toml digest is unchanged (contents + root uv.lock). The
+        requirements.txt fallback prefixes its digest with a format marker, so
+        switching a plugin between the two formats always invalidates the
+        cached `.requirements_hash` instead of thrashing on a shared digest."""
+        root_lock = cls._root_lock_path()
+        if os.path.basename(source) != "requirements.txt":
+            inputs = [source] + ([root_lock] if os.path.exists(root_lock) else [])
+            return cls._hash_files(inputs)
+
+        h = hashlib.sha256()
+        h.update(b"requirements.txt\0")
+        with open(source, "rb") as f:
+            for chunk in iter(lambda: f.read(8192), b""):
+                h.update(chunk)
+        if os.path.exists(root_lock):
+            with open(root_lock, "rb") as f:
+                for chunk in iter(lambda: f.read(8192), b""):
+                    h.update(chunk)
+        return h.hexdigest()
 
     @staticmethod
     def _should_exit_from_installing_requirements(hash_file: str, current_hash: str) -> bool:
@@ -405,14 +467,19 @@ class Plugin:
         return False
 
     async def _install_requirements(self):
-        pyproject_file = self._requirements_source()
-        if pyproject_file is None:
+        source = self._requirements_source()
+        if source is None:
             return
 
-        hash_inputs = [pyproject_file]
-        if os.path.exists(self._root_lock_path()):
-            hash_inputs.append(self._root_lock_path())
-        current_hash = self._hash_files(hash_inputs)
+        source_name = os.path.basename(source)
+        log.info(f"Plugin {self.id}: using {source_name} as requirements source")
+        if source_name == "requirements.txt":
+            dependencies = self._read_requirements_dependencies(source)
+        else:
+            dependencies = self._read_pyproject_dependencies(source)
+        log.debug(f"Plugin {self.id} requirements from {source_name}: {dependencies}")
+
+        current_hash = self._requirements_hash(source)
         hash_file = os.path.join(self.path, ".requirements_hash")
 
         # Fast path: neither the plugin's dependencies nor the root project's
@@ -437,12 +504,12 @@ class Plugin:
                 if self._should_exit_from_installing_requirements(hash_file, current_hash):
                     return
             # Poll timed out — fallback to blocking install
-            await loop.run_in_executor(None, self._install_requirements_sync, pyproject_file, current_hash)
+            await loop.run_in_executor(None, self._install_requirements_sync, source, current_hash)
             return
 
         # We hold the lock → run the install in a thread
         try:
-            await loop.run_in_executor(None, self._install_requirements_sync, pyproject_file, current_hash, lf)
+            await loop.run_in_executor(None, self._install_requirements_sync, source, current_hash, lf)
         finally:
             fcntl.flock(lf, fcntl.LOCK_UN)
             lf.close()
@@ -464,7 +531,7 @@ class Plugin:
         return proc.returncode
 
     def _install_requirements_sync(
-        self, pyproject_file: str, current_hash: str, lock_fh=None
+        self, source: str, current_hash: str, lock_fh=None
     ):
         """Synchronous compile-then-install with cross-process serialization
         via fcntl.flock.
@@ -475,7 +542,9 @@ class Plugin:
         downgrade of a system library, and against the uv.lock of the other
         installed plugins, so it never replaces a library another plugin
         installed. Dependencies are then installed strictly from that lock
-        into the active virtual environment.
+        into the active virtual environment. A legacy requirements.txt is
+        converted into the same pyproject form, so it goes through this very
+        same path.
 
         If *lock_fh* is given the lock is already held by the caller;
         otherwise a blocking flock is acquired.
@@ -499,8 +568,13 @@ class Plugin:
             start_time = time.time()
             log.info(f"Compiling and installing requirements for plugin {self.id}")
 
-            with open(pyproject_file, "r") as f:
-                pyproject_text = f.read()
+            if os.path.basename(source) == "requirements.txt":
+                pyproject_text = self._requirements_to_pyproject(
+                    self.id, self._read_requirements_dependencies(source)
+                )
+            else:
+                with open(source, "r") as f:
+                    pyproject_text = f.read()
             constraints = self._root_lock_constraints()
             constraints += self._other_plugins_constraints({c.split("==")[0] for c in constraints})
             constraint_block = (

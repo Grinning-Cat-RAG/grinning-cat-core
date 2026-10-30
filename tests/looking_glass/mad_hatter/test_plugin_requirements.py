@@ -112,3 +112,89 @@ def test_a_successful_command_logs_no_error(monkeypatch):
     monkeypatch.setattr(plugin_module.log, "error", lambda msg: errors.append(msg))
     assert Plugin._run_streamed([sys.executable, "-c", "print('ok')"], dict(os.environ)) == 0
     assert errors == []
+
+
+def requirements_plugin(folder: Path, lines: list[str]) -> Plugin:
+    """A legacy plugin that ships only a requirements.txt."""
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "hooks.py").write_text("")
+    (folder / "requirements.txt").write_text("\n".join(lines) + "\n")
+    return Plugin(str(folder))
+
+
+def test_requirements_txt_is_used_when_no_pyproject_exists(tmp_path, monkeypatch):
+    root, core, plugins = layout(tmp_path, monkeypatch)
+    plugin = requirements_plugin(plugins / "legacy", ["requests>=2", "# a comment", "pyfiglet==1.0.2"])
+
+    assert plugin._requirements_source() == str(plugins / "legacy" / "requirements.txt")
+
+    lock(root, "numpy==2.0.0")
+    compiled = {}
+    commands = []
+
+    def run(cmd, env):
+        commands.append(cmd)
+        if cmd[1] == "lock":
+            project = Path(cmd[cmd.index("--project") + 1])
+            compiled["pyproject"] = (project / "pyproject.toml").read_text()
+            (project / "uv.lock").write_text("version = 1\n")
+        return 0
+
+    monkeypatch.setattr(Plugin, "_run_streamed", staticmethod(run))
+
+    plugin._install_requirements_sync(
+        plugin._requirements_source(), plugin._requirements_hash(plugin._requirements_source())
+    )
+
+    assert [c[1] for c in commands] == ["lock", "sync"]
+    assert '"requests>=2"' in compiled["pyproject"]
+    assert '"pyfiglet==1.0.2"' in compiled["pyproject"]
+    assert "# a comment" not in compiled["pyproject"]
+    hash_file = plugins / "legacy" / ".requirements_hash"
+    assert hash_file.read_text() == Plugin._requirements_hash(str(plugins / "legacy" / "requirements.txt"))
+
+
+def test_pyproject_wins_over_requirements_txt(tmp_path, monkeypatch):
+    root, core, plugins = layout(tmp_path, monkeypatch)
+    folder = plugins / "both"
+    plugin = a_plugin(folder, ["requests"])
+    (folder / "requirements.txt").write_text("pyfiglet==1.0.2\n")
+
+    assert plugin._requirements_source() == str(folder / "pyproject.toml")
+
+    lock(root, "numpy==2.0.0")
+    compiled = {}
+
+    def run(cmd, env):
+        if cmd[1] == "lock":
+            project = Path(cmd[cmd.index("--project") + 1])
+            compiled["pyproject"] = (project / "pyproject.toml").read_text()
+            (project / "uv.lock").write_text("version = 1\n")
+        return 0
+
+    monkeypatch.setattr(Plugin, "_run_streamed", staticmethod(run))
+    plugin._install_requirements_sync(str(folder / "pyproject.toml"), "hash")
+
+    assert '"requests"' in compiled["pyproject"]
+    assert "pyfiglet==1.0.2" not in compiled["pyproject"]
+
+
+def test_no_requirements_source_when_neither_file_exists(tmp_path, monkeypatch):
+    root, core, plugins = layout(tmp_path, monkeypatch)
+    plugin = a_plugin(plugins / "bare")
+
+    assert plugin._requirements_source() is None
+
+
+def test_requirements_hash_is_stable_and_tracks_the_file(tmp_path, monkeypatch):
+    root, core, plugins = layout(tmp_path, monkeypatch)
+    folder = plugins / "legacy"
+    plugin = requirements_plugin(folder, ["requests>=2"])
+    requirements = str(folder / "requirements.txt")
+
+    first = plugin._requirements_hash(requirements)
+    second = plugin._requirements_hash(requirements)
+    assert first == second
+
+    (folder / "requirements.txt").write_text("requests>=2\npyfiglet==1.0.2\n")
+    assert plugin._requirements_hash(requirements) != first
