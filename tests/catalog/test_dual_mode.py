@@ -846,6 +846,167 @@ async def test_reembed_keeps_oversized_card_ids(app_client, agent_key, monkeypat
     })
 
 
+async def test_phase_replaces_segments_when_embedder_window_changes(app_client, agent_key, monkeypatch):
+    """F2: a changed embedder window REPLACES the card segments (no orphans).
+
+    Lowering the window re-splits the card into more segments whose
+    start_index-derived ids do not match the stored ones. The phase must delete
+    this source's old cards in the SAME collection + chat before writing the new
+    ones: the stored segments must then be EXACTLY those a fresh split of the
+    same card text produces. Other sources and other chats must stay untouched.
+    """
+    from langchain_core.documents import Document
+
+    from cat.core_plugins.cat_efficient_ingestion.split import split_oversized
+
+    monkeypatch.setattr(Embeddings, "max_input_tokens", 100)
+    cat = await _configure_agent(app_client, agent_key, EFFICIENT_ENGINE)
+    cat_alog = _cat_alog_module(cat)
+    run_hook = next(
+        h for h in cat.plugin_manager.plugins["cat_alog"].hooks
+        if h.name == "ingestion_phase_run"
+    )
+
+    long_text = ("Alice was beginning to get very tired of sitting by her sister. " * 220).encode()
+    other_name = "other_catalog.txt"
+    other_text = b"a different source that must never be touched"
+    other_chat_name = "other_chat_catalog.txt"
+    chat_1 = f"catalog_chat_{uuid.uuid4().hex[:8]}"
+    chat_2 = f"catalog_chat_{uuid.uuid4().hex[:8]}"
+
+    user = await create_new_user(
+        app_client,
+        username=f"catalog_user_{uuid.uuid4().hex[:8]}",
+        headers=_headers(agent_key),
+    )
+    for chat in (chat_1, chat_2):
+        assert await crud_conversations.claim_conversation(agent_key, chat, user["id"]) == user["id"]
+
+    assert (await _ingest(app_client, agent_key, LONG_NAME, long_text)).status_code == 200
+    assert (await _ingest(app_client, agent_key, other_name, other_text)).status_code == 200
+    assert (
+        await _ingest(app_client, agent_key, LONG_NAME, long_text, chat_id=chat_1)
+    ).status_code == 200
+    assert (
+        await _ingest(app_client, agent_key, LONG_NAME, long_text, chat_id=chat_2)
+    ).status_code == 200
+    assert (
+        await _ingest(app_client, agent_key, other_chat_name, other_text, chat_id=chat_2)
+    ).status_code == 200
+
+    async def _ids(collection, chat_id, source=LONG_NAME):
+        return {
+            p.id for p in await _card_points(cat, collection, source)
+            if _meta(p).get("chat_id") == chat_id
+        }
+
+    async def _write(collection):
+        return await _card_points(cat, collection, LONG_NAME)
+
+    def _expected_offsets(card_text, embedder):
+        segments = split_oversized(
+            [Document(page_content=card_text, metadata={})], embedder,
+        )
+        normalized = " ".join(card_text.split())
+        cursor = 0
+        offsets = []
+        for segment in segments:
+            offset = normalized.find(segment.page_content, cursor)
+            if offset < 0:
+                offset = cursor
+            offsets.append(offset)
+            cursor = offset + len(segment.page_content)
+        return offsets
+
+    async def _run_and_check(expected_more_than=None, expected_count=None):
+        result = await run_hook.function("catalog_cards", LONG_NAME, {}, cat)
+        assert result == {"status": "done"}, result
+        agent_cards = await _write(DECLARATIVE)
+        chat_cards = await _write(EPISODIC)
+        assert {_meta(c).get("chat_id") for c in agent_cards} == {None}, (
+            "agent-scoped cards leaked a chat scope"
+        )
+        assert {_meta(c).get("chat_id") for c in chat_cards} == {chat_1, chat_2}, (
+            "chat-scoped cards leaked",
+            {_meta(c).get("chat_id") for c in chat_cards},
+        )
+        full_card = _meta(agent_cards[0]).get("full_card")
+        embedder = await cat.embedder()
+        expected = _expected_offsets(full_card, embedder)
+        if expected_count is not None:
+            assert len(expected) == expected_count, (len(expected), expected_count)
+        if expected_more_than is not None:
+            assert len(expected) > expected_more_than, (len(expected), expected_more_than)
+        # The stored agent-scoped segments are EXACTLY the fresh split: same
+        # count, same start_index set, same deterministic ids -> no orphan.
+        assert len(agent_cards) == len(expected), (
+            "stored segment count != fresh segment count",
+            len(agent_cards), len(expected),
+        )
+        assert sorted(_meta(c)["start_index"] for c in agent_cards) == sorted(expected)
+        assert {c.id for c in agent_cards} == {
+            cat_alog._catalogue_card_point_id(
+                agent_key, None, LONG_NAME, start_index=offset,
+            )
+            for offset in expected
+        }
+        for card in chat_cards:
+            meta = _meta(card)
+            assert card.id == cat_alog._catalogue_card_point_id(
+                agent_key, meta["chat_id"], LONG_NAME, start_index=meta["start_index"],
+            ), meta
+            assert meta.get("is_catalogue_card_segment") is True, meta
+        assert len([c for c in chat_cards if _meta(c).get("chat_id") == chat_1]) == len(expected)
+        assert len([c for c in chat_cards if _meta(c).get("chat_id") == chat_2]) == len(expected)
+        return agent_cards, chat_cards
+
+    other_ids_before = await _ids(DECLARATIVE, None, source=other_name)
+    assert other_ids_before, "the other source card was not produced"
+    other_chat_ids_before = {
+        p.id for p in await _card_points(cat, EPISODIC, other_chat_name)
+    }
+    assert other_chat_ids_before, "the other chat source card was not produced"
+
+    # Baseline at window 100: an oversized, multi-segment card.
+    before_dec, _ = await _run_and_check(expected_count=None)
+    first_dec_ids = {c.id for c in before_dec}
+    assert len(first_dec_ids) > 1, len(first_dec_ids)
+
+    # LOWER the window -> MORE segments, the old ids must be replaced.
+    monkeypatch.setattr(Embeddings, "max_input_tokens", 25)
+    after_dec, _ = await _run_and_check(expected_more_than=len(first_dec_ids))
+    second_dec_ids = {c.id for c in after_dec}
+    assert second_dec_ids != first_dec_ids
+    assert first_dec_ids - second_dec_ids, "old segment ids survived the re-run"
+    print("WINDOW_LOWER_CATALOG", {
+        "before": len(first_dec_ids), "after": len(second_dec_ids),
+        "replaced": len(first_dec_ids - second_dec_ids),
+    })
+
+    # RAISE the window -> ONE whole card, every old segment gone.
+    monkeypatch.setattr(Embeddings, "max_input_tokens", 100000)
+    third_dec, third_chat = await _run_and_check(expected_count=1)
+    assert len(third_dec) == 1, [(_meta(c), c.id) for c in third_dec]
+    assert third_dec[0].id == cat_alog._catalogue_card_point_id(
+        agent_key, None, LONG_NAME,
+    )
+    assert len(third_chat) == 2, [(_meta(c), c.id) for c in third_chat]
+    print("WINDOW_RAISE_CATALOG", {"segments": len(third_dec)})
+
+    # Other sources (agent scope and another chat) are untouched by every re-run.
+    assert await _ids(DECLARATIVE, None, source=other_name) == other_ids_before
+    assert {
+        p.id for p in await _card_points(cat, EPISODIC, other_chat_name)
+    } == other_chat_ids_before
+    assert await _card_points(cat, DECLARATIVE, other_name), "other source card lost"
+    assert await _card_points(cat, EPISODIC, other_chat_name), "other chat source card lost"
+    assert await _card_points(cat, DECLARATIVE, LONG_NAME)
+
+    print("PHASE_SEGMENT_REPLACE_CATALOG", {
+        "lower": len(second_dec_ids), "raised": len(third_dec), "chat_segments": len(third_chat),
+    })
+
+
 # ---------------------------------------------------------------------------
 # Scenario 7 — cleanup receipt (runs last)
 # ---------------------------------------------------------------------------
