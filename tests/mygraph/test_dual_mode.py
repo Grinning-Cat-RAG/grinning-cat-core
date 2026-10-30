@@ -497,7 +497,7 @@ async def test_efficient_mode_runs_both_phases_and_never_the_classic_callback(ap
 
         handler = (await app_client._fastapi_test_app.state.lizard.get_cheshire_cat(agent_key)).vector_memory_handler
         assert recorded["graph_spacy_extraction"]["marker"] == handler._spacy_fingerprint()
-        assert recorded["graph_llm_extraction"]["marker"] == handler._concept_fingerprint()
+        assert recorded["graph_llm_extraction"]["marker"] == await handler._concept_fingerprint()
 
         # scenario 3 - one extraction per document on the real-vector storage
         # pass; none on the empty-vector staging pass. The deterministic graph
