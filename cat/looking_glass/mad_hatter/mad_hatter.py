@@ -377,6 +377,7 @@ class MadHatter:
         )
 
     async def load_plugin(self, plugin_id: str, with_deactivation: bool = True) -> LoadedPlugin:
+        folder: str | None = None
         try:
             folder = self._get_plugin_folder_path(plugin_id)
             plugin = Plugin(folder)
@@ -388,7 +389,10 @@ class MadHatter:
 
             return LoadedPlugin(plugin=plugin)
         except Exception as e:
-            log.error(str(e))
+            # A single broken/unreadable plugin must never abort the whole
+            # plugin-loading loop: log which one failed, then let the caller
+            # move on to the next plugin.
+            log.error(f"Could not load plugin '{plugin_id}' from '{folder}': {e}")
             return LoadedPlugin()
 
     def load_active_plugins_ids_from_folders(self):
@@ -500,7 +504,17 @@ class MadHatter:
     @property
     def get_core_plugins_ids(self) -> List[str]:
         path = Path(utils.get_core_plugins_path())
-        core_plugins = [p.name for p in path.iterdir() if p.is_dir()]
+        core_plugins = []
+        for entry in os.scandir(path):
+            try:
+                if entry.is_dir():
+                    core_plugins.append(entry.name)
+            except OSError as e:
+                # An unreadable/inaccessible entry (broken symlink, missing
+                # mount, non-traversable parent, permission denied) must be
+                # skipped, not fatal: otherwise a single bad entry aborts the
+                # whole boot.
+                log.warning(f"Skipping inaccessible core plugin entry '{entry.path}': {e}")
         return core_plugins
 
     def is_system_plugin(self, plugin_id: str) -> bool:
