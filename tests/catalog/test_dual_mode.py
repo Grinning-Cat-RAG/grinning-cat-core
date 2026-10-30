@@ -532,10 +532,11 @@ async def test_efficient_mode_phase_builds_one_card_and_never_fires_classic_hook
         assert len(cards) == 1, [(_meta(c), c.id) for c in cards]
         assert _meta(cards[0])["is_catalogue_card"] is True
 
-        # the classic card work is inert: the phase owns the card. EffING's
-        # shared chunking step still invokes the splits hook, but it performs no
-        # card work (no summary cache write) and the card-appending hook never runs.
-        assert spy["stores"] == 0 and spy["cache_writes"] == 0, spy
+        # the classic card work is inert: the phase owns the card. EffING emits
+        # the store hook once (both engines emit it exactly once per source),
+        # but the phase machine makes it a no-op: no card work and no summary
+        # cache write.
+        assert spy["stores"] == 1 and spy["cache_writes"] == 0, spy
 
         chunks = await _chunk_points(cat, DECLARATIVE, SAMPLE_NAME)
         assert len(chunks) >= 2, len(chunks)
