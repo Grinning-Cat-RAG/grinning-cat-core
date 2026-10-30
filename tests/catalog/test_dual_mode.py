@@ -51,11 +51,12 @@ from httpx import ASGITransport, AsyncClient
 from neo4j import AsyncGraphDatabase
 
 from cat import utils
+from cat.db.cruds import conversations as crud_conversations
 from cat.services.factory.embedder import Embeddings
 from cat.services.memory.models import PointStruct, VectorMemoryType
 from cat.startup import create_app
 from tests.catalog.conftest import created_links
-from tests.utils import api_key, jwt_secret
+from tests.utils import api_key, create_new_user, jwt_secret
 
 PLUGIN_SRC = Path("/root/git/plugins/cat-graphrag.my")
 PLUGIN_ID = "cat_graphrag"
@@ -415,6 +416,13 @@ async def _prompt_list(cat, base: str = "You are a helpful cat.") -> str:
     return await hook.function(base, cat)
 
 
+def _cat_alog_module(cat):
+    hook = next(
+        h for h in cat.plugin_manager.plugins["cat_alog"].hooks if h.name == "agent_prompt_suffix"
+    )
+    return importlib.import_module(hook.function.__module__)
+
+
 def _install_card_hook_spy(plugin_manager, monkeypatch) -> dict:
     """Count the cat_alog classic card work (test-only instrumentation).
 
@@ -745,6 +753,97 @@ async def test_reembed_keeps_card_id_and_does_not_duplicate(app_client, agent_ke
     )
 
     print("REEMBED_CATALOG", {"cards": len(cards), "ids": sorted(original_ids)})
+
+
+async def test_same_source_in_two_chats_phase_mode_is_isolated(app_client, agent_key):
+    """B1: the phase keeps two chats of one filename isolated (two cards)."""
+    cat = await _configure_agent(app_client, agent_key, EFFICIENT_ENGINE)
+    chat_1 = f"catalog_chat_{uuid.uuid4().hex[:8]}"
+    chat_2 = f"catalog_chat_{uuid.uuid4().hex[:8]}"
+    text_1 = ("ALPHA CHAT ONLY " * 60).encode()
+    text_2 = ("BETA CHAT ONLY " * 60).encode()
+
+    # The phase worker resolves each chat's StrayCat by its conversation owner,
+    # so the conversations must exist (the admin API key bypasses the ownership
+    # claim the UI user path performs). Attach both chats to a real user.
+    user = await create_new_user(
+        app_client,
+        username=f"catalog_user_{uuid.uuid4().hex[:8]}",
+        headers=_headers(agent_key),
+    )
+    for chat in (chat_1, chat_2):
+        assert await crud_conversations.claim_conversation(agent_key, chat, user["id"]) == user["id"]
+
+    assert (
+        await _ingest(app_client, agent_key, SAMPLE_NAME, text_1, chat_id=chat_1)
+    ).status_code == 200
+    assert (
+        await _ingest(app_client, agent_key, SAMPLE_NAME, text_2, chat_id=chat_2)
+    ).status_code == 200
+
+    cards = await _card_points(cat, EPISODIC, SAMPLE_NAME)
+    assert len(cards) == 2, [(_meta(c).get("chat_id"), c.id) for c in cards]
+    by_chat = {_meta(c).get("chat_id"): c for c in cards}
+    assert set(by_chat) == {chat_1, chat_2}, by_chat.keys()
+    assert by_chat[chat_1].id != by_chat[chat_2].id, by_chat
+
+    full_1 = _meta(by_chat[chat_1]).get("full_card") or ""
+    full_2 = _meta(by_chat[chat_2]).get("full_card") or ""
+    assert "ALPHA CHAT ONLY" in full_1 and "BETA CHAT ONLY" not in full_1, full_1[:200]
+    assert "BETA CHAT ONLY" in full_2 and "ALPHA CHAT ONLY" not in full_2, full_2[:200]
+    assert await _card_points(cat, DECLARATIVE, SAMPLE_NAME) == []
+
+    print("CHAT_SCOPED_PHASE_CATALOG", {
+        "segments": len(cards),
+        "ids": {chat: c.id for chat, c in by_chat.items()},
+    })
+
+
+async def test_reembed_keeps_oversized_card_ids(app_client, agent_key, monkeypatch):
+    """B2: a re-embed must not re-split the card, so count and ids stay stable."""
+    from cat.core_plugins.cat_efficient_ingestion import reembed
+
+    # test-only instrumentation: force the phase to segment the oversized card.
+    monkeypatch.setattr(Embeddings, "max_input_tokens", 100)
+    cat = await _configure_agent(app_client, agent_key, EFFICIENT_ENGINE)
+    long_text = ("Alice was beginning to get very tired of sitting by her sister. " * 220).encode()
+
+    assert (await _ingest(app_client, agent_key, LONG_NAME, long_text)).status_code == 200
+
+    cards = await _card_points(cat, DECLARATIVE, LONG_NAME)
+    assert len(cards) > 1, [(_meta(c), c.id) for c in cards]
+    original_ids = sorted(c.id for c in cards)
+    cat_alog = _cat_alog_module(cat)
+    for card in cards:
+        meta = _meta(card)
+        assert meta.get("is_catalogue_card_segment") is True, meta
+        assert isinstance(meta.get("start_index"), int), meta
+        assert card.id == cat_alog._catalogue_card_point_id(
+            agent_key, None, LONG_NAME, start_index=meta["start_index"]
+        )
+
+    points = await _points(cat, DECLARATIVE, {"source": LONG_NAME})
+    embedder = await cat.embedder()
+    # A LOWER limit after the fact: without the card-segment exemption this
+    # re-split would mint a different segment count and new ids.
+    monkeypatch.setattr(embedder, "max_input_tokens", 20, raising=False)
+    rebuilt = await reembed._embed_phase(
+        cat, DECLARATIVE, LONG_NAME, points, embedder, None, cat, rabbit_hole=None,
+    )
+    rebuilt_cards = [
+        p for p in rebuilt
+        if (p.payload or {}).get("metadata", {}).get("is_catalogue_card") is True
+    ]
+    assert len(rebuilt_cards) == len(cards), [p.id for p in rebuilt_cards]
+    assert sorted(p.id for p in rebuilt_cards) == original_ids, (
+        "the re-embed re-split the card and lost its ids",
+        original_ids,
+        sorted(p.id for p in rebuilt_cards),
+    )
+
+    print("REEMBED_OVERSIZED_CATALOG", {
+        "segments": len(cards), "ids": original_ids,
+    })
 
 
 # ---------------------------------------------------------------------------
