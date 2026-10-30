@@ -1,6 +1,6 @@
 from contextlib import asynccontextmanager
 from enum import Enum
-from typing import List, Dict, Any
+from typing import Collection, List, Dict, Any
 from redis.exceptions import LockError, RedisError
 from redis.lock import Lock
 
@@ -130,7 +130,12 @@ async def store(
         if expire:
             await pipeline.expire(key, expire)
 
-        if not await pipeline.execute():
+        results = await pipeline.execute()
+        # A JSON.SET rejected by NX/XX returns ``None`` for that command while
+        # other pipelined commands (e.g. EXPIRE) still make the result list
+        # non-empty. Inspect the SET result itself: ``[None]`` is truthy, so the
+        # old ``if not results`` check reported a lost create as a success.
+        if not results or results[0] is None:
             return None
 
         log.debug(f"Stored key {key}, value {value}, TTL: {expire}")
@@ -162,20 +167,71 @@ async def delete(key: str, path: str | None = "$"):
         raise
 
 
-async def destroy(key_pattern: str) -> int:
+def escape_glob(value: str) -> str:
+    """
+    Escape Redis glob metacharacters so a user-controlled value matches literally.
+
+    Agent ids come straight from the API and are untrusted: an id like ``a*`` must not turn a key pattern into a
+    wildcard that reaches unrelated agents. Backslash is escaped first so it cannot neutralize the escapes added
+    afterwards.
+
+    Args:
+        value: Raw value (e.g., an agent id) to embed in a glob pattern.
+
+    Returns:
+        The value with ``\\ * ? [ ]`` escaped.
+    """
+    escaped = value
+    for char in ("\\", "*", "?", "[", "]"):
+        escaped = escaped.replace(char, "\\" + char)
+    return escaped
+
+
+async def scan_keys(pattern: str) -> List[str]:
+    """
+    List all keys matching a glob pattern, sorted for deterministic output.
+
+    CORE-INTERNAL HELPER. This is the ONLY sanctioned use of the raw client for key enumeration: no module outside
+    `cat/db/` may touch the raw Redis client. It must NOT be exposed to plugins as a generic key/wipe API (a plugin
+    could enumerate unrelated agents' data); plugins get the specific CRUD functions they need instead.
+
+    Args:
+        pattern: Glob pattern to match keys (e.g., "agents:<agent_id>:*").
+
+    Returns:
+        Sorted list of matching keys (empty when nothing matches).
+
+    Raises:
+        RedisError: If Redis connection fails.
+    """
+    try:
+        keys = [key async for key in get_async_db().scan_iter(pattern)]
+        return sorted(keys)
+    except RedisError as e:
+        log.error(f"Redis scan error for pattern '{pattern}': {e}")
+        raise
+
+
+async def destroy(key_pattern: str, exclude: Collection[str] | None = None) -> int:
     """
     Delete all keys matching a pattern, serialized via a distributed lock.
 
     Concurrent destroy calls on the same pattern are queued rather than interleaved, so no replica can insert new
     matching keys between another replica's SCAN and DEL steps unnoticed.
 
+    CORE-INTERNAL HELPER. The raw client use here (SCAN + DEL) is sanctioned only inside `cat/db/`: no other module may
+    touch the raw Redis client, and this must NOT be exposed to plugins as a general wipe API. Callers outside the DB
+    layer use the specific CRUD functions they need.
+
     Note: this does NOT guarantee that zero keys survive if other writers keep inserting after the lock is released.
 
     Args:
         key_pattern: Pattern to match keys (e.g., "agents:<agent_id>:*").
+        exclude: Optional collection of exact keys to preserve even when they match the pattern (e.g., a delete
+                 marker that must survive the wipe). `None` keeps the original destroy-everything behaviour.
 
     Returns:
-        Number of keys deleted.
+        Number of keys actually deleted.
 
     Raises:
         LockError: If the lock cannot be acquired.
@@ -185,6 +241,9 @@ async def destroy(key_pattern: str) -> int:
         async with distributed_lock(key_pattern):
             db = get_async_db()
             keys = [k async for k in db.scan_iter(key_pattern)]
+            if exclude:
+                excluded = set(exclude)
+                keys = [k for k in keys if k not in excluded]
             if keys:
                 await db.delete(*keys)
             log.debug(f"Destroyed {len(keys)} keys matching {key_pattern}")

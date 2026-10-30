@@ -10,8 +10,6 @@ from cat.services.factory.embedder import embedding_size
 from cat.auth.permissions import AuthUserInfo
 from cat.db.cruds import (
     conversations as crud_conversations,
-    plugins as crud_plugins,
-    settings as crud_settings,
     users as crud_users,
 )
 from cat.log import log
@@ -100,29 +98,31 @@ class CheshireCat(BotMixin, NonCopyableMixin):
             await self.vector_memory_handler.delete_tenant_points(collection_name)
 
     async def destroy(self):
-        """Destroy all data from the cat."""
+        """Destroy all data from the cat.
+
+        Delegates the whole teardown to ``complete_agent_teardown``: write the
+        deletion marker FIRST (so in-flight ingestion workers self-abort), then
+        quiesce, purge memory and files, wipe the ``agents:<id>:*`` namespace,
+        fire ``after_cheshire_cat_destroy`` and clear the marker LAST. The
+        inline steps this method used to repeat (``destroy_memory``, the file
+        folder, the ``crud_*.destroy_all`` calls, the destroy hook) are all
+        owned by the protocol: every one of those key families lives under
+        ``agents:<agent_id>:*`` (conversations.py:29, users.py:28, plugins.py:10,
+        settings.py:9) and is deleted by ``wipe_agent_namespace_excluding_marker``;
+        the hook fires after the wipe, in ``complete_agent_teardown``.
+
+        Lazy imports: ``agent_deletion`` is imported by the core at startup and
+        a top-level import here would widen the startup import graph.
+        """
+        from cat.looking_glass.agent_deletion import complete_agent_teardown, set_delete_marker
+
         log.info(f"Agent id: {self._id}. Destroying all data from the cat")
 
-        # destroy all memories
-        await self.destroy_memory()
-
-        # remove the folder from storage
-        self.file_manager.remove_folder(self._id)
-
-        await crud_settings.destroy_all(self._id)
-        await crud_conversations.destroy_all(self._id)
-        await crud_plugins.destroy_all(self._id)
-        await crud_users.destroy_all(self._id)
-
-        # notify plugins the agent has been destroyed (before shutdown tears down
-        # the plugin manager), so plugin-owned namespaces can be cleaned up —
-        # e.g. ingestion_status drops its agents:<id>:ingestion:* registry rows
-        if self.plugin_manager is not None:
-            await self.plugin_manager.execute_hook(
-                "after_cheshire_cat_destroy", self._id, caller=self,
-            )
-
-        await self.shutdown()
+        await set_delete_marker(self._id)
+        try:
+            await complete_agent_teardown(self._id, ccat=self)
+        finally:
+            await self.shutdown()
 
     async def destroy_conversation(self, chat_id: str, user_id: str):
         """

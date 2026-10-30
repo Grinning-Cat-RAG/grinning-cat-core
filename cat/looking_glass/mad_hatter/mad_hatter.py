@@ -11,7 +11,7 @@ from cat import utils
 from cat.db.cruds import plugins as crud_plugins, settings as crud_settings
 from cat.db.database import DEFAULT_SYSTEM_KEY
 from cat.db.models import Setting
-from cat.exceptions import ManagementModeException
+from cat.exceptions import CustomHookVetoException, ManagementModeException
 from cat.log import log
 from cat.looking_glass.mad_hatter.decorators.endpoint import CatEndpoint
 from cat.looking_glass.mad_hatter.decorators.hook import CatHook
@@ -355,6 +355,10 @@ class MadHatter:
                 # a deliberate management gate (mgmt_message plugin): not an
                 # error — propagate to the caller (ConnectionAuth -> startup
                 # handler -> 403) without logging and without swallowing
+                raise
+            except CustomHookVetoException:
+                # a hook refuses the current operation: propagate to the caller
+                # and stop the chain — remaining hooks must NOT run
                 raise
             except Exception as e:
                 log.error(f"Error in plugin {hook.plugin_id}::{hook.name}: {e}")

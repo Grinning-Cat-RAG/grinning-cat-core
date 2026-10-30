@@ -1,0 +1,10 @@
+{
+    "name": "Phase Consumer Fixture",
+    "description": "Test-only third-party plugin exposing one ingestion phase.",
+    "author_name": "EffING test harness",
+    "plugin_url": "",
+    "tags": "test, fixture",
+    "thumb": "",
+    "version": "0.0.1",
+    "dependencies": ["cat_efficient_ingestion"]
+}

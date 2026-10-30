@@ -70,11 +70,51 @@ class RecursiveTextChunker(BaseChunker):
             strip_whitespace=True,
             allowed_special={"\n"},  # Explicitly allow the special token ‘\n’
             disallowed_special=(),  # Disallow control for other special tokens
+            add_start_index=True,  # Each chunk gets metadata["start_index"] (monotonic, survives overlap)
         )
 
     async def split_documents(self, documents: Iterable[Document]) -> List[Document]:
+        """
+        Split the documents into chunks, numbering them for stable ordering.
+
+        ONE CALL == ONE LOGICAL SOURCE: ``chunk_index`` is the 0-based ordinal of
+        every produced chunk within this call, so it is only meaningful when the
+        input documents together represent a single logical source. A pre-existing
+        ``chunk_index`` is preserved untouched (``setdefault``), e.g. when a
+        caller numbers chunks itself.
+
+        Every produced chunk also carries ``start_index``: the monotonic character
+        offset of the chunk in its source text, which survives overlap. The
+        splitter is built with ``add_start_index=True``, but LangChain derives the
+        offset assuming the overlap is measured in the same unit as the chunk
+        length; with a tiktoken-length splitter the overlap is in tokens and the
+        derived value can point at the wrong occurrence (or go to -1). We therefore
+        re-derive the offset from the source text, searching forward from the
+        previous chunk's start so overlaps and repeated text resolve correctly.
+        """
         docs = list(documents)
-        return await asyncio.to_thread(self.splitter.split_documents, docs)
+
+        def _split_and_index() -> List[Document]:
+            chunks: List[Document] = []
+            for doc in docs:
+                source = doc.page_content
+                doc_chunks = self.splitter.split_documents([doc])
+                cursor = 0
+                for chunk in doc_chunks:
+                    position = source.find(chunk.page_content, cursor)
+                    if position >= 0:
+                        chunk.metadata["start_index"] = position
+                        cursor = position
+                    elif chunk.metadata.get("start_index", -1) < 0:
+                        # Never emit a negative offset: keep the best monotonic guess.
+                        chunk.metadata["start_index"] = cursor
+                    chunks.append(chunk)
+
+            for i, chunk in enumerate(chunks):
+                chunk.metadata.setdefault("chunk_index", i)
+            return chunks
+
+        return await asyncio.to_thread(_split_and_index)
 
 
 class ChunkerSettings(BaseFactoryConfigModel, ABC):

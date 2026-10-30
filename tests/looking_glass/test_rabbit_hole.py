@@ -505,3 +505,52 @@ async def test_ingest_file_sets_processing_before_parse(cheshire_cat, monkeypatc
     # processing fires after the file is persisted but before the parser runs
     assert order == ["save_file", "processing", "parse"]
 
+
+
+async def test_store_documents_honours_preset_document_id(cheshire_cat, monkeypatch):
+    """A Document-provided id is used verbatim as the stored point id.
+
+    This is what makes the deterministic catalogue-card id survive a re-ingest:
+    an upsert on the same id replaces the card instead of adding a duplicate.
+    """
+    stored: dict = {}
+
+    async def fake_add_points(collection_name, points):
+        stored["points"] = points
+
+    monkeypatch.setattr(cheshire_cat.vector_memory_handler, "add_points_to_tenant", fake_add_points)
+
+    rabbit_hole = RabbitHole()
+    rabbit_hole.cat = cheshire_cat
+    rabbit_hole.stray = None
+
+    card_id = uuid.uuid5(uuid.NAMESPACE_URL, "catalogue_card:test.txt").hex
+    docs = [Document(page_content="catalogue card text", metadata={}, id=card_id)]
+
+    points = await rabbit_hole.store_documents(docs=docs, source="test.txt", metadata={})
+
+    assert len(points) == 1
+    assert points[0].id == card_id
+    assert stored["points"][0].id == card_id
+
+
+async def test_store_documents_generates_uuid4_without_document_id(cheshire_cat, monkeypatch):
+    """A Document without an id still gets the historical random uuid4 hex."""
+
+    async def fake_add_points(collection_name, points):
+        return None
+
+    monkeypatch.setattr(cheshire_cat.vector_memory_handler, "add_points_to_tenant", fake_add_points)
+
+    rabbit_hole = RabbitHole()
+    rabbit_hole.cat = cheshire_cat
+    rabbit_hole.stray = None
+
+    docs = [Document(page_content="a plain chunk", metadata={})]
+
+    points = await rabbit_hole.store_documents(docs=docs, source="test.txt", metadata={})
+
+    assert len(points) == 1
+    point_id = points[0].id
+    assert len(point_id) == 32
+    assert uuid.UUID(point_id).version == 4

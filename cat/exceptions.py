@@ -29,6 +29,16 @@ class ManagementModeException(CustomNotFoundException):
     """
 
 
+class CustomHookVetoException(Exception):
+    """Raised by a hook to refuse the current operation.
+
+    A plugin raising this from a hook vetoes the operation the hook is gating
+    (e.g. the ingestion completion gate). Unlike any other hook error, the
+    dispatcher MUST propagate it to the caller instead of logging and
+    swallowing it, and it MUST short-circuit the remaining hooks in the chain.
+    """
+
+
 class CustomUnauthorizedException(Exception):
     pass
 
