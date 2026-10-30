@@ -35,7 +35,6 @@ class FakeGraphRAGHandler:
     """Counts graph writes so both mechanisms can be told apart."""
 
     def __init__(self):
-        self._enable_derived_graph = True
         self.classic_calls = 0
         self.spacy_calls = 0
         self.llm_calls = 0

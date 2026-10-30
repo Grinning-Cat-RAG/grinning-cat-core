@@ -116,14 +116,13 @@ class _Session:
         return _Result({"id": params.get("id")})
 
 
-def _make_handler(enabled_derived_graph=False):
+def _make_handler():
     handler = GraphRAGHandler.__new__(GraphRAGHandler)
     handler.agent_id = "tenant_test"
     handler._generation = "v1"
     handler._names = {"embedding_prop": "embedding_v1"}
     handler._enable_entity_extraction = True
     handler._entity_extractor = object()
-    handler._enable_derived_graph = enabled_derived_graph
     handler._pending_entity_tasks = []
     handler._pending_source_tasks = {}
     handler.extraction_calls = 0
@@ -207,7 +206,7 @@ async def test_classic_flow_extraction_count_is_unchanged():
 async def test_efficient_flow_builds_derived_graph_exactly_once():
     """The derived graph (incl. step-8 LLM concept extraction) also runs once:
     skipped for the staging batch, run for the embedding batch."""
-    handler = _make_handler(enabled_derived_graph=True)
+    handler = _make_handler()
 
     handler.staging_sources.add("file.pdf")
     await handler.add_points_to_tenant(
@@ -229,7 +228,7 @@ async def test_payload_only_document_still_builds_the_graph():
     """B2: a legitimate payload-only point (empty/zero vector) in the embedding
     pass MUST build the derived graph and extract once — vector validity is no
     longer a gate."""
-    handler = _make_handler(enabled_derived_graph=True)
+    handler = _make_handler()
 
     await handler.add_points_to_tenant(
         "declarative", [_Point("p-image", content="[Image] file.pdf", vector={})]

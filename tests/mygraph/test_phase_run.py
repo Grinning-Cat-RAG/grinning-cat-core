@@ -7,7 +7,6 @@ an unimplemented phase). MyGRAPH must therefore return the documented tri-state:
 situation               return
 ======================  ============================================
 handler not GraphRAG    ``{"status": "done"}`` (nothing to do)
-derived graph disabled  ``{"status": "done"}`` (nothing to do)
 points not stored yet   ``{"status": "not_ready", "retry_after": 5}``
 phase done              ``{"status": "done"}``
 unknown phase           ``None`` (genuinely unimplemented -> error)
@@ -23,7 +22,6 @@ import sys
 import types
 from pathlib import Path
 
-import pytest
 
 PLUGIN_DIR = Path("/root/git/plugins/cat-graphrag.my")
 MAIN_PATH = PLUGIN_DIR / "main.py"
@@ -44,13 +42,16 @@ def _load_plugin_main(package_name: str):
     sys.modules[package_name] = package
 
     class _GraphRAGHandler:
-        def __init__(self, *, enable_derived_graph=True):
-            self._enable_derived_graph = enable_derived_graph
+        def __init__(self):
+            self.spacy_calls = 0
+            self.llm_calls = 0
 
         async def run_spacy_extraction_phase(self, source, cat=None):
+            self.spacy_calls += 1
             return {"status": "done"}
 
         async def run_llm_extraction_phase(self, source, cat=None):
+            self.llm_calls += 1
             return {"status": "done"}
 
     handler = types.ModuleType(package_name + ".graphrag_handler")
@@ -89,16 +90,17 @@ def test_done_when_handler_is_not_graphrag():
         _cleanup("_mygraph_run_handler_absent")
 
 
-def test_done_when_derived_graph_disabled():
-    module, handler_cls = _load_plugin_main("_mygraph_run_derived_off")
+def test_phase_runs_unconditionally_not_gated_by_retired_flag():
+    module, handler_cls = _load_plugin_main("_mygraph_run_unconditional")
     try:
-        handler = handler_cls(enable_derived_graph=False)
+        handler = handler_cls()
         result = asyncio.run(module.ingestion_phase_run.function(
             "graph_spacy_extraction", "file.pdf", [], _cat(handler)
         ))
         assert result == {"status": "done"}, result
+        assert handler.spacy_calls == 1, "graph phase must not be gated by a flag"
     finally:
-        _cleanup("_mygraph_run_derived_off")
+        _cleanup("_mygraph_run_unconditional")
 
 
 def test_passes_through_not_ready_when_points_absent():

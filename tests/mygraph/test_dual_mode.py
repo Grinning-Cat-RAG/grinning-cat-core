@@ -585,7 +585,6 @@ def _load_blocked_plugin(package_name: str):
 
     class FakeGraphRAGHandler:
         def __init__(self):
-            self._enable_derived_graph = True
             self.classic_calls = 0
             self.nodes = 0
             self.relationships = 0

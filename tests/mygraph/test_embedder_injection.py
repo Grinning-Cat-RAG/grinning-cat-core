@@ -43,7 +43,6 @@ class FakeGraphRAGHandler:
     """Mirrors the real handler's embedder property + once-only alignment."""
 
     def __init__(self):
-        self._enable_derived_graph = True
         self._embedder = None
         self._alignment_done = False
         self.align_calls = 0

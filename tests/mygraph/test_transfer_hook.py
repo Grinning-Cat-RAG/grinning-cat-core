@@ -36,7 +36,6 @@ class FakeGraphRAGHandler:
     """Current handler stand-in; counts classic graph writes."""
 
     def __init__(self):
-        self._enable_derived_graph = True
         self.classic_calls = 0
 
     async def create_derived_graph_for_source(self, source, stored_points, cat):
