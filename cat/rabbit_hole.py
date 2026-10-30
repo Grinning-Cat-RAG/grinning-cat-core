@@ -548,8 +548,11 @@ class RabbitHole:
         storing_vectors = await self._run_in_ingestion_executor(
             lambda: embedder.embed_documents([doc_.page_content for doc_ in valid_documents])
         )
+        # Honour a document-provided id (e.g. the catalogue card's deterministic
+        # uuid5): a re-ingest then upserts the same point instead of duplicating
+        # it. Documents without an id keep the historical random uuid4.
         points = [PointStruct(
-            id=uuid.uuid4().hex,
+            id=doc.id or uuid.uuid4().hex,
             payload=doc.model_dump(),
             vector=vector,
         ) for doc, vector in zip(valid_documents, storing_vectors)]
