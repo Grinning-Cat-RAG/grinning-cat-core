@@ -33,11 +33,12 @@ class _FakePluginManager:
         return None
 
 
-async def test_efficient_ingestion_plugin_is_not_system_only(lizard):
-    """The plugin's phase hooks must reach every agent: it is a core plugin and
-    never system-only / non-toggleable."""
+async def test_efficient_ingestion_plugin_is_system_only(lizard):
+    """The plugin is a core plugin AND system-only: its own phase hooks are
+    dispatched by the system manager and never activated on a user agent."""
     pm = lizard.plugin_manager
-    assert EFFICIENT_INGESTION_PLUGIN not in pm.get_system_only_plugin_ids
+    assert EFFICIENT_INGESTION_PLUGIN in pm.get_core_plugins_ids
+    assert EFFICIENT_INGESTION_PLUGIN in pm.get_system_only_plugin_ids
     assert EFFICIENT_INGESTION_PLUGIN not in pm.get_non_toggleable_plugin_ids
 
 
@@ -58,14 +59,12 @@ async def test_validation_fires_when_plugin_absent(monkeypatch):
     assert logged == [message]
 
 
-async def test_validation_fires_when_plugin_is_system_only(monkeypatch):
+async def test_validation_fires_when_plugin_is_not_system_only(monkeypatch):
     logged = []
     monkeypatch.setattr(
         "cat.looking_glass.bill_the_lizard.log.error", logged.append
     )
-    pm = _FakePluginManager(
-        core=[EFFICIENT_INGESTION_PLUGIN], system_only=[EFFICIENT_INGESTION_PLUGIN]
-    )
+    pm = _FakePluginManager(core=[EFFICIENT_INGESTION_PLUGIN])
 
     message = await _validate_efficient_ingestion_installation(
         pm, EFFICIENT_INGESTION_ENGINE
@@ -81,7 +80,9 @@ async def test_validation_stays_silent_when_plugin_present(monkeypatch):
     monkeypatch.setattr(
         "cat.looking_glass.bill_the_lizard.log.error", logged.append
     )
-    pm = _FakePluginManager(core=[EFFICIENT_INGESTION_PLUGIN])
+    pm = _FakePluginManager(
+        core=[EFFICIENT_INGESTION_PLUGIN], system_only=[EFFICIENT_INGESTION_PLUGIN]
+    )
 
     message = await _validate_efficient_ingestion_installation(
         pm, EFFICIENT_INGESTION_ENGINE

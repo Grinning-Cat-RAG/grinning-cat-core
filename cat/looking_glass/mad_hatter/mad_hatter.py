@@ -71,15 +71,18 @@ class MadHatter:
         # stored list was customized without them
         active_plugins.extend(self.get_non_toggleable_plugin_ids)
 
-        # Remove duplicates while preserving insertion order
-        active_plugins = utils.deduplicate_list(active_plugins)
-
-        # ...except the ones BillTheLizard runs on its own behalf: an agent
-        # carries neither them nor their `agents:<id>:plugins:*` keys
-        if self.agent_key != DEFAULT_SYSTEM_KEY:
+        # System-only plugins are instance-level services (white_rabbit,
+        # march_hare, mgmt_message, the efficient-ingestion engine): they are
+        # loaded on the SYSTEM manager (BillTheLizard's own, which is what runs
+        # them), and never on a user agent. The system manager gets them even
+        # when the stored list predates them; user agents never carry them.
+        if self.agent_key == DEFAULT_SYSTEM_KEY:
+            active_plugins.extend(self.get_system_only_plugin_ids)
+        else:
             active_plugins = [p for p in active_plugins if p not in self.get_system_only_plugin_ids]
 
-        return active_plugins
+        # Remove duplicates while preserving insertion order
+        return utils.deduplicate_list(active_plugins)
 
     async def install_plugin(self, package_plugin: str) -> str:
         """
@@ -362,7 +365,16 @@ class MadHatter:
                 raise
             except Exception as e:
                 log.error(f"Error in plugin {hook.plugin_id}::{hook.name}: {e}")
-                log.warning(self.plugins[hook.plugin_id].plugin_specific_error_message())  # type: ignore[union-attr, index]
+                # A hook can be registered on a manager where its plugin is no
+                # longer loaded (e.g. a system-only plugin's hooks injected by
+                # a test, or a plugin deactivated mid-flight): a missing plugin
+                # must never turn a hook error into a KeyError that aborts the
+                # whole dispatch.
+                plugin = self.plugins.get(hook.plugin_id)
+                if plugin is not None:
+                    log.warning(plugin.plugin_specific_error_message())
+                else:
+                    log.warning(f"Plugin '{hook.plugin_id}' is not loaded in this manager")
 
         return tea_cup
 
@@ -493,13 +505,24 @@ class MadHatter:
     @property
     def get_system_only_plugin_ids(self) -> List[str]:
         # Plugins that exist for the instance as a whole, not for an agent:
-        # their settings are global (stored on the system agent) and every one
-        # of their hooks takes the lizard (after_lizard_bootstrap,
-        # before_lizard_shutdown, lizard_notify_plugin_*, ...), so no agent
-        # carries them.
+        # their settings are global (stored on the system agent) and their
+        # hooks run on BillTheLizard's own plugin manager
+        # (after_lizard_bootstrap, before_lizard_shutdown,
+        # lizard_notify_plugin_*, ...), so no agent carries them.
         # base_plugin is the one always-on plugin that is NOT system-only: it
         # holds the default hooks every agent runs.
-        return [p for p in self.get_non_toggleable_plugin_ids if p != self.get_base_core_plugin_id]
+        #
+        # ``cat_efficient_ingestion`` is system-only too, even though it is not
+        # a non-toggleable core plugin: ``ingestion`` is a SYSTEM-level factory
+        # service (like ``embedder``) and its own phase hooks
+        # (ingestion_phase_pending/run/settings_marker) must be dispatched on
+        # the system manager. The phase PROVIDERS stay agent-level: EffING
+        # collects ``ingestion_phase_specs`` from BOTH managers, so MyGRAPH and
+        # CATALOG keep registering and running their phases per agent.
+        return utils.deduplicate_list(
+            [p for p in self.get_non_toggleable_plugin_ids if p != self.get_base_core_plugin_id]
+            + ["cat_efficient_ingestion"]
+        )
 
     @property
     def get_core_plugins_ids(self) -> List[str]:

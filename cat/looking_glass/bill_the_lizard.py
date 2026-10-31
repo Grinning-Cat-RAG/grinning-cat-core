@@ -41,8 +41,10 @@ def _delete_completion_enabled() -> bool:
 
 # The efficient ingestion engine and the core plugin that owns its phase hooks.
 # ``ingestion`` is a SYSTEM-level service (like ``embedder``): the plugin must be
-# a core plugin so every agent carries its hooks, and it must never be
-# system-only — that would strip it (and its phase hooks) from every agent.
+# a core plugin AND must be system-only, so its own phase hooks are dispatched
+# on BillTheLizard's plugin manager (``ccat.lizard.plugin_manager``) and never
+# activated per agent. The phase PROVIDERS (MyGRAPH, CATALOG) stay agent-level
+# and are collected from both managers by the plugin itself.
 EFFICIENT_INGESTION_ENGINE = "EfficientIngestionConfiguration"
 EFFICIENT_INGESTION_PLUGIN = "cat_efficient_ingestion"
 
@@ -53,8 +55,9 @@ def _efficient_ingestion_installation_error(plugin_manager, selected_engine_name
     The check only applies when the system ``ingestion`` setting resolves to the
     efficient engine: in that case the ``cat_efficient_ingestion`` core plugin
     must be installed as a core plugin (its hooks are what drive the phases) and
-    must NOT be system-only (agents would lose those hooks). A ``None`` return
-    means the installation is consistent (or another engine is selected).
+    must be system-only (its own phase hooks run on the system manager, never on
+    a user agent). A ``None`` return means the installation is consistent (or
+    another engine is selected).
     """
     if selected_engine_name != EFFICIENT_INGESTION_ENGINE:
         return None
@@ -64,15 +67,18 @@ def _efficient_ingestion_installation_error(plugin_manager, selected_engine_name
 
     if EFFICIENT_INGESTION_PLUGIN not in core_plugins:
         reason = "is not installed as a core plugin (its phase hooks are missing)"
-    elif EFFICIENT_INGESTION_PLUGIN in system_only:
-        reason = "is listed in get_system_only_plugin_ids (its phase hooks would be stripped from every agent)"
+    elif EFFICIENT_INGESTION_PLUGIN not in system_only:
+        reason = (
+            "is not listed in get_system_only_plugin_ids (it would be activated "
+            "on every agent instead of being dispatched by the system manager)"
+        )
     else:
         return None
 
     return (
         f"The system 'ingestion' setting resolves to the efficient engine "
         f"('{EFFICIENT_INGESTION_ENGINE}'), but the '{EFFICIENT_INGESTION_PLUGIN}' "
-        f"plugin {reason}. Install it under cat/core_plugins/ and keep it out of "
+        f"plugin {reason}. Install it under cat/core_plugins/ and add it to "
         f"get_system_only_plugin_ids, or select the core ingestion engine."
     )
 
@@ -83,8 +89,9 @@ async def _validate_efficient_ingestion_installation(
     """Log an error when the efficient ingestion installation is broken.
 
     Non-fatal by design: an inconsistent selection degrades (the phase hooks are
-    absent) but startup must continue. ``selected_engine_name`` can be passed to
-    keep the check hermetic; otherwise it is read from the system settings.
+    absent or dispatched on the wrong manager) but startup must continue.
+    ``selected_engine_name`` can be passed to keep the check hermetic; otherwise
+    it is read from the system settings.
     """
     if selected_engine_name is None:
         setting = await crud_settings.get_settings_by_category(DEFAULT_SYSTEM_KEY, "ingestion")
