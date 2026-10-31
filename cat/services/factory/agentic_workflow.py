@@ -1,6 +1,7 @@
 import re
 from abc import ABC, abstractmethod
 from typing import Type, List, Dict, Tuple
+import cat.services.factory._langgraph_serde_compat  # noqa: F401  (must precede langchain.agents)
 from langchain.agents import create_agent
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.language_models import BaseLanguageModel
