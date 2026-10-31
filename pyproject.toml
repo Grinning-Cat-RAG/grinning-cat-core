@@ -41,7 +41,7 @@ dependencies = [
     "python-multipart",
     "python-slugify",
     "pandas",
-    "qdrant_client",
+    "qdrant-client>=1.20,<2",
     "rapidfuzz",
     "redis",
     "ruff",
