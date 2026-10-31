@@ -34,13 +34,26 @@ ROOT_LOCK = "uv.lock"
 VENV_DIR = os.path.join(os.getcwd(), ".venv")
 
 
+def constraint_pin(pkg: dict) -> str:
+    """Exact pin of a locked package, keeping the lock's `resolution-markers`.
+
+    A lock may carry several versions of the same package, each guarded by
+    markers (e.g. networkx 3.6.1 for py<3.12 and 3.7 for py>=3.12). Emitting
+    them as bare exact pins makes the constraints contradictory and forces the
+    resolver onto unrelated fallbacks (torch 1.13.1, uninstallable on 3.13).
+    """
+    pin = f"{pkg['name']}=={pkg['version']}"
+    markers = pkg.get("resolution-markers") or []
+    return f"{pin}; {' or '.join(markers)}" if markers else pin
+
+
 def root_lock_constraints():
     if not os.path.exists(ROOT_LOCK):
         return []
     with open(ROOT_LOCK, "rb") as f:
         data = tomllib.load(f)
     return [
-        f"{pkg['name']}=={pkg['version']}"
+        constraint_pin(pkg)
         for pkg in data.get("package", [])
         if "version" in pkg
     ]
@@ -52,7 +65,7 @@ def lock_pins(lock_file: str, pinned: set) -> list:
     with open(lock_file, "rb") as f:
         packages = tomllib.load(f).get("package", [])
     return [
-        f"{pkg['name']}=={pkg['version']}"
+        constraint_pin(pkg)
         for pkg in packages
         if "version" in pkg
         and not {"virtual", "editable"} & set(pkg.get("source", {}))
