@@ -103,6 +103,55 @@ async def _validate_efficient_ingestion_installation(
     return error
 
 
+async def _reconcile_base_admin_permissions() -> Dict[str, List[str]]:
+    """Merge newly introduced resources/permissions into the base admin.
+
+    The base admin is created once, on a fresh install, with the full permission
+    set of that moment. When a new ``AuthResource`` (or permission) is introduced
+    later, an already existing admin keeps its old permission dict and every
+    endpoint guarded by the new resource rejects it (e.g. ``GET
+    /ingestion/settings`` returning 403). This reconciles the stored admin only:
+    it adds what is missing from the current full permission set, never removes
+    anything, and never touches other users, the username, the password or the
+    creation timestamp.
+
+    Returns the resources that gained permissions (empty when already aligned).
+    """
+    admin = await crud_users.get_user_by_username(
+        DEFAULT_SYSTEM_KEY, DEFAULT_ADMIN_USERNAME, with_password=True
+    )
+    if not admin:
+        return {}
+
+    full_permissions = sanitize_permissions(get_full_permissions(), DEFAULT_SYSTEM_KEY)
+    current_permissions = admin.get("permissions") or {}
+
+    added: Dict[str, List[str]] = {}
+    for resource, permissions in full_permissions.items():
+        existing = current_permissions.get(resource) or []
+        missing = [permission for permission in permissions if permission not in existing]
+        if missing:
+            added[resource] = missing
+
+    if not added:
+        return {}
+
+    merged_permissions = dict(current_permissions)
+    for resource, permissions in added.items():
+        merged_permissions[resource] = list(current_permissions.get(resource) or []) + permissions
+
+    # ``update_user`` preserves id/created_at/password (all taken from the stored
+    # user) and only refreshes ``updated_at``, as any update does.
+    await crud_users.update_user(
+        DEFAULT_SYSTEM_KEY, admin["id"], {**admin, "permissions": merged_permissions}
+    )
+    log.info(
+        "Base admin permissions reconciled, added resources: "
+        + ", ".join(sorted(added))
+    )
+    return added
+
+
 def _create_lock_budget(quiesce: int) -> int:
     """Budget for the ``agent-create:<id>`` lock.
 
@@ -199,6 +248,14 @@ class BillTheLizard(OrchestratorMixin, NonCopyableMixin):
                 "password": hash_password(get_env("CAT_ADMIN_DEFAULT_PASSWORD")),
                 "permissions": permissions,  # base admin has all permissions, but CHAT
             })
+
+        # Reconcile the base admin's permissions: an admin created before a new
+        # AuthResource existed would otherwise be denied by that resource.
+        # Non-fatal: a failure here must not prevent startup.
+        try:
+            await _reconcile_base_admin_permissions()
+        except Exception as e:  # noqa: BLE001 - reconciliation must never break boot
+            log.warning(f"Could not reconcile the base admin permissions: {e}")
 
         # Start Redis Pub/Sub listener so WebSocket messages are delivered
         # cross-replica in Docker Swarm deployments.  Degrades gracefully to
