@@ -33,6 +33,7 @@ behaviour is changed here.
 import asyncio
 import importlib
 import inspect
+import json
 import os
 import sys
 import time
@@ -64,6 +65,13 @@ SAMPLE_CONTENT_TYPE = "text/plain"
 
 CORE_ENGINE = "CoreIngestionConfiguration"
 EFFICIENT_ENGINE = "EfficientIngestionConfiguration"
+
+# Deterministic product handed to the concept phase by the fake LLM: unique
+# names/text so the graph assertions prove the concepts came from this stub
+# (never from spaCy or from an empty silent success).
+FAKE_CONCEPT_ALPHA = "dual mode alpha"
+FAKE_CONCEPT_BETA = "dual mode beta"
+FAKE_RELATION_TEXT = "dual mode alpha causally affects dual mode beta"
 
 # Handler instances created after the spies are installed (test-only): the
 # classic background entity extraction is not awaited by the request, so the
@@ -356,6 +364,86 @@ def _install_empty_pass_marker(monkeypatch) -> None:
     monkeypatch.setattr(reembed, "_store_empty_vectors", store_empty_vectors)
 
 
+def _install_fake_llm(monkeypatch) -> None:
+    """Give the concept phase a REAL product through the existing LLM seam.
+
+    Under the new contract a phase with no LLM is a configuration error, so a
+    green ``completed`` status requires an actual extraction product. Two
+    patches, both on the plugin (the phase body itself is untouched):
+
+    * ``GraphRAGHandler._resolve_agent_llm`` returns a sentinel object, so the
+      handler resolves a usable (non-default) LLM;
+    * ``StructuredLLM.run`` returns a schema-valid, NON-EMPTY product instead
+      of calling a real model. The concept/relation types are taken from the
+      handler's dynamic output model, so the stub stays valid against the
+      configured whitelist.
+
+    Returns nothing; the product is deterministic and known via the
+    ``FAKE_*`` constants, which the graph assertions query for.
+    """
+    handler_module = importlib.import_module("cat.plugins.cat_graphrag.graphrag_handler")
+    structured_module = importlib.import_module("cat.plugins.cat_graphrag.structured_llm")
+    cls = handler_module.GraphRAGHandler
+    sentinel_llm = object()
+
+    async def resolve_agent_llm(self):
+        return sentinel_llm
+
+    async def run(self, prompt, llm, output_model, system_prompt=None):
+        schema = output_model.model_json_schema()
+        concept_types = schema["$defs"]["Concept"]["properties"]["type"]["enum"]
+        relation_types = schema["$defs"]["Relation"]["properties"]["type"]["enum"]
+        concept_type = "DEFINITION" if "DEFINITION" in concept_types else concept_types[0]
+        relation_type = "CAUSES" if "CAUSES" in relation_types else relation_types[0]
+        product = {
+            "concepts": [
+                {"type": concept_type, "text": FAKE_CONCEPT_ALPHA},
+                {"type": concept_type, "text": FAKE_CONCEPT_BETA},
+            ],
+            "relations": [
+                {
+                    "type": relation_type,
+                    "origin": FAKE_CONCEPT_ALPHA,
+                    "destination": FAKE_CONCEPT_BETA,
+                    "text": FAKE_RELATION_TEXT,
+                }
+            ],
+        }
+        model = output_model(**product)
+        return structured_module.StructuredLLMResult(text=json.dumps(product), model=model)
+
+    monkeypatch.setattr(cls, "_resolve_agent_llm", resolve_agent_llm)
+    monkeypatch.setattr(structured_module.StructuredLLM, "run", run)
+
+
+async def _fake_product_counts(tenant: str) -> dict:
+    """Count the exact nodes/edges the fake LLM product must have produced."""
+    driver = _neo4j_driver()
+    try:
+        async with driver.session(database=NEO4J_DATABASE) as session:
+
+            async def one(query, **params):
+                result = await session.run(query, tenant=tenant, **params)
+                record = await result.single()
+                await result.consume()
+                return record["c"] if record else 0
+
+            return {
+                "concept_entities": await one(
+                    "MATCH (e:Entity {tenant_id: $tenant}) WHERE e.name IN $names "
+                    "RETURN count(e) AS c",
+                    names=[FAKE_CONCEPT_ALPHA, FAKE_CONCEPT_BETA],
+                ),
+                "concept_relations": await one(
+                    "MATCH (a:Entity {tenant_id: $tenant})-[r:RELATED_TO {text: $text}]"
+                    "->(b:Entity {tenant_id: $tenant}) RETURN count(r) AS c",
+                    text=FAKE_RELATION_TEXT,
+                ),
+            }
+    finally:
+        await driver.close()
+
+
 # ---------------------------------------------------------------------------
 # App-level configuration helpers
 # ---------------------------------------------------------------------------
@@ -467,6 +555,7 @@ async def test_efficient_mode_runs_both_phases_and_never_the_classic_callback(ap
         await _configure_agent(app_client, agent_key, EFFICIENT_ENGINE)
         counts = _install_spies(monkeypatch)
         _install_empty_pass_marker(monkeypatch)
+        _install_fake_llm(monkeypatch)
 
         response = await _ingest_sample(app_client, agent_key)
         assert response.status_code == 200, response.text
@@ -475,13 +564,17 @@ async def test_efficient_mode_runs_both_phases_and_never_the_classic_callback(ap
         graph = await _settle_counts(agent_key)
         status = await _status(agent_key)
         recorded = status.get("completed_phases") or {}
+        fake_product = await _fake_product_counts(agent_key)
 
-        # B1: a phase that has nothing to do (or reports done) must leave the
-        # source COMPLETED, never ERROR.
+        # The LLM phase really produced a product (not an empty silent
+        # success): the source is COMPLETED because the concept path wrote the
+        # fake concepts and their RELATED_TO edge.
         assert status.get("status") == "completed", status
         assert graph["nodes"] > 0
         assert graph["relationships"] > 0
         assert graph["documents"] > 0
+        assert fake_product["concept_entities"] >= 2, fake_product
+        assert fake_product["concept_relations"] >= 1, fake_product
 
         # scenario 2 - the phases, not the classic callback, do the work
         assert counts["classic"] == 0, counts
