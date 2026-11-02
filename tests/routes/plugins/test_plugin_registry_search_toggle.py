@@ -11,6 +11,7 @@ import pytest
 
 from cat.core_plugins.base_plugin.registry import CheshireCatPluginRegistry
 from cat.env_check import validate_env
+from cat.exceptions import CustomValidationException
 
 REGISTRY_MODULE = "cat.core_plugins.base_plugin.registry"
 REGISTRY_PLUGIN = {
@@ -24,6 +25,7 @@ REGISTRY_PLUGIN = {
 class _FakeResponse:
     def __init__(self, payload):
         self._payload = payload
+        self.content = b"zip-bytes"
 
     def raise_for_status(self):
         pass
@@ -87,6 +89,68 @@ async def test_search_enabled_uses_http_client(monkeypatch):
     client = _FakeAsyncClient.instances[0]
     assert client.calls and client.calls[0][0] == "get"
     assert [m.id for m in result] == ["https://registry.test/air-gapped-plugin"]
+
+
+async def test_download_disabled_raises_without_network(monkeypatch):
+    monkeypatch.setenv("CAT_PLUGINS_REGISTRY_SEARCH_ENABLED", "false")
+
+    calls = []
+
+    def _forbidden(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise AssertionError("httpx.AsyncClient must not be instantiated when the registry is disabled")
+
+    _patch_registry_http_client(monkeypatch, _forbidden)
+
+    with pytest.raises(CustomValidationException) as exc_info:
+        await CheshireCatPluginRegistry().download_plugin("https://registry.test/air-gapped-plugin")
+
+    message = str(exc_info.value)
+    assert "disabled" in message
+    assert "CAT_PLUGINS_REGISTRY_SEARCH_ENABLED" in message
+    assert calls == []
+
+
+async def test_download_enabled_uses_http_client(monkeypatch):
+    monkeypatch.setenv("CAT_PLUGINS_REGISTRY_SEARCH_ENABLED", "true")
+    _FakeAsyncClient.instances.clear()
+    _patch_registry_http_client(monkeypatch, _FakeAsyncClient)
+
+    await CheshireCatPluginRegistry().download_plugin("https://registry.test/air-gapped-plugin")
+
+    assert len(_FakeAsyncClient.instances) == 1
+    client = _FakeAsyncClient.instances[0]
+    assert client.calls and client.calls[0][0] == "post"
+    assert client.calls[0][1].endswith("/download")
+
+
+async def test_install_from_registry_route_reports_disabled_setting(
+    monkeypatch, lizard, secure_client, secure_client_headers, cheshire_cat
+):
+    monkeypatch.setenv("CAT_PLUGINS_REGISTRY_SEARCH_ENABLED", "false")
+    # the package conftest patches only search_plugins; restore the real download
+    # so this test exercises the env toggle end-to-end.
+    monkeypatch.setattr(
+        lizard.plugin_registry,
+        "download_plugin",
+        types.MethodType(CheshireCatPluginRegistry.download_plugin, lizard.plugin_registry),
+    )
+
+    def _forbidden(*args, **kwargs):
+        raise AssertionError("the remote registry must not be contacted")
+
+    _patch_registry_http_client(monkeypatch, _forbidden)
+
+    response = await secure_client.post(
+        "/plugins/install/registry",
+        json={"url": "https://registry.test/air-gapped-plugin"},
+        headers=secure_client_headers,
+    )
+
+    assert response.status_code == 400
+    message = response.json()["detail"]
+    assert "disabled" in message
+    assert "CAT_PLUGINS_REGISTRY_SEARCH_ENABLED" in message
 
 
 async def test_available_plugins_route_lists_local_plugins_when_search_disabled(

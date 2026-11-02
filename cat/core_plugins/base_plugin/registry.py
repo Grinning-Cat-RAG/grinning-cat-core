@@ -4,6 +4,7 @@ import httpx
 
 from cat import PluginRegistry
 from cat.env import get_env_bool
+from cat.exceptions import CustomValidationException
 from cat.log import log
 from cat.looking_glass.models import PluginManifest
 from cat.utils import write_temp_file
@@ -57,6 +58,12 @@ class CheshireCatPluginRegistry(PluginRegistry):
             return []
 
     async def download_plugin(self, url: str) -> str:
+        if not get_env_bool("CAT_PLUGINS_REGISTRY_SEARCH_ENABLED"):
+            raise CustomValidationException(
+                "The remote plugins registry is disabled "
+                "(CAT_PLUGINS_REGISTRY_SEARCH_ENABLED=false)"
+            )
+
         log.info(f"Downloading {url}")
 
         payload = {"url": url}
