@@ -509,7 +509,13 @@ class BillTheLizard(OrchestratorMixin, NonCopyableMixin):
             "after_all_cheshire_cats_embedded", success, caller=self,
         )
 
-    def is_custom_endpoint(self, path: str, methods: List[str] | None = None, method: str | None = None):
+    def is_custom_endpoint(
+        self,
+        path: str,
+        methods: List[str] | None = None,
+        method: str | None = None,
+        plugin_ids: set[str] | None = None,
+    ):
         """
         Check if the given path and methods correspond to a custom endpoint.
 
@@ -517,11 +523,39 @@ class BillTheLizard(OrchestratorMixin, NonCopyableMixin):
             path (str): The path of the request (e.g. ``/custom/items/42`` for the endpoint ``/custom/items/{id}``).
             methods (List[str] | None): The HTTP methods of the endpoint to check. If None, checks all methods.
             method (str | None): The HTTP method of the request. If None, checks all methods.
+            plugin_ids (set[str] | None): If provided, only endpoints owned by these plugins are considered.
 
         Returns:
             bool: True if the endpoint is a custom endpoint, False otherwise.
         """
-        return any(ep.matches(path, methods, method) for ep in self.plugin_manager.endpoints)
+        endpoints = self.plugin_manager.endpoints
+        if plugin_ids is not None:
+            endpoints = [ep for ep in endpoints if ep.plugin_id in plugin_ids]
+        return any(ep.matches(path, methods, method) for ep in endpoints)
+
+    def is_system_custom_endpoint(
+        self, path: str, methods: List[str] | None = None, method: str | None = None,
+    ) -> bool:
+        """
+        Check if the given path and methods correspond to an endpoint of a system-only plugin.
+
+        System-only plugins provide instance-level services to every agent (like the embedder), so their endpoints
+        are served for the system scope as well as with an agent id.
+
+        Args:
+            path (str): The path of the request (e.g. ``/ingestion/status``).
+            methods (List[str] | None): The HTTP methods of the endpoint to check. If None, checks all methods.
+            method (str | None): The HTTP method of the request. If None, checks all methods.
+
+        Returns:
+            bool: True if the endpoint belongs to a system-only plugin, False otherwise.
+        """
+        return self.is_custom_endpoint(
+            path,
+            methods=methods,
+            method=method,
+            plugin_ids=set(self.plugin_manager.get_system_only_plugin_ids),
+        )
 
     async def install_plugin(self, plugin_path: str) -> str:
         try:
