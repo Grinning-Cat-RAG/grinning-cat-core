@@ -70,6 +70,10 @@ class FakeGraphRAGHandler:
         self._alignment_done = True
         self.align_calls += 1
 
+    async def drain_source_tasks(self, source):
+        # No background extraction in this fake; the classic write follows.
+        return False
+
     async def create_derived_graph_for_source(self, source, stored_points, cat):
         self.classic_calls += 1
         self.seen_embedder = self._embedder

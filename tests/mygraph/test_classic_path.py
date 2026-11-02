@@ -14,7 +14,6 @@ gating is what is asserted here, and the real node/relationship writes are
 represented by the handler's counters (stated in the task evidence).
 """
 
-import asyncio
 import importlib
 import importlib.util
 import sys
@@ -40,6 +39,11 @@ class FakeGraphRAGHandler:
         self.llm_calls = 0
         self.nodes = 0
         self.relationships = 0
+
+    async def drain_source_tasks(self, source):
+        # The plugin joins the per-source background extraction before the
+        # classic write; the fake has no background tasks to join.
+        return False
 
     async def create_derived_graph_for_source(self, source, stored_points, cat):
         self.classic_calls += 1

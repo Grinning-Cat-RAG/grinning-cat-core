@@ -97,7 +97,9 @@ async def test_merged_phases_keeps_both_graph_phases():
     module = _load_plugin_main("_mygraph_phase_merged")
     try:
         class _PluginManager:
-            hooks = {"ingestion_phase_specs": module.ingestion_phase_specs}
+            # The host registry maps a hook name to the LIST of registered
+            # CatHooks; a bare CatHook is not iterable.
+            hooks = {"ingestion_phase_specs": [module.ingestion_phase_specs]}
 
             async def execute_hook(self, name, *args, caller=None):
                 assert name == "ingestion_phase_specs"

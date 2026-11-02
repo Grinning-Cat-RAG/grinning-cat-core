@@ -84,9 +84,19 @@ def test_module_imports_and_uses_new_effing_paths(monkeypatch):
         calls.append(("list_statuses", agent_id))
         return []
 
+    async def get_status(agent_id, scope, source):
+        calls.append(("get_status", agent_id, scope, source))
+        return {"status": "completed", "completed_phases": {}}
+
+    def phase_state(entry):
+        return (entry or {}).get("state")
+
     setattr(fake_reembed, "reembed_sources", reembed_sources)
     setattr(fake_registry, "delete_status", delete_status)
     setattr(fake_registry, "list_statuses", list_statuses)
+    setattr(fake_registry, "get_status", get_status)
+    setattr(fake_registry, "phase_state", phase_state)
+    setattr(fake_registry, "PHASE_STATE_ERROR", "error")
     monkeypatch.setitem(sys.modules, f"{EFFING}.reembed", fake_reembed)
     monkeypatch.setitem(sys.modules, f"{EFFING}.registry", fake_registry)
 

@@ -154,7 +154,7 @@ def _make_handler():
 
     handler._ensure_connected = _ensure_connected
     handler._read_generation = _read_generation
-    handler._extract_and_link_entities = _extract
+    handler._extract_document_graph = _extract
     handler._create_similarity_relationships = _similarity
     handler.create_derived_graph_for_source = _derived
     handler._get_session = lambda: _Session()
