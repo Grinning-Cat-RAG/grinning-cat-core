@@ -106,9 +106,6 @@ async def update_user(
     if not stored_user:
         raise CustomNotFoundException("User not found")
 
-    if user.password:
-        user.password = hash_password(user.password)
-
     if len(user.permissions) == 0:
         user.permissions = stored_user["permissions"]
 

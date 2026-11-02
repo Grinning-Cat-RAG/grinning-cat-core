@@ -1,8 +1,10 @@
 import pytest
 from pydantic import ValidationError
 
+from cat.auth.auth_utils import check_password
 from cat.auth.permissions import AuthResource, AuthPermission
 from cat.db.cruds import conversations as crud_conversations
+from cat.db.cruds import users as crud_users
 from cat.routes.users import UserBase, UserUpdate
 from cat.services.memory.messages import ConversationMessage, UserMessage
 
@@ -185,6 +187,32 @@ async def test_update_user(secure_client, secure_client_headers, cheshire_cat):
         check_user_fields(d)
         assert d["username"] == "Alice3"
         assert d["permissions"] == {"UPLOAD": ["WRITE"]}
+
+
+async def test_update_user_password_roundtrip(secure_client, secure_client_headers, cheshire_cat):
+    # create user
+    data = await create_new_user(secure_client, headers=secure_client_headers)
+    user_id = data["id"]
+    new_password = "new_wandering_in_wonderland"
+
+    # update the password through the API
+    response = await secure_client.put(
+        f"/users/{user_id}",
+        json={"username": data["username"], "password": new_password, "permissions": data["permissions"]},
+        headers=secure_client_headers,
+    )
+    assert response.status_code == 200
+
+    # the stored hash must verify with the plaintext through exactly ONE check_password
+    stored = await crud_users.get_user(agent_id, user_id, full=True)
+    assert stored is not None
+    assert check_password(new_password, stored["password"])
+
+    # the real login path must accept the new plaintext (regression: it returned 401 while PUT returned 200)
+    response = await secure_client.post(
+        "/auth/token", json={"username": data["username"], "password": new_password}
+    )
+    assert response.status_code == 200
 
 
 async def test_delete_user(secure_client, secure_client_headers, cheshire_cat):
