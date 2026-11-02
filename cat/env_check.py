@@ -58,6 +58,15 @@ def _check_number(
         report.errors.append(f"{name} is out of range (got {raw!r})")
 
 
+def _check_bool(report: EnvReport, name: str) -> None:
+    raw = get_env(name)
+    if raw is None or str(raw).strip() == "":
+        report.errors.append(f"{name} is not set")
+        return
+    if str(raw).strip() not in ("true", "false", "1", "0"):
+        report.errors.append(f"{name} must be a boolean value (true/false/1/0, got {raw!r})")
+
+
 def _check_required(report: EnvReport, name: str) -> None:
     value = get_env(name)
     if value is None or not str(value).strip():
@@ -107,6 +116,9 @@ def validate_env() -> EnvReport:
         report.warnings.append("CAT_CRYPTO_KEY / CAT_CRYPTO_SALT use the public defaults")
     if get_env("CAT_ADMIN_DEFAULT_PASSWORD") == "admin":
         report.warnings.append("CAT_ADMIN_DEFAULT_PASSWORD uses the public default 'admin'")
+
+    # --- plugins --------------------------------------------------------------------------------------------------
+    _check_bool(report, "CAT_PLUGINS_REGISTRY_SEARCH_ENABLED")
 
     # --- CORS / Origin allow-list ---------------------------------------------------------------------------------
     for origin in parse_allowed_origins() or []:
