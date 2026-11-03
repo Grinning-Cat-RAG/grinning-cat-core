@@ -1,3 +1,14 @@
+# ---------------------------------------------------------------------------
+# OPTIONAL plugin-dependency source (see `make build-with-plugins`).
+# `--build-context plugins=<dir>` passes the host plugins directory (outside the
+# repo build context) and `--build-arg PLUGINS_CTX=plugins` selects it here.
+# Without the named context PLUGINS_CTX defaults to an empty stage, so the COPY
+# below copies nothing and the build is unaffected.
+# ---------------------------------------------------------------------------
+ARG PLUGINS_CTX=plugins-empty
+FROM scratch AS plugins-empty
+FROM ${PLUGINS_CTX} AS plugin-src
+
 FROM python:3.13-slim-bookworm AS builder
 
 ### ENVIRONMENT VARIABLES ###
@@ -36,6 +47,22 @@ RUN pip install -U pip uv && \
     rm -rf *.egg-info /root/.cache/pip /tmp/* /var/tmp/* && \
     uv cache clean && \
     find ./ -type d -name __pycache__ -exec rm -rf {} +
+
+### OPTIONAL: DEPENDENCIES OF THE HOST PLUGINS (bind-mounted at runtime) ###
+# Enabled only with --build-arg INSTALL_PLUGIN_DEPS=1. The plugins are copied into
+# /app/cat/plugins (the installer's second glob) and their dependencies are
+# compiled against the root uv.lock and installed into the same /app/.venv.
+# The copied plugin sources are shadowed at runtime by the bind mount; only the
+# venv dependencies matter here.
+ARG INSTALL_PLUGIN_DEPS=0
+COPY --from=plugin-src / /app/cat/plugins/
+RUN if [ "$INSTALL_PLUGIN_DEPS" = "1" ]; then \
+        python3 scripts/install_plugin_requirements.py && \
+        python3 scripts/hash_plugin_requirements.py && \
+        find ./ -type d -name __pycache__ -exec rm -rf {} + ; \
+    else \
+        echo "INSTALL_PLUGIN_DEPS=0: skipping host plugin dependencies"; \
+    fi
 
 # ──────────────────────────────────────────────
 FROM python:3.13-slim-bookworm AS final
