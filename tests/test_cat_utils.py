@@ -68,3 +68,47 @@ async def test_load_settings_no_agent_key_from_cheshire_cat(cheshire_cat):
     assert utils.inspect_calling_agent().agent_key == agent_id
 
     utils.inspect_calling_folder = original_fnc
+
+
+ModelNamesForTest = utils.Enum("ModelNamesForTest", {"bge_base": "BAAI/bge-base-en"})
+
+
+def test_get_nlp_object_name_with_enum_model_name():
+    from types import SimpleNamespace
+
+    obj = SimpleNamespace(model_name=ModelNamesForTest.bge_base)
+    # cat.utils.Enum.__str__ returns .value, so the enum normalizes like its model id.
+    assert utils.get_nlp_object_name(obj, "default_embedder") == "baai_bge_base_en"
+
+
+def test_get_nlp_object_name_with_plain_str_model_name():
+    from types import SimpleNamespace
+
+    obj = SimpleNamespace(model_name="BAAI/bge-base-en")
+    assert utils.get_nlp_object_name(obj, "default_embedder") == "baai_bge_base_en"
+
+
+def test_get_nlp_object_name_with_int_model_name_does_not_raise():
+    from types import SimpleNamespace
+
+    obj = SimpleNamespace(model_name=123)
+    assert utils.get_nlp_object_name(obj, "default_embedder") == "123"
+
+
+def test_get_nlp_object_name_llm_path_enum_model_name():
+    from typing import Any
+
+    from cat.services.factory.llm import LargeLanguageModel
+
+    class DummyLLM(LargeLanguageModel):
+        model_name: Any = None
+
+        @property
+        def _llm_type(self):
+            return "dummy"
+
+        def _call(self, *args, **kwargs):
+            return ""
+
+    llm = DummyLLM(model_name=ModelNamesForTest.bge_base)
+    assert llm.name == "baai_bge_base_en"

@@ -548,6 +548,11 @@ def get_nlp_object_name(nlp_object: Any, default: str) -> str:
     elif hasattr(nlp_object, "model"):
         name = nlp_object.model
 
+    # The name may come from a non-str attribute (e.g. a cat.utils.Enum model_name,
+    # or an int/None/pydantic value). Normalization below assumes a string, so coerce.
+    if not isinstance(name, str):
+        name = str(name)
+
     replaces = ["/", "-", "."]
     for v in replaces:
         name = name.replace(v, "_")
