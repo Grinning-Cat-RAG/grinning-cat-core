@@ -56,21 +56,70 @@ async def _seed(agent: str, source: str, status: IngestionStatus) -> None:
     )
 
 
+def _stored_chunk_point(source_name: str = "doc.pdf"):
+    """One genuinely stored chunk point (what the store-grounded guard inspects)."""
+    return SimpleNamespace(
+        id="stored-chunk-0",
+        payload={
+            "page_content": "stored chunk",
+            "metadata": {"source": source_name},
+        },
+        vector={},
+    )
+
+
+class _FileManager:
+    """Minimal file manager so a forced parse can never hit an AttributeError."""
+
+    def read_file(self, *args, **kwargs):
+        return b"%PDF-1.4 stub"
+
+    def write_file(self, *args, **kwargs):
+        return True
+
+    def remove_file(self, *args, **kwargs):
+        return None
+
+    def file_exists(self, *args, **kwargs):
+        return True
+
+    def list_files(self, *args, **kwargs):
+        return ["doc.pdf"]
+
+
 def _ccat(agent: str, points=None):
-    async def _empty_points(*args, **kwargs):
-        return points or [], None
+    # ``points=None`` seeds ONE stored chunk so the store-grounded freshness
+    # guard (``_source_has_stored_points``) sees a populated store on the
+    # diary-fresh path. An explicit list — including ``[]`` — is used verbatim,
+    # so the guard test can simulate a wiped store.
+    chunks = [_stored_chunk_point()] if points is None else points
+
+    async def _get_points(*args, **kwargs):
+        return list(chunks), None
+
+    async def _write_points(*args, **kwargs):
+        return [], None
 
     async def embedder():
         return SimpleNamespace(name="test-embedder")
+
+    async def file_handlers():
+        return {}
+
+    async def save_file(*args, **kwargs):
+        return True
 
     return SimpleNamespace(
         _id=agent,
         agent_key=agent,
         vector_memory_handler=SimpleNamespace(
-            get_all_tenant_points=_empty_points,
-            add_points_to_tenant=_empty_points,
-            delete_tenant_points=_empty_points,
+            get_all_tenant_points=_get_points,
+            add_points_to_tenant=_write_points,
+            delete_tenant_points=_write_points,
         ),
+        file_manager=_FileManager(),
+        file_handlers=file_handlers,
+        save_file=save_file,
         embedder=embedder,
         chunker=SimpleNamespace(name="test-chunker"),
         rabbit_hole=SimpleNamespace(),
@@ -160,12 +209,8 @@ async def test_stale_phase_still_runs(monkeypatch):
     async def fake_embed(*args, **kwargs):
         embedded.append(args)
 
-    async def fake_record(*args, **kwargs):
-        return {}
-
     monkeypatch.setattr(reembed, "_probe_pending", fake_probe)
     monkeypatch.setattr(reembed, "_embed_phase", fake_embed)
-    monkeypatch.setattr(reembed, "_record_phase", fake_record)
 
     point = SimpleNamespace(payload={"metadata": {"source": source_name}})
     ccat = _ccat(agent, points=[point])
@@ -238,5 +283,52 @@ async def test_fresh_error_row_is_not_handed_by_resume(monkeypatch):
         assert doc is not None
         assert doc["status"] == IngestionStatus.ERROR.value
         assert handed == [], "a fresh error row was resurrected/re-handed"
+    finally:
+        await _drop(agent)
+
+
+async def test_fresh_diary_with_empty_store_forces_reparse(monkeypatch):
+    """A fresh diary is NOT trusted when the store holds zero chunk points.
+
+    The store-grounded freshness guard exists for exactly this case: a wipe
+    that leaves the phase diary intact would otherwise make every phase look
+    fresh, the embedder would never run again, and later phases would fail
+    forever. The guard must force ``parsing_chunking`` (and the matching
+    ``embedding`` in the same pass) even though the probe reports nothing stale.
+    """
+
+    agent = _agent_id()
+    await _seed_master_key(agent)
+    source_name = "doc.pdf"
+    await _seed(agent, source_name, IngestionStatus.PROCESSING)
+
+    async def fresh_probe(*args, **kwargs):
+        return []
+
+    parsed = []
+    embedded = []
+
+    async def fake_parse(*args, **kwargs):
+        parsed.append(args[3])
+        return args[3], [_stored_chunk_point(args[3])], 1, 1
+
+    async def fake_embed(*args, **kwargs):
+        embedded.append(args[2])
+
+    monkeypatch.setattr(reembed, "_probe_pending", fresh_probe)
+    monkeypatch.setattr(reembed, "_run_parsing_phase", fake_parse)
+    monkeypatch.setattr(reembed, "_embed_phase", fake_embed)
+
+    ccat = _ccat(agent, points=[])
+    try:
+        await reembed.reembed_sources(
+            ccat, VectorMemoryType.DECLARATIVE, [_source(source_name)],
+            stale_after=0.0, caller_cat=ccat,
+        )
+        assert parsed, "fresh diary + EMPTY store did not force parsing_chunking"
+        assert embedded, "the forced re-parse was not followed by the forced re-embed"
+        doc = await get_status(agent, "agent", source_name)
+        assert doc is not None
+        assert doc["status"] == IngestionStatus.COMPLETED.value
     finally:
         await _drop(agent)
