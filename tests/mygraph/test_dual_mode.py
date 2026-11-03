@@ -617,17 +617,6 @@ async def test_efficient_mode_runs_both_phases_and_never_the_classic_callback(ap
 # ---------------------------------------------------------------------------
 # Comparable counts (same corpus, both engines)
 # ---------------------------------------------------------------------------
-@pytest.mark.xfail(
-    strict=False,
-    reason=(
-        "KNOWN PRODUCT DEFECT (reported, not fixed): add_points_to_tenant prunes "
-        "completed per-source extraction tasks before drain_source_tasks joins "
-        "them (graphrag_handler.py:1527-1531), so a random chunk's entities are "
-        "silently lost and the two engines disagree. See "
-        "/root/git/.omo/evidence/mygraph-test-triage.md; remove this marker "
-        "once the plugin prune is fixed."
-    ),
-)
 @pytest.mark.asyncio
 async def test_both_modes_produce_comparable_graphs(app_client, monkeypatch):
     """Same corpus -> same chunk structure, comparable graph size.
