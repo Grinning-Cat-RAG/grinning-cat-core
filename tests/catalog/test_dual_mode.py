@@ -38,6 +38,7 @@ cat_alog hook functions are wrapped to count their invocations.
 """
 
 import asyncio
+import functools
 import importlib
 import json
 import os
@@ -392,6 +393,15 @@ def _meta(record) -> dict:
     return (record.payload or {}).get("metadata", {}) or {}
 
 
+def _norm_id(point_id) -> str:
+    """Normalize a point id for comparison across UUID representations.
+
+    The product mints ``uuid5(...).hex`` (undashed); Qdrant returns stored point
+    ids in the canonical dashed UUID form. Compare the identity, not the format.
+    """
+    return str(point_id).replace("-", "").lower()
+
+
 def _order_key(record) -> tuple:
     meta = _meta(record)
     return (meta.get("start_index", 1 << 60), meta.get("chunk_index", 1 << 60))
@@ -438,6 +448,7 @@ def _install_card_hook_spy(plugin_manager, monkeypatch) -> dict:
     }
 
     def _wrap(key, original):
+        @functools.wraps(original)
         async def wrapper(*args, **kwargs):
             counts[key] += 1
             return await original(*args, **kwargs)
@@ -730,7 +741,7 @@ async def test_reembed_keeps_card_id_and_does_not_duplicate(app_client, agent_ke
         if (p.payload or {}).get("metadata", {}).get("is_catalogue_card") is True
     ]
     assert len(rebuilt_cards) == 1, [(_meta(p), p.id) for p in rebuilt_cards]
-    assert {p.id for p in rebuilt_cards} == original_ids, (
+    assert {_norm_id(p.id) for p in rebuilt_cards} == {_norm_id(i) for i in original_ids}, (
         "the re-embed rebuild lost the card id",
         original_ids,
         {p.id for p in rebuilt_cards},
@@ -747,7 +758,7 @@ async def test_reembed_keeps_card_id_and_does_not_duplicate(app_client, agent_ke
 
     cards = await _card_points(cat, DECLARATIVE, SAMPLE_NAME)
     assert len(cards) == 1, [(_meta(c), c.id) for c in cards]
-    assert {c.id for c in cards} == original_ids, (
+    assert {_norm_id(c.id) for c in cards} == {_norm_id(i) for i in original_ids}, (
         "re-embed + phase re-run changed the card id",
         original_ids,
         {c.id for c in cards},
@@ -761,8 +772,8 @@ async def test_same_source_in_two_chats_phase_mode_is_isolated(app_client, agent
     cat = await _configure_agent(app_client, agent_key, EFFICIENT_ENGINE)
     chat_1 = f"catalog_chat_{uuid.uuid4().hex[:8]}"
     chat_2 = f"catalog_chat_{uuid.uuid4().hex[:8]}"
-    text_1 = ("ALPHA CHAT ONLY " * 60).encode()
-    text_2 = ("BETA CHAT ONLY " * 60).encode()
+    text_1 = ("alpha chat only " * 60).encode()
+    text_2 = ("beta chat only " * 60).encode()
 
     # The phase worker resolves each chat's StrayCat by its conversation owner,
     # so the conversations must exist (the admin API key bypasses the ownership
@@ -790,8 +801,8 @@ async def test_same_source_in_two_chats_phase_mode_is_isolated(app_client, agent
 
     full_1 = _meta(by_chat[chat_1]).get("full_card") or ""
     full_2 = _meta(by_chat[chat_2]).get("full_card") or ""
-    assert "ALPHA CHAT ONLY" in full_1 and "BETA CHAT ONLY" not in full_1, full_1[:200]
-    assert "BETA CHAT ONLY" in full_2 and "ALPHA CHAT ONLY" not in full_2, full_2[:200]
+    assert "alpha chat only" in full_1 and "beta chat only" not in full_1, full_1[:200]
+    assert "beta chat only" in full_2 and "alpha chat only" not in full_2, full_2[:200]
     assert await _card_points(cat, DECLARATIVE, SAMPLE_NAME) == []
 
     print("CHAT_SCOPED_PHASE_CATALOG", {
@@ -819,9 +830,9 @@ async def test_reembed_keeps_oversized_card_ids(app_client, agent_key, monkeypat
         meta = _meta(card)
         assert meta.get("is_catalogue_card_segment") is True, meta
         assert isinstance(meta.get("start_index"), int), meta
-        assert card.id == cat_alog._catalogue_card_point_id(
+        assert _norm_id(card.id) == _norm_id(cat_alog._catalogue_card_point_id(
             agent_key, None, LONG_NAME, start_index=meta["start_index"]
-        )
+        ))
 
     points = await _points(cat, DECLARATIVE, {"source": LONG_NAME})
     embedder = await cat.embedder()
@@ -836,7 +847,9 @@ async def test_reembed_keeps_oversized_card_ids(app_client, agent_key, monkeypat
         if (p.payload or {}).get("metadata", {}).get("is_catalogue_card") is True
     ]
     assert len(rebuilt_cards) == len(cards), [p.id for p in rebuilt_cards]
-    assert sorted(p.id for p in rebuilt_cards) == original_ids, (
+    assert sorted(_norm_id(p.id) for p in rebuilt_cards) == sorted(
+        _norm_id(i) for i in original_ids
+    ), (
         "the re-embed re-split the card and lost its ids",
         original_ids,
         sorted(p.id for p in rebuilt_cards),
@@ -945,17 +958,17 @@ async def test_phase_replaces_segments_when_embedder_window_changes(app_client, 
             len(agent_cards), len(expected),
         )
         assert sorted(_meta(c)["start_index"] for c in agent_cards) == sorted(expected)
-        assert {c.id for c in agent_cards} == {
-            cat_alog._catalogue_card_point_id(
+        assert {_norm_id(c.id) for c in agent_cards} == {
+            _norm_id(cat_alog._catalogue_card_point_id(
                 agent_key, None, LONG_NAME, start_index=offset,
-            )
+            ))
             for offset in expected
         }
         for card in chat_cards:
             meta = _meta(card)
-            assert card.id == cat_alog._catalogue_card_point_id(
+            assert _norm_id(card.id) == _norm_id(cat_alog._catalogue_card_point_id(
                 agent_key, meta["chat_id"], LONG_NAME, start_index=meta["start_index"],
-            ), meta
+            )), meta
             assert meta.get("is_catalogue_card_segment") is True, meta
         assert len([c for c in chat_cards if _meta(c).get("chat_id") == chat_1]) == len(expected)
         assert len([c for c in chat_cards if _meta(c).get("chat_id") == chat_2]) == len(expected)
@@ -988,9 +1001,9 @@ async def test_phase_replaces_segments_when_embedder_window_changes(app_client, 
     monkeypatch.setattr(Embeddings, "max_input_tokens", 100000)
     third_dec, third_chat = await _run_and_check(expected_count=1)
     assert len(third_dec) == 1, [(_meta(c), c.id) for c in third_dec]
-    assert third_dec[0].id == cat_alog._catalogue_card_point_id(
+    assert _norm_id(third_dec[0].id) == _norm_id(cat_alog._catalogue_card_point_id(
         agent_key, None, LONG_NAME,
-    )
+    ))
     assert len(third_chat) == 2, [(_meta(c), c.id) for c in third_chat]
     print("WINDOW_RAISE_CATALOG", {"segments": len(third_dec)})
 
