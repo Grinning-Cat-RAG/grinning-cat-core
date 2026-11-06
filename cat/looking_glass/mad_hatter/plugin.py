@@ -42,9 +42,12 @@ class Plugin:
         # where the plugin is on disk
         self._path: str = plugin_path
 
-        # search for .py files in folder
-        py_files_path = os.path.join(self._path, "**/*.py")
-        self._py_files = glob.glob(py_files_path, recursive=True)
+        # search for .py files in folder, skipping the plugin's own tests: they import only under pytest,
+        # and a single failed import would prevent the whole plugin from loading
+        py_files_path = os.path.join(glob.escape(self._path), "**/*.py")
+        self._py_files = [
+            py_file for py_file in glob.glob(py_files_path, recursive=True) if not self._is_test_file(py_file)
+        ]
 
         if len(self._py_files) == 0:
             raise Exception(
@@ -66,6 +69,11 @@ class Plugin:
 
         # plugin starts deactivated
         self._active = False
+
+    def _is_test_file(self, py_file: str) -> bool:
+        """`conftest.py` files and anything under a `tests` folder inside the plugin (not above it)."""
+        parts = Path(py_file).relative_to(self._path).parts
+        return parts[-1] == "conftest.py" or "tests" in parts[:-1]
 
     async def activate(self, agent_id: str):
         # install plugin requirements on activation (non-blocking: uses asyncio subprocess)

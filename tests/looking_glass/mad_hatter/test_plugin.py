@@ -1,6 +1,7 @@
 import os
 import pytest
 from inspect import isfunction
+from pathlib import Path
 
 from cat.db.database import DEFAULT_SYSTEM_KEY
 from cat.looking_glass.mad_hatter.decorators.experimental.form import CatForm
@@ -26,6 +27,55 @@ def test_create_plugin_empty_folder():
 
     with pytest.raises(Exception) as e:
         Plugin(path)
+
+    assert "Cannot create" in str(e.value)
+
+
+def _write_plugin(root, rel_paths):
+    for rel in rel_paths:
+        path = root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # test modules only import under pytest: importing them at load time would break the plugin
+        path.write_text("raise ImportError('test-only module')\n" if "test" in rel else "\n")
+
+
+def test_plugin_test_files_are_not_loaded(tmp_path):
+    root = tmp_path / "plugin_with_tests"
+    _write_plugin(root, [
+        "hook.py", "sub/module.py", "contests.py", "my_tests.py", "sub/latest/module.py",
+        "conftest.py", "tests/__init__.py", "tests/conftest.py", "tests/test_a.py",
+        "tests/unit/test_b.py", "sub/tests/test_c.py", "sub/conftest.py",
+    ])
+
+    plugin = Plugin(str(root))
+
+    loaded = sorted(Path(p).relative_to(root).as_posix() for p in plugin._py_files)
+    assert loaded == ["contests.py", "hook.py", "my_tests.py", "sub/latest/module.py", "sub/module.py"]
+
+
+def test_plugin_path_inside_a_tests_folder_is_still_loaded(tmp_path):
+    """Only folders *inside* the plugin are skipped: the plugin may itself live under a `tests` path."""
+    root = tmp_path / "tests" / "mocks" / "plugin"
+    _write_plugin(root, ["hook.py"])
+
+    assert [Path(p).name for p in Plugin(str(root))._py_files] == ["hook.py"]
+
+
+def test_plugin_path_with_glob_metacharacters(tmp_path):
+    """`[1]` in the folder name must not be read as a pattern matching a sibling `plug1` folder."""
+    _write_plugin(tmp_path / "plug1", ["other_plugin_hook.py"])
+    root = tmp_path / "plug[1]"
+    _write_plugin(root, ["hook.py"])
+
+    assert [Path(p).name for p in Plugin(str(root))._py_files] == ["hook.py"]
+
+
+def test_create_plugin_with_only_test_files(tmp_path):
+    root = tmp_path / "only_tests"
+    _write_plugin(root, ["conftest.py", "tests/test_a.py"])
+
+    with pytest.raises(Exception) as e:
+        Plugin(str(root))
 
     assert "Cannot create" in str(e.value)
 

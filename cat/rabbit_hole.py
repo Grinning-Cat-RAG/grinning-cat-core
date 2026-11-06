@@ -643,7 +643,13 @@ class RabbitHole:
             )
 
         def can_safely_merge(prev_doc: Document) -> bool:
-            """Check if two documents can be safely merged."""
+            """Check if two documents can be safely merged.
+
+            Never across slides: a presentation chunk must keep one exact `slide` (chunks without
+            `slide`, on either side, are compared as None, so plain documents merge as before).
+            """
+            if prev_doc.metadata.get("slide") != current_doc.metadata.get("slide"):
+                return False
             potential_size = len(prev_doc.page_content) + len(current_doc.page_content) + 2
             return potential_size <= max_merge_size
 
