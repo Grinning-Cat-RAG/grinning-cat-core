@@ -43,7 +43,7 @@ jobs:
       - name: Build and test
         run: |
           docker compose build --pull --no-cache
-          docker compose run --rm grinning-cat-core uv run python -m pytest --color=yes -W ignore --disable-warnings .
+          docker compose run --rm grinning-cat-core uv run python -m pytest --color=yes -W ignore --disable-warnings tests
       - name: Cleanup after tests
         if: always()
         run: |
