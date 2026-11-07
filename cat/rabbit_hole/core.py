@@ -112,6 +112,10 @@ class SourceBusy(Exception):
     """The source is being processed (e.g. ingested) by a worker: retry later."""
 
 
+class SourceNotKept(Exception):
+    """The bytes of the source were not kept (a file ingested without storing it): it cannot be processed again."""
+
+
 def _sanitize_filename(file_name: str) -> str:
     """The name of an uploaded file as a source: dots and spaces of the base name become underscores."""
     if "." not in file_name:
@@ -435,6 +439,57 @@ class RabbitHole:
                 return await engine.run_phases(rabbit_hole, ccat, source)
         except (engine.LockError, engine.IngestionCanceled, engine.LockLost):
             return None
+
+    async def reingest_source(
+        self, cat: "CheshireCat", name: str, chat_id: str | None = None,  # type: ignore[name-defined]
+    ) -> Dict | None:
+        """Process a source again from scratch: every phase runs again (each one replaces what it produced before), from
+        the bytes kept for it (a URL may be downloaded again). A source ingested before the states existed gets its
+        state. Public API, for the maintenance scripts.
+
+        It waits for a worker holding the source. ``SourceNotKept`` when the bytes of the file were not kept: nothing is
+        touched. Returns the row of the source, or None when it is gone (or was being deleted: the deletion completes)."""
+        rabbit_hole = copy.copy(self)
+        await rabbit_hole.setup(cat)
+        ccat = rabbit_hole.cat
+        if chat_id is not None:
+            rabbit_hole.stray = await ccat._find_stray_cat(chat_id)  # the owner of the chat
+        source = IngestionSource(ccat.agent_key, chat_id, name, "url" if fnc_is_url(name) else "file")
+        try:
+            async with engine.source_lock(source):
+                kept = await asyncio.to_thread(chunks.read_source_bytes, ccat.file_manager, ccat.agent_key, chat_id, name)
+                if kept is None and source.type == "file":
+                    raise SourceNotKept(name)
+                row = await crud_ingestions.get_status(ccat.agent_key, chat_id, name)
+                if row is not None and row["status"] == IngestionStatus.DELETING.value:
+                    await engine.delete_source(rabbit_hole, ccat, source)
+                    return None
+                if row is None:
+                    await crud_ingestions.create_status(ccat.agent_key, chat_id, name, type_=source.type)
+                else:
+                    phases = await engine.collect_phases(rabbit_hole, ccat)
+                    recorded = set(row.get("completed_phases") or {}) | {phase.id for phase in phases}
+                    await crud_ingestions.reset_phase_entries(ccat.agent_key, chat_id, name, sorted(recorded))
+                return await engine.run_phases(rabbit_hole, ccat, source)
+        except (engine.IngestionCanceled, engine.LockLost):
+            return None
+
+    async def rerun_agent(self, cat: "CheshireCat", retry_errors: bool = False) -> Dict[str, int]:  # type: ignore[name-defined]
+        """Bring every source of the agent (its knowledge base and its chats) up to date (see ``rerun_source``); with
+        ``retry_errors``, the failed phases run again too. Public API, for the maintenance scripts: they put the agent
+        in maintenance meanwhile, so that the automatic resume leaves it alone.
+
+        Returns how many sources ended ``completed``, ``error``, or ``skipped`` (gone, or deleted meanwhile)."""
+        counts = {"completed": 0, "error": 0, "skipped": 0}
+        for row in await crud_ingestions.list_statuses(cat.agent_key):
+            failed = [
+                phase_id for phase_id, entry in (row.get("completed_phases") or {}).items()
+                if entry.get("state") == engine.STATE_ERROR
+            ] if retry_errors else None
+            result = await self.rerun_source(cat, row["source"], row["chat_id"], invalidate=failed)
+            status = (result or {}).get("status")
+            counts[status if status in ("completed", "error") else "skipped"] += 1
+        return counts
 
     async def _is_still_wanted(self, source: IngestionSource) -> bool:
         """Whether the source is still to be ingested: its agent and its row exist (a deleted chat removes its rows)."""

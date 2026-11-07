@@ -50,6 +50,18 @@ class IngestionStatus(str, Enum):
     DELETING = "deleting"
 
 
+#: Display labels of the states (English defaults: a client localizes them by the state id)
+STATUS_LABELS = {
+    IngestionStatus.UPLOADED.value: "Uploaded",
+    IngestionStatus.DOWNLOADING.value: "Downloading",
+    IngestionStatus.DOWNLOADED.value: "Downloaded",
+    IngestionStatus.PROCESSING.value: "Processing",
+    IngestionStatus.COMPLETED.value: "Completed",
+    IngestionStatus.ERROR.value: "Error",
+    IngestionStatus.DELETING.value: "Deleting",
+}
+
+
 def _now() -> float:
     """The current time, rounded to the millisecond: RedisJSON does not round-trip every digit of a float."""
     return round(time.time(), 3)

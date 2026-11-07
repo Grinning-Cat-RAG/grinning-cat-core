@@ -87,6 +87,11 @@ class IngestionPhase(ABC):
     async def delete(self, source: IngestionSource, cat) -> None:
         """Remove what the phase produced for the source. Idempotent: it may run again after an interruption."""
 
+    @property
+    def display_label(self) -> str:
+        """The label shown to the users (the id when the phase has none)."""
+        return self.label or self.id.replace("_", " ").capitalize()
+
 
 class PhaseGraphError(ValueError):
     """The phases do not form a graph: a cycle, or a dependency on a phase that does not exist."""

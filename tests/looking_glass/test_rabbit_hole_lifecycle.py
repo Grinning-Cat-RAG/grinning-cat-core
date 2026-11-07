@@ -13,7 +13,8 @@ deletions, with faults injected in the phases. The rules are checked after every
   upload runs;
 - concurrent uploads and deletions of the same source run one at a time; a source whose row is deleted while it is
   processed (its chat deleted) leaves nothing behind;
-- every upload notifies ``after_rabbithole_stored_documents`` exactly once (points, or none on failure).
+- every upload notifies ``after_rabbithole_stored_documents`` exactly once (points, or none on failure);
+- a reingest runs the source again from scratch; only a failed ingestion can be dismissed (409 otherwise).
 """
 import asyncio
 import copy
@@ -28,7 +29,7 @@ from redis.exceptions import LockError
 
 from cat.core_plugins.base_plugin.file_managers.custom import LocalFileManager
 from cat.db.cruds import ingestions as crud_ingestions
-from cat.rabbit_hole import RabbitHole, chunks, engine, recovery
+from cat.rabbit_hole import RabbitHole, SourceNotKept, chunks, engine, recovery
 from cat.rabbit_hole.phases import IngestionPhase, PhaseResult, compute_tags
 from cat.services.memory.models import VectorMemoryType
 
@@ -149,6 +150,8 @@ operation = st.one_of(
     st.tuples(st.just("row_gone"), st.sampled_from(SOURCES), st.none()),
     st.tuples(st.just("ingest_and_delete"), st.sampled_from(SOURCES), st.none()),
     st.tuples(st.just("ingest_both"), st.none(), st.none()),
+    st.tuples(st.just("reingest"), st.sampled_from(SOURCES), st.none()),
+    st.tuples(st.just("dismiss"), st.sampled_from(SOURCES), st.none()),
 )
 
 
@@ -201,6 +204,17 @@ async def test_the_lifecycle_of_the_sources(lizard, cheshire_cat, monkeypatch, o
         return await cheshire_cat.rabbit_hole.ingest_file(
             cat=cheshire_cat, file=BytesIO(TEXT), metadata={}, filename=name, content_type="text/plain",
         )
+
+    async def dismiss(name):
+        from httpx import ASGITransport, AsyncClient
+        from tests.utils import api_key
+
+        app = lizard.fastapi_app
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            return await client.delete(
+                "/ingestion/status", params={"source": name},
+                headers={"Authorization": f"Bearer {api_key}", "X-Agent-ID": agent},
+            )
 
     async def crash_source(name):
         """An upload whose worker dies during the embedding: its lock is never released (it expires)."""
@@ -273,6 +287,32 @@ async def test_the_lifecycle_of_the_sources(lizard, cheshire_cat, monkeypatch, o
                 expected[name] = "completed"
             else:
                 expected.pop(name, None)
+        elif kind == "reingest":
+            # maintenance: the source again from scratch (waits for a crashed worker's lock to expire)
+            if name not in expected:
+                continue
+            if expected[name] == "error" and world.faults.get(name) == "empty":
+                with pytest.raises(SourceNotKept):  # an empty upload kept no bytes: nothing is touched
+                    await cheshire_cat.rabbit_hole.reingest_source(cheshire_cat, name)
+                continue
+            row = await cheshire_cat.rabbit_hole.reingest_source(cheshire_cat, name)
+            if expected[name] == "deleting":
+                assert row is None
+                expected.pop(name)
+            else:
+                ok = expected[name] == "crashed" or world.faults.get(name) in (None, "plugin_not_ready")
+                expected[name] = "completed" if ok else "error"
+                assert row["status"] == expected[name]
+        elif kind == "dismiss":
+            # the client dismisses a failed ingestion: only a failed one goes, with the files kept for it
+            if name not in expected:
+                continue
+            response = await dismiss(name)
+            if expected[name] == "error":
+                assert response.status_code == 200
+                expected.pop(name)
+            else:
+                assert response.status_code == 409
         elif kind == "ingest_both":
             for source in SOURCES:
                 world.faults[source] = None
