@@ -31,11 +31,13 @@ namespace holds nothing else. Firing it before the wipe would let a crash
 between the plugin's delete and re-store lose the marker while the master
 key, settings and conversations still exist.
 
-The marker key format mirrors the ``ingestion_status`` plugin registry
-(EffING's ``registry.delete_marker_key``): the plugin owns the single source
-of truth, but the core MUST NOT import ``cat.core_plugins`` (core must not
-depend on plugins), so the key literal and the marker helpers are re-declared
-here and must be kept in sync with the plugin registry.
+This module is the single source of truth for the marker key and its schema:
+the core owns ``agents:{agent_id}:ingestion:delete`` and the helpers below, and
+ingestion plugins import them (EffING's ``registry`` re-exports
+``delete_marker_key`` and the helpers) instead of re-declaring copies. The
+schema is ``{"delete_marker": True, "started_at": <unix float>}``; reads stay
+presence-only, so legacy ``{"delete_marker": True}`` markers keep working and
+are rewritten on the next teardown.
 
 Import-safe: this module is imported by the core at startup; it performs no
 network/Redis/filesystem work at import time.
@@ -115,6 +117,11 @@ def _delete_marker_key(agent_id: str) -> str:
     return f"{DEFAULT_AGENTS_KEY}:{agent_id}:ingestion:delete"
 
 
+#: Public name of the key helper: the cross-repo contract ingestion plugins
+#: import. The underscore-prefixed name stays for internal core callers.
+delete_marker_key = _delete_marker_key
+
+
 async def set_delete_marker(agent_id: str) -> None:
     """Write the deletion marker for an agent (idempotent).
 
@@ -131,8 +138,8 @@ async def set_delete_marker(agent_id: str) -> None:
 async def has_delete_marker(agent_id: str) -> bool:
     """Whether the deletion marker is present (teardown incomplete).
 
-    Presence-only: tolerates both this module's schema (``delete_marker`` +
-    ``started_at``) and the plugin's ``{"delete_marker": True}``-only rows.
+    Presence-only: tolerates both the current schema (``delete_marker`` +
+    ``started_at``) and legacy ``{"delete_marker": True}``-only rows.
     """
     return await crud.read(_delete_marker_key(agent_id)) is not None
 

@@ -115,6 +115,7 @@ async def test_set_delete_marker_writes_schema(marker_agent_id):
 
         doc = _unwrap(await crud.read(key))
         assert isinstance(doc, dict)
+        assert set(doc) == {"delete_marker", "started_at"}
         assert doc["delete_marker"] is True
         assert isinstance(doc["started_at"], float)
         assert doc["started_at"] > 0
