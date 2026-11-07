@@ -222,3 +222,26 @@ def agent_core_plugins(plugin_manager) -> list:
     They are still fully visible on the `/plugins/system/*` routes.
     """
     return [p for p in plugin_manager.get_core_plugins_ids if not plugin_manager.is_system_plugin(p)]
+
+
+def agent_active_core_plugins(plugin_manager) -> list[str]:
+    """Core plugins active for an agent.
+
+    ``get_system_only_plugin_ids`` (e.g. ``cat_efficient_ingestion``) run on the system
+    manager only: an agent lists them as installed but inactive, so they must not be
+    expected among the agent's active plugins.
+    """
+    system_only = set(plugin_manager.get_system_only_plugin_ids)
+    return [p for p in agent_core_plugins(plugin_manager) if p not in system_only]
+
+
+async def assert_system_only_plugin_contract(secure_client, headers, plugin_id="cat_efficient_ingestion"):
+    """A system-only plugin is inactive for an agent and active on the system manager."""
+    response = await secure_client.get("/plugins/", headers=headers)
+    assert response.status_code == 200
+    installed = {p["id"]: p for p in response.json()["installed"]}
+    assert installed[plugin_id]["local_info"]["active"] is False
+
+    response = await secure_client.get(f"/plugins/system/details/{plugin_id}", headers=headers)
+    assert response.status_code == 200
+    assert response.json()["data"]["local_info"]["active"] is True

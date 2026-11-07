@@ -1,4 +1,9 @@
-from tests.utils import agent_core_plugins, just_installed_plugin
+from tests.utils import (
+    agent_active_core_plugins,
+    agent_core_plugins,
+    assert_system_only_plugin_contract,
+    just_installed_plugin,
+)
 
 
 async def _check_activation(secure_client, secure_client_headers):
@@ -37,6 +42,7 @@ async def test_deactivate_plugin(lizard, secure_client, secure_client_headers, c
     # install and activate
     await just_installed_plugin(secure_client, secure_client_headers, activate=True)
     core_plugins = agent_core_plugins(lizard.plugin_manager)
+    active_core_plugins = agent_active_core_plugins(lizard.plugin_manager)
 
     # verify that the plugin is active
     response = await secure_client.get("/plugins/", headers=secure_client_headers)
@@ -51,7 +57,10 @@ async def test_deactivate_plugin(lizard, secure_client, secure_client_headers, c
     available_plugins = response.json()["installed"]
     assert len(available_plugins) == len(core_plugins) + 1  # core plugins and mock_plugin
     for p in available_plugins:
-        assert p["local_info"]["active"] == (p["id"] in core_plugins)
+        assert p["local_info"]["active"] == (p["id"] in active_core_plugins)
+
+    # cat_efficient_ingestion is system-only: inactive for the agent, active on the system manager
+    await assert_system_only_plugin_contract(secure_client, secure_client_headers)
 
 
 async def test_reactivate_plugin(secure_client, secure_client_headers, cheshire_cat):

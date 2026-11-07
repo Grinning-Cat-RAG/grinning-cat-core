@@ -4,10 +4,10 @@ from cat.env import get_env, get_env_int, get_supported_env_variables
 
 
 def test_get_env():
-    # container envs
-    assert get_env("PYTHONUNBUFFERED") == "1"
-    assert get_env("UV_LINK_MODE") == "copy"
-    assert get_env("UV_NO_CACHE") == "1"
+    # container envs: the Docker image sets these, a source checkout does not.
+    # Compare against the real environment instead of hardcoding the image values.
+    for name in ("PYTHONUNBUFFERED", "UV_LINK_MODE", "UV_NO_CACHE"):
+        assert get_env(name) == os.environ.get(name)
 
     # unexisting
     assert get_env("UNEXISTING_ENV") is None

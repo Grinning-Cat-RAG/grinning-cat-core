@@ -43,8 +43,9 @@ pytest_plugins = ["pytest"]
 # only a mock: a `Database` already bound to the real env (default
 # CAT_REDIS_DB=0 == production) would make `flushdb()` wipe real agent data.
 # Incident: get_sync_db().flushdb() hit db0 in CAT. [scope:DEH-RAG-wide]
+# db 1 is used in production too, so tests use db 15, which no deployment uses.
 # ---------------------------------------------------------------------------
-TEST_REDIS_DB = "1"
+TEST_REDIS_DB = "15"
 os.environ["CAT_REDIS_DB"] = TEST_REDIS_DB
 # substitute classes' methods where necessary for testing purposes
 def mock_classes(monkeypatch, memory_client):

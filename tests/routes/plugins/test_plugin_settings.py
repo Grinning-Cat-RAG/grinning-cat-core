@@ -1,4 +1,4 @@
-from tests.utils import agent_core_plugins, just_installed_plugin
+from tests.utils import agent_active_core_plugins, just_installed_plugin
 from tests.mocks.mock_plugin.mock_plugin_overrides import MockPluginSettings
 
 
@@ -9,7 +9,9 @@ async def test_get_all_plugin_settings(lizard, secure_client, secure_client_head
     json = response.json()
 
     plugin_manager = lizard.plugin_manager
-    available_plugins = agent_core_plugins(plugin_manager) + ["mock_plugin"]
+    # the route lists only the plugins active for the agent: system-only plugins are
+    # not loaded on an agent manager and therefore expose no settings here.
+    available_plugins = agent_active_core_plugins(plugin_manager) + ["mock_plugin"]
 
     assert response.status_code == 200
     assert isinstance(json["settings"], list)

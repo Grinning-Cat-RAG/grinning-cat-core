@@ -7,7 +7,10 @@ from tests.utils import agent_id
 
 
 def test_get_base_path():
-    assert utils.get_base_path() == "/app/cat/"
+    # The base path is the directory that contains the `cat` package: `/app/cat/` in the
+    # Docker image, the checkout path elsewhere. Assert the real environment, not a literal.
+    expected = os.path.dirname(os.path.abspath(utils.__file__)) + "/"
+    assert utils.get_base_path() == expected
 
 
 def test_get_plugin_path():

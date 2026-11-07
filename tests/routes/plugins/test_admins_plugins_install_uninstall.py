@@ -4,7 +4,14 @@ from cat.db import crud
 from cat.db.cruds import plugins as crud_plugins
 from cat.db.database import DEFAULT_SYSTEM_KEY
 
-from tests.utils import agent_core_plugins, api_key, agent_id, just_installed_plugin
+from tests.utils import (
+    agent_active_core_plugins,
+    agent_core_plugins,
+    api_key,
+    agent_id,
+    assert_system_only_plugin_contract,
+    just_installed_plugin,
+)
 
 
 # NOTE: here we test zip upload and install
@@ -13,6 +20,7 @@ async def test_plugin_install_from_zip(lizard, secure_client, secure_client_head
     await just_installed_plugin(secure_client, secure_client_headers)
     # only the agent-visible core plugins: system plugins are hidden at an agent level
     core_plugins = agent_core_plugins(lizard.plugin_manager)
+    active_core_plugins = agent_active_core_plugins(lizard.plugin_manager)
 
     # during tests, the cat uses a different folder for plugins
     mock_plugin_final_folder = "tests/mocks/mock_plugin_folder/mock_plugin"
@@ -36,9 +44,8 @@ async def test_plugin_install_from_zip(lizard, secure_client, secure_client_head
         assert p["local_info"]["active"]
 
     # now, lists the plugins as an agent (new plugins are installed but deactivated, initially)
-    response = await secure_client.get(
-        "/plugins/", headers={"X-Agent-ID": cheshire_cat.agent_key, "Authorization": f"Bearer {api_key}"}
-    )
+    agent_headers = {"X-Agent-ID": cheshire_cat.agent_key, "Authorization": f"Bearer {api_key}"}
+    response = await secure_client.get("/plugins/", headers=agent_headers)
     installed_plugins = response.json()["installed"]
     installed_plugins_names = list(map(lambda p_: p_["id"], installed_plugins))
     assert "mock_plugin" in installed_plugins_names
@@ -46,7 +53,9 @@ async def test_plugin_install_from_zip(lizard, secure_client, secure_client_head
     # core plugins are active, mock_plugin is not at an agent level
     for p in installed_plugins:
         assert isinstance(p["local_info"]["active"], bool)
-        assert p["local_info"]["active"] == (p["id"] in core_plugins)
+        assert p["local_info"]["active"] == (p["id"] in active_core_plugins)
+    # cat_efficient_ingestion is system-only: inactive for the agent, active on the system manager
+    await assert_system_only_plugin_contract(secure_client, agent_headers)
 
     # plugin has been actually extracted in (mock) plugins folder
     assert os.path.exists(mock_plugin_final_folder)
@@ -62,11 +71,11 @@ async def test_plugin_install_after_cheshire_cat_creation(lizard, secure_client,
     ccat = await lizard.create_cheshire_cat("agent_test_test")
     # only the agent-visible core plugins: system plugins are hidden at an agent level
     core_plugins = agent_core_plugins(lizard.plugin_manager)
+    active_core_plugins = agent_active_core_plugins(lizard.plugin_manager)
 
     # list the plugins as an agent: mock_plugin is not installed yet
-    response = await secure_client.get(
-        "/plugins/", headers={"X-Agent-ID": ccat.agent_key, "Authorization": f"Bearer {api_key}"}
-    )
+    ccat_headers = {"X-Agent-ID": ccat.agent_key, "Authorization": f"Bearer {api_key}"}
+    response = await secure_client.get("/plugins/", headers=ccat_headers)
     installed_plugins = response.json()["installed"]
     installed_plugins_names = list(map(lambda p_: p_["id"], installed_plugins))
     assert "mock_plugin" not in installed_plugins_names
@@ -74,9 +83,7 @@ async def test_plugin_install_after_cheshire_cat_creation(lizard, secure_client,
     await just_installed_plugin(secure_client, secure_client_headers, plugin_id="mock_plugin")
 
     # now, lists the plugins as an agent (new plugins are installed but deactivated, initially)
-    response = await secure_client.get(
-        "/plugins/", headers={"X-Agent-ID": ccat.agent_key, "Authorization": f"Bearer {api_key}"}
-    )
+    response = await secure_client.get("/plugins/", headers=ccat_headers)
     installed_plugins = response.json()["installed"]
     installed_plugins_names = list(map(lambda p_: p_["id"], installed_plugins))
     assert "mock_plugin" in installed_plugins_names
@@ -84,7 +91,9 @@ async def test_plugin_install_after_cheshire_cat_creation(lizard, secure_client,
     # core plugins are active, mock_plugin is not at an agent level
     for p in installed_plugins:
         assert isinstance(p["local_info"]["active"], bool)
-        assert p["local_info"]["active"] == (p["id"] in core_plugins)
+        assert p["local_info"]["active"] == (p["id"] in active_core_plugins)
+    # cat_efficient_ingestion is system-only: inactive for the agent, active on the system manager
+    await assert_system_only_plugin_contract(secure_client, ccat_headers)
 
 
 async def test_create_cheshire_cat_after_plugin_install(lizard, secure_client, secure_client_headers, cheshire_cat):
@@ -94,11 +103,11 @@ async def test_create_cheshire_cat_after_plugin_install(lizard, secure_client, s
     ccat = await lizard.create_cheshire_cat("agent_test_test")
     # only the agent-visible core plugins: system plugins are hidden at an agent level
     core_plugins = agent_core_plugins(lizard.plugin_manager)
+    active_core_plugins = agent_active_core_plugins(lizard.plugin_manager)
 
     # now, lists the plugins as an agent (new plugins are installed but deactivated, initially)
-    response = await secure_client.get(
-        "/plugins/", headers={"X-Agent-ID": ccat.agent_key, "Authorization": f"Bearer {api_key}"}
-    )
+    ccat_headers = {"X-Agent-ID": ccat.agent_key, "Authorization": f"Bearer {api_key}"}
+    response = await secure_client.get("/plugins/", headers=ccat_headers)
     installed_plugins = response.json()["installed"]
     installed_plugins_names = list(map(lambda p_: p_["id"], installed_plugins))
     assert "mock_plugin" in installed_plugins_names
@@ -106,7 +115,9 @@ async def test_create_cheshire_cat_after_plugin_install(lizard, secure_client, s
     # core plugins are active, mock_plugin is not at an agent level
     for p in installed_plugins:
         assert isinstance(p["local_info"]["active"], bool)
-        assert p["local_info"]["active"] == (p["id"] in core_plugins)
+        assert p["local_info"]["active"] == (p["id"] in active_core_plugins)
+    # cat_efficient_ingestion is system-only: inactive for the agent, active on the system manager
+    await assert_system_only_plugin_contract(secure_client, ccat_headers)
 
 
 async def test_plugin_uninstall(secure_client, secure_client_headers, cheshire_cat):
@@ -147,6 +158,7 @@ async def test_plugin_uninstall(secure_client, secure_client_headers, cheshire_c
 async def test_plugin_recurrent_installs(lizard, secure_client, secure_client_headers, cheshire_cat):
     # create a new agent
     ccat = await lizard.create_cheshire_cat("agent_test_test")
+    active_core_plugins = agent_active_core_plugins(lizard.plugin_manager)
 
     await just_installed_plugin(secure_client, secure_client_headers, plugin_id="mock_plugin")
 
@@ -160,7 +172,10 @@ async def test_plugin_recurrent_installs(lizard, secure_client, secure_client_he
 
     for p in installed_plugins:
         assert isinstance(p["local_info"]["active"], bool)
-        assert p["local_info"]["active"]
+        assert p["local_info"]["active"] == (p["id"] in active_core_plugins + ["mock_plugin"])
+
+    # cat_efficient_ingestion is system-only: inactive for the agent, active on the system manager
+    await assert_system_only_plugin_contract(secure_client, ccat_headers)
 
     await just_installed_plugin(secure_client, secure_client_headers, plugin_id="mock_plugin")
 
@@ -172,7 +187,7 @@ async def test_plugin_recurrent_installs(lizard, secure_client, secure_client_he
 
     for p in installed_plugins:
         assert isinstance(p["local_info"]["active"], bool)
-        assert p["local_info"]["active"]
+        assert p["local_info"]["active"] == (p["id"] in active_core_plugins + ["mock_plugin"])
 
 
 async def test_plugin_incremental_settings_on_recurrent_installs(
