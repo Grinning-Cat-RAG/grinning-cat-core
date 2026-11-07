@@ -262,6 +262,55 @@ async def test_quiesce_waits_on_processing_row(marker_agent_id):
         await crud.delete(processing_key)
 
 
+async def test_quiesce_does_not_wait_on_terminal_error_row():
+    agent_id = "agent_quiesce_error_c41d"
+    error_key = f"{DEFAULT_AGENTS_KEY}:{agent_id}:ingestion:agent:failed"
+    try:
+        await crud.store(error_key, {"status": "error"})
+
+        started = time.monotonic()
+        result = await wait_for_ingestion_quiesce(agent_id, quiesce_seconds=5, poll_seconds=0.1)
+        elapsed = time.monotonic() - started
+
+        assert result is None
+        assert elapsed < 1.0
+    finally:
+        await crud.delete(error_key)
+
+
+async def test_quiesce_treats_an_unknown_status_as_busy():
+    agent_id = "agent_quiesce_unknown_7a2e"
+    unknown_key = f"{DEFAULT_AGENTS_KEY}:{agent_id}:ingestion:agent:weird"
+    try:
+        await crud.store(unknown_key, {"status": "some_future_status"})
+
+        started = time.monotonic()
+        result = await wait_for_ingestion_quiesce(agent_id, quiesce_seconds=1, poll_seconds=0.1)
+        elapsed = time.monotonic() - started
+
+        assert result is None
+        assert elapsed >= 0.9
+        assert elapsed < 3.0
+    finally:
+        await crud.delete(unknown_key)
+
+
+async def test_quiesce_skips_the_delete_marker_row():
+    agent_id = "agent_quiesce_marker_9b6f"
+    marker_key = _delete_marker_key(agent_id)
+    try:
+        await set_delete_marker(agent_id)
+
+        started = time.monotonic()
+        result = await wait_for_ingestion_quiesce(agent_id, quiesce_seconds=5, poll_seconds=0.1)
+        elapsed = time.monotonic() - started
+
+        assert result is None
+        assert elapsed < 1.0
+    finally:
+        await crud.delete(marker_key)
+
+
 # 6. resumable orphan marker (boot-light path) -------------------------------
 async def test_complete_pending_deletes_recovers_orphan_marker(lizard):
     agent_id = "agent_orphan_5b1e"
