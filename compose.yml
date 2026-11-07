@@ -16,6 +16,8 @@ services:
       - CAT_API_KEY=test
       # REQUIRED: the app does not start without it (>= 32 random chars). Set it in your shell or in .env
       - CAT_JWT_SECRET=${CAT_JWT_SECRET:?CAT_JWT_SECRET must be set (>= 32 random characters)}
+      - CAT_CRYPTO_KEY=${CAT_CRYPTO_KEY:?CAT_CRYPTO_KEY must be set}
+      - CAT_CRYPTO_SALT=${CAT_CRYPTO_SALT:?CAT_CRYPTO_SALT must be set}
       - CAT_REDIS_HOST=grinning_cat_redis
       - CAT_REDIS_PORT=6379
       - CAT_LOG_LEVEL=DEBUG

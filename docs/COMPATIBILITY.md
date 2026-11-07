@@ -50,6 +50,8 @@ The current version introduces also the following additional hooks:
 
 ### RabbitHole:
 - `before_rabbithole_splits_documents` replaces the removed `before_rabbithole_splits_text`
+- `rabbithole_ingestion_phases`: to add phases to the ingestion of the sources (`cat.rabbit_hole.phases.IngestionPhase`
+  subclasses, run after the phases they depend on and again when their settings change)
 
 ### Memory:
 - `before_cat_recalls_memories` replaces the removed `before_cat_recalls_declarative_memories`

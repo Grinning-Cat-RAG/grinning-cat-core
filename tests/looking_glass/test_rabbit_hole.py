@@ -7,6 +7,7 @@ from io import BytesIO
 from langchain_core.documents import Document
 
 from cat.core_plugins.base_plugin.parsers import MimeTypeBasedParser
+from cat.db.cruds import ingestions as crud_ingestions
 from cat.rabbit_hole import RabbitHole
 from cat.services.factory.embedder import MultimodalEmbeddings
 from cat.services.memory.models import PointStruct, VectorMemoryType
@@ -326,11 +327,12 @@ async def test_parse_to_docs_runs_off_event_loop(cheshire_cat, monkeypatch):
 
 
 def _mock_ingestion_pipeline(monkeypatch, cheshire_cat, state):
-    """Monkeypatch the heavy ``ingest_file`` body so only ``_parse_to_docs`` runs.
+    """Make the parse of ``ingest_file`` slow and observable.
 
     ``_parse_to_docs`` is replaced by a slow coroutine that tracks a shared
-    active counter, so concurrent calls can be observed overlapping. Everything
-    downstream (store, file save, hooks, notifications) is stubbed out.
+    active counter, so concurrent calls can be observed overlapping. The file
+    save, the hooks and the notifications are stubbed out (the hooks answer
+    nothing: the sources end in error after the parse, which is not observed).
     """
     async def slow_parse_to_docs(self, source, file_bytes, content_type=None):
         state["active"] += 1
@@ -339,9 +341,6 @@ def _mock_ingestion_pipeline(monkeypatch, cheshire_cat, state):
         await asyncio.sleep(0.05)  # keep the body busy so overlap is observable
         state["active"] -= 1
         return [Document(page_content="hello")], []
-
-    async def fake_store_documents(self, docs, source, file_hash=None, metadata=None, images=None, source_bytes=None):
-        return []
 
     async def fake_send_notification(self, message):
         pass
@@ -353,7 +352,6 @@ def _mock_ingestion_pipeline(monkeypatch, cheshire_cat, state):
         return None
 
     monkeypatch.setattr(RabbitHole, "_parse_to_docs", slow_parse_to_docs)
-    monkeypatch.setattr(RabbitHole, "store_documents", fake_store_documents)
     monkeypatch.setattr(RabbitHole, "_send_notification_message", fake_send_notification)
     monkeypatch.setattr(cheshire_cat, "save_file", fake_save_file)
     monkeypatch.setattr(cheshire_cat.plugin_manager, "execute_hook", fake_execute_hook)
@@ -435,15 +433,11 @@ async def test_ingest_file_saves_file_before_parsing(cheshire_cat, monkeypatch):
         order.append("parse")
         return [Document(page_content="x")], []
 
-    async def fake_store_documents(self, docs, source, file_hash=None, metadata=None, images=None, source_bytes=None):
-        return []
-
     async def fake_execute_hook(self, *args, **kwargs):
         return None
 
     monkeypatch.setattr(cheshire_cat, "save_file", fake_save_file)
     monkeypatch.setattr(RabbitHole, "_parse_to_docs", fake_parse_to_docs)
-    monkeypatch.setattr(RabbitHole, "store_documents", fake_store_documents)
     monkeypatch.setattr(cheshire_cat.plugin_manager, "execute_hook", fake_execute_hook)
 
     rabbit_hole = RabbitHole()
@@ -462,40 +456,22 @@ async def test_ingest_file_saves_file_before_parsing(cheshire_cat, monkeypatch):
 
 
 async def test_ingest_file_sets_processing_before_parse(cheshire_cat, monkeypatch):
-    """The ``processing`` status is recorded BEFORE the parser runs.
-
-    ``ingest_file`` must record the ``processing`` state after the file is
-    persisted (``save_file``) and before ``_parse_to_docs``, so a long parse is
-    visible as ``processing``.
-    """
+    """The source is ``processing``, with its phase, while the parser runs: after the file is persisted."""
     order: list = []
 
     async def fake_save_file(file_bytes, content_type, source, chat_id=None):
         order.append("save_file")
 
     async def fake_parse_to_docs(self, source, file_bytes, content_type=None):
-        order.append("parse")
+        row = await crud_ingestions.get_status(cheshire_cat.agent_key, None, source)
+        order.append(("parse", row["status"], row["phase"]))
         return [Document(page_content="x")], []
-
-    async def fake_store_documents(self, docs, source, file_hash=None, metadata=None, images=None, source_bytes=None):
-        return []
-
-    async def fake_processing(self, source):
-        order.append("processing")
 
     monkeypatch.setattr(cheshire_cat, "save_file", fake_save_file)
     monkeypatch.setattr(RabbitHole, "_parse_to_docs", fake_parse_to_docs)
-    monkeypatch.setattr(RabbitHole, "store_documents", fake_store_documents)
-    monkeypatch.setattr(RabbitHole, "_ingestion_processing", fake_processing)
 
-    rabbit_hole = RabbitHole()
-    rabbit_hole.cat = cheshire_cat
-    rabbit_hole.stray = None
-
-    await rabbit_hole.ingest_file(
+    await cheshire_cat.rabbit_hole.ingest_file(
         cat=cheshire_cat, file=BytesIO(b"hello world"), metadata={}, filename="hello.txt", content_type="text/plain",
     )
 
-    # processing fires after the file is persisted but before the parser runs
-    assert order == ["save_file", "processing", "parse"]
-
+    assert order == ["save_file", ("parse", "processing", "parsing_chunking")]

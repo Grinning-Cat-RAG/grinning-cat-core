@@ -18,6 +18,10 @@ class CustomForbiddenException(Exception):
     pass
 
 
+class CustomConflictException(Exception):
+    """The resource is busy (e.g. a source being ingested): retry later. HTTP 409."""
+
+
 class ManagementModeException(CustomNotFoundException):
     """Raised when the instance is in management mode (mgmt_message plugin):
     every route other than the plugin's own ones behaves as if it did not

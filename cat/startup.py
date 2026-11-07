@@ -11,6 +11,7 @@ from cat.db.database import get_async_db
 from cat.env import get_env
 from cat.env_check import ensure_valid_env, parse_allowed_origins
 from cat.exceptions import (
+    CustomConflictException,
     CustomForbiddenException,
     CustomNotFoundException,
     CustomUnauthorizedException,
@@ -182,6 +183,12 @@ def create_app() -> FastAPI:
     async def custom_forbidden_exception_handler(request, exc):
         log.error(exc)
         return JSONResponse(status_code=403, content={"detail": str(exc)})
+
+
+    @app.exception_handler(CustomConflictException)
+    async def custom_conflict_exception_handler(request, exc):
+        log.warning(exc)
+        return JSONResponse(status_code=409, content={"detail": str(exc)})
 
 
     @app.exception_handler(ManagementModeException)

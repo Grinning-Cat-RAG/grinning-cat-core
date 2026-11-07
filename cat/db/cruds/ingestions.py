@@ -4,7 +4,8 @@ A row lives at ``agents:<agent_id>:ingestion:agent:<sha256(source)>`` for the kn
 ``agents:<agent_id>:ingestion:chat:<chat_id>:<sha256(source)>`` for a source uploaded in a chat (``chat_id=None``
 means the knowledge base in every function). The row is a JSON document:
 
-- ``source``, ``chat_id``, ``type`` (``"file"`` or ``"url"``);
+- ``source``, ``chat_id``, ``type`` (``"file"`` or ``"url"``), ``content_type``, ``metadata`` (the custom metadata of
+  the upload, stored with every chunk);
 - ``status`` (see ``IngestionStatus``), ``phase`` (the phase running, if any), ``error`` (the reason of a failure);
 - ``owner`` (the worker processing the source), ``deleted_phases`` (the phases already removed by a deletion);
 - ``completed_phases``: the diary, ``{phase_id: entry}``, written when a phase ends;
@@ -31,8 +32,9 @@ ALL_SCOPES = object()
 
 SOURCE_TYPES = ("file", "url")
 
-_UPDATABLE_FIELDS = {"status", "phase", "error", "owner", "deleted_phases"}
-_PHASE_ID = re.compile(r"^[a-z][a-z0-9_]*$")
+_UPDATABLE_FIELDS = {"status", "phase", "error", "owner", "deleted_phases", "content_type"}
+#: The ids of the phases: lowercase letters, digits and underscores, starting with a letter.
+PHASE_ID = re.compile(r"^[a-z][a-z0-9_]*$")
 _SOURCE_ID = re.compile(r"^[0-9a-f]{64}$")
 _AGENT_SEGMENT = "agent"
 _CHAT_SEGMENT = "chat:"
@@ -83,7 +85,7 @@ def _glob_escaped(text: str) -> str:
 def _check_phase_ids(phase_ids: Iterable[str]) -> List[str]:
     phase_ids = list(phase_ids)
     for phase_id in phase_ids:
-        if not isinstance(phase_id, str) or not _PHASE_ID.match(phase_id):
+        if not isinstance(phase_id, str) or not PHASE_ID.match(phase_id):
             raise ValueError(f"Invalid phase id {phase_id!r}: lowercase letters, digits and underscores only")
     return phase_ids
 
@@ -113,7 +115,15 @@ def _unwrap(value: Any) -> Dict | None:
     return value
 
 
-async def create_status(agent_id: str, chat_id: str | None, source: str, *, type_: str) -> Dict:
+async def create_status(
+    agent_id: str,
+    chat_id: str | None,
+    source: str,
+    *,
+    type_: str,
+    content_type: str | None = None,
+    metadata: Dict | None = None,
+) -> Dict:
     """Start the lifecycle of a source: the row is written from scratch, ``uploaded``, with an empty diary."""
     if type_ not in SOURCE_TYPES:
         raise ValueError(f"Invalid source type {type_!r}: one of {SOURCE_TYPES}")
@@ -122,6 +132,8 @@ async def create_status(agent_id: str, chat_id: str | None, source: str, *, type
         "source": source,
         "chat_id": chat_id,
         "type": type_,
+        "content_type": content_type,
+        "metadata": metadata or {},
         "status": IngestionStatus.UPLOADED.value,
         "phase": None,
         "error": None,
@@ -158,7 +170,7 @@ async def _write_paths(key: str, values: Dict[str, Any], deletions: Iterable[str
 async def update_status(agent_id: str, chat_id: str | None, source: str, **fields: Any) -> bool:
     """Change some fields of the row (and its update time). False if the row does not exist: it is never created.
 
-    Fields: ``status`` (an ``IngestionStatus``), ``phase``, ``error``, ``owner``, ``deleted_phases``.
+    Fields: ``status`` (an ``IngestionStatus``), ``phase``, ``error``, ``owner``, ``deleted_phases``, ``content_type``.
     """
     unknown = set(fields) - _UPDATABLE_FIELDS
     if unknown:

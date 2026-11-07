@@ -103,8 +103,6 @@ def validate_env() -> EnvReport:
     # only warnings: existing data may be encrypted with the defaults, changing them would make it unreadable
     _check_required(report, "CAT_CRYPTO_KEY")
     _check_required(report, "CAT_CRYPTO_SALT")
-    if get_env("CAT_CRYPTO_KEY") == "grinning_cat" or get_env("CAT_CRYPTO_SALT") == "grinning_cat_salt":
-        report.warnings.append("CAT_CRYPTO_KEY / CAT_CRYPTO_SALT use the public defaults")
     if get_env("CAT_ADMIN_DEFAULT_PASSWORD") == "admin":
         report.warnings.append("CAT_ADMIN_DEFAULT_PASSWORD uses the public default 'admin'")
 

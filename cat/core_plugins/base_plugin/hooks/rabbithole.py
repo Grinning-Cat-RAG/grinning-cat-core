@@ -101,8 +101,9 @@ def before_rabbithole_stores_documents(docs: List[Document], cat) -> List[Docume
 def finalize_oversized_chunks(docs: List[Document], cat) -> List[Document]:
     """Hook to finalize the chunk list so no chunk exceeds the embedder's limit.
 
-    Fired by the core RabbitHole after chunking/splitting.
-    The no-op default returns the docs unchanged (upstream parity: no token-budget split).
+    Fired by the RabbitHole right before embedding the chunks (it depends on the embedder): in the ``embedding``
+    phase, so again at every re-embedding of the stored chunks (e.g. a change of the embedder), and in
+    ``store_documents``. The no-op default returns the docs unchanged (upstream parity: no token-budget split).
     """
     return docs
 
@@ -122,6 +123,24 @@ def after_rabbithole_stored_documents(source, stored_points: List[PointStruct], 
             Cheshire Cat instance.
     """
     pass
+
+
+@hook(priority=0)
+def rabbithole_ingestion_phases(phases: List, cat) -> List:
+    """Hook to add phases to the ingestion of the sources of the agent.
+
+    Each registrant appends its ``cat.rabbit_hole.phases.IngestionPhase`` subclasses (e.g. a phase extracting a graph
+    from the stored chunks, depending on ``embedding``) and returns the extended list: classes, not instances (the
+    hooks deep-copy what they pass along). The RabbitHole instantiates them without arguments for every run, runs them
+    after the phases they depend on, records them in the diary of each source and runs them again when their settings
+    (or the ones of a phase they depend on) change. The built-in phases (``parsing_chunking``, ``embedding``) win on a
+    duplicate id; a class with an invalid id is left out. No-op default: no phases added.
+
+    Args:
+        phases: List of IngestionPhase subclasses
+        cat: CheshireCat
+    """
+    return phases
 
 
 @hook(priority=0)
@@ -148,8 +167,9 @@ def rabbithole_stores_image_points(
 ) -> List[PointStruct]:
     """Hook to build the image points stored alongside a source's text chunks.
 
-    Fired by RabbitHole ``store_documents`` when the source produced images
-    (from the parse-time collection).
+    Fired by the RabbitHole when the source produced images (from the parse-time collection): in the ``embedding``
+    phase, with the images and the bytes of the source read back from the files kept for it (also at every
+    re-embedding), and in ``store_documents``.
     First arg ``image_points`` is the chain carrier: with no plugin the no-op
     returns it unchanged (upstream parity: no image points).
     """

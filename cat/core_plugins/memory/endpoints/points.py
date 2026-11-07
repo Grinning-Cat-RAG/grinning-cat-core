@@ -17,7 +17,8 @@ from cat.core_plugins.memory.routes_utils import (
     upsert_memory_point,
     verify_memory_point_existence,
 )
-from cat.exceptions import CustomValidationException
+from cat.exceptions import CustomConflictException, CustomValidationException
+from cat.rabbit_hole import DELETE_WAIT_SECONDS, SourceBusy
 from cat.routes.routes_utils import create_dict_parser
 from cat.services.memory.models import DocumentRecall, UpdateResult, Record, VectorMemoryType
 
@@ -235,19 +236,38 @@ async def delete_memory_points_by_metadata(
         ccat = info.cheshire_cat
         metadata = metadata or {}
 
+        # a filter on a whole source removes the source with its ingestion phases and state: a source of the knowledge
+        # base (declarative, no chat) or of a chat (episodic, with its chat); any other filter removes just the points
+        # it selects
+        whole_source = metadata.get("source") and (
+            (collection_id == str(VectorMemoryType.DECLARATIVE) and set(metadata) == {"source"})
+            or (collection_id == str(VectorMemoryType.EPISODIC) and set(metadata) == {"source", "chat_id"})
+        )
+        async def remove_files():
+            if source := metadata.get("source"):
+                # delete the file with path `metadata["source"]` from the file storage
+                ccat.file_manager.remove_file(os.path.join(ccat.agent_key, source))
+
+                # delete the file with path `metadata["source"]/metadata["chat_id"]` from the file storage
+                chat_id = metadata.get("chat_id")
+                if chat_id:
+                    ccat.file_manager.remove_file(os.path.join(ccat.agent_key, chat_id, source))
+
+        if whole_source:
+            # the files go holding the lock of the source, so a new upload of it cannot interleave; 409 while ingested
+            await ccat.lizard.rabbit_hole.delete_source(
+                ccat, metadata["source"], metadata.get("chat_id"), wait=DELETE_WAIT_SECONDS, before=remove_files,
+            )
+
         # delete points
         ret = await ccat.vector_memory_handler.delete_tenant_points(collection_id, metadata)
 
-        if source := metadata.get("source"):
-            # delete the file with path `metadata["source"]` from the file storage
-            ccat.file_manager.remove_file(os.path.join(ccat.agent_key, source))
-
-            # delete the file with path `metadata["source"]/metadata["chat_id"]` from the file storage
-            chat_id = metadata.get("chat_id")
-            if chat_id:
-                ccat.file_manager.remove_file(os.path.join(ccat.agent_key, chat_id, source))
+        if not whole_source:
+            await remove_files()
 
         return DeleteMemoryPointsByMetadataResponse(deleted=ret)
+    except SourceBusy:
+        raise CustomConflictException(f"The source {metadata['source']} is being ingested: retry later")
     except Exception as e:
         raise CustomValidationException(f"Failed to delete memory points: {e}")
 

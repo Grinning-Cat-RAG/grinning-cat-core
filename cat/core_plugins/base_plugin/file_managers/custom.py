@@ -107,6 +107,13 @@ class LocalFileManager(BaseFileManager):
             ))
         return files
 
+    def _walk_files(self, remote_root_dir: str) -> List[FileResponse]:
+        # the listing covers one folder only: walk the subfolders too
+        files = []
+        for root, _, names in os.walk(remote_root_dir):
+            files.extend(file for file in self._list_files(root) if file.name in names)
+        return files
+
     def file_exists(self, filename: str, remote_root_dir: str | None = None) -> bool:
         # the same paths as the base class, without listing (and hashing) the whole folder
         if remote_root_dir is None:

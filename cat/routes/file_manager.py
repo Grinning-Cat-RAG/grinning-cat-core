@@ -7,7 +7,9 @@ from starlette.responses import StreamingResponse
 
 from cat.auth.connection import AuthorizedInfo
 from cat.auth.permissions import AuthPermission, AuthResource, check_permissions
-from cat.exceptions import CustomNotFoundException, CustomValidationException
+from cat.db.cruds import ingestions as crud_ingestions
+from cat.exceptions import CustomConflictException, CustomNotFoundException, CustomValidationException
+from cat.rabbit_hole import DELETE_WAIT_SECONDS, SourceBusy
 from cat.routes.routes_utils import (
     GetSettingResponse,
     GetSettingsResponse,
@@ -143,43 +145,41 @@ async def download_file(
     )
 
 
+async def _delete_source(info: AuthorizedInfo, path: str, name: str) -> bool:
+    """Delete a source of the scope (the agent knowledge base, or the chat of the request) holding its lock: the
+    uploaded file, then (the plugins notified) what its ingestion phases produced, its points among them, and its state.
+    Returns whether the file was removed. ``SourceBusy`` when its ingestion is still running after the wait."""
+    ccat = info.cheshire_cat
+    scope = path.split(os.sep, 1)[1] if os.sep in path else "agent"
+
+    async def remove_file() -> bool:
+        removed = ccat.file_manager.remove_file(os.path.join(path, name))
+        # the file is gone from storage: notify the plugins BEFORE the memory points are deleted
+        await ccat.plugin_manager.execute_hook("before_file_manager_file_delete", name, str(scope), caller=ccat)
+        return removed
+
+    removed = await info.lizard.rabbit_hole.delete_source(
+        ccat, name, info.stray_cat.id if info.stray_cat else None, wait=DELETE_WAIT_SECONDS, before=remove_file,
+    )
+    # the file is gone: notify the plugins
+    await ccat.plugin_manager.execute_hook("after_file_manager_file_deleted", name, str(scope), caller=ccat)
+    return removed
+
+
 @router.delete("/files/{source_name:path}")
 async def delete_file(
     source_name: str,
     info: AuthorizedInfo = check_permissions(AuthResource.MEMORY, AuthPermission.DELETE),
 ) -> FileManagerDeletedFiles:
-    """Delete a file"""
-    path, collection_id, metadata = get_from_info(info)
-    metadata = {"source": source_name} | metadata
+    """Delete a file, with the source ingested from it. 409 while the source is being ingested."""
+    path, _, _ = get_from_info(info)
 
     sanitized_source = sanitize_source_name(source_name, path=path)
 
     try:
-        # delete the file from the file storage
-        res = info.cheshire_cat.file_manager.remove_file(os.path.join(path, sanitized_source))
-
-        # the file is gone from storage: notify the plugins BEFORE the memory
-        # points are deleted
-        chat_or_agent = path.split(os.sep, 1)[1] if os.sep in path else "agent"
-        await info.cheshire_cat.plugin_manager.execute_hook(
-            "before_file_manager_file_delete",
-            sanitized_source,
-            str(chat_or_agent),
-            caller=info.cheshire_cat,
-        )
-
-        # delete points
-        await info.cheshire_cat.vector_memory_handler.delete_tenant_points(str(collection_id), metadata)  # type: ignore[arg-type]
-
-        # the file is gone: notify the plugins
-        await info.cheshire_cat.plugin_manager.execute_hook(
-            "after_file_manager_file_deleted",
-            sanitized_source,
-            str(chat_or_agent),
-            caller=info.cheshire_cat,
-        )
-
-        return FileManagerDeletedFiles(deleted=res)
+        return FileManagerDeletedFiles(deleted=await _delete_source(info, path, sanitized_source))
+    except SourceBusy:
+        raise CustomConflictException(f"The source {sanitized_source} is being ingested: retry later")
     except Exception as e:
         raise CustomValidationException(f"Failed to delete memory points: {e}")
 
@@ -188,31 +188,31 @@ async def delete_file(
 async def delete_files(
     info: AuthorizedInfo = check_permissions(AuthResource.MEMORY, AuthPermission.DELETE),
 ) -> FileManagerDeletedFiles:
-    """Delete all files"""
-    path, collection_id, metadata = get_from_info(info)
+    """Delete every source of the scope (the agent knowledge base, or the chat of the request): its files and URLs,
+    with what they produced. The sources being ingested are left; then 409 tells which ones."""
+    path, _, _ = get_from_info(info)
+    ccat = info.cheshire_cat
+    chat_id = info.stray_cat.id if info.stray_cat else None
 
     try:
-        file_manager = info.cheshire_cat.file_manager
-        # get the list of files
-        files = file_manager.list_files(path)
+        # the sources with a state, and the files listed in the scope (sources ingested before the states existed)
+        names = [row["source"] for row in await crud_ingestions.list_statuses(ccat.agent_key, chat_id)]
+        names += [file.name for file in ccat.file_manager.list_files(path) if file.name not in names]
 
-        # delete all the files from the file storage
-        res = file_manager.remove_folder(path)
+        busy = []
+        for name in names:
+            try:
+                await _delete_source(info, path, name)
+            except SourceBusy:
+                busy.append(name)
 
-        # delete points
-        for file in files:
-            metadata |= {"source": file.name}
-            await info.cheshire_cat.vector_memory_handler.delete_tenant_points(str(collection_id), metadata)  # type: ignore[arg-type]
-
-            # notify the plugins that the file is gone
-            chat_or_agent = path.split(os.sep, 1)[1] if os.sep in path else "agent"
-            await info.cheshire_cat.plugin_manager.execute_hook(
-                "after_file_manager_file_deleted",
-                file.name,
-                str(chat_or_agent),
-                caller=info.cheshire_cat,
-            )
-
-        return FileManagerDeletedFiles(deleted=res)
+        # a chat folder holds the chat only: remove what is left; the agent folder holds the chats too
+        if chat_id is not None and not busy:
+            ccat.file_manager.remove_folder(path)
     except Exception as e:
         raise CustomValidationException(f"Failed to delete memory points: {e}")
+
+    if busy:
+        raise CustomConflictException(f"Sources being ingested, not deleted (retry later): {', '.join(busy)}")
+    return FileManagerDeletedFiles(deleted=True)
+

@@ -11,11 +11,15 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from io import BytesIO
-from typing import Dict, List, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Tuple
 
 from httpx import AsyncClient
 from langchain_core.documents.base import Blob, Document
 
+from cat.db.cruds import ingestions as crud_ingestions
+from cat.db.cruds.ingestions import IngestionStatus
+from cat.rabbit_hole import chunks, engine
+from cat.rabbit_hole.phases import PHASE_EMBEDDING, IngestionSource, PhaseResult
 from cat.services.factory.embedder import embedding_size
 from cat.core_plugins.base_plugin.parsers import MimeTypeBasedParser
 from cat.env import get_env_int
@@ -24,7 +28,7 @@ from cat.services.factory.chunker import BaseChunker
 from cat.services.memory.models import PointStruct, VectorMemoryType
 from cat.utils import is_url as fnc_is_url
 
-# Process-wide semaphore bounding concurrent ``ingest_file`` executions.
+# Process-wide semaphore bounding the parsing and embedding phases running at the same time.
 # Created lazily on first use; the size is read at runtime from
 # ``CAT_INGESTION_MAX_CONCURRENCY`` (``None`` or ``<= 0`` means unlimited).
 _ingestion_semaphore: asyncio.Semaphore | None = None
@@ -100,6 +104,24 @@ async def run_in_ingestion_executor(func, *args, **kwargs):
     )
 
 
+#: Seconds an HTTP deletion waits for an ingestion of the same source to end, before answering 409 (retry later)
+DELETE_WAIT_SECONDS = 5
+
+
+class SourceBusy(Exception):
+    """The source is being processed (e.g. ingested) by a worker: retry later."""
+
+
+def _sanitize_filename(file_name: str) -> str:
+    """The name of an uploaded file as a source: dots and spaces of the base name become underscores."""
+    if "." not in file_name:
+        return file_name
+    # Split on the LAST dot only (if any)
+    base, ext = file_name.rsplit(".", 1)
+    # Replace any sequence of dots or spaces in the base name only
+    return re.sub(r"[.\s]+", "_", base) + "." + ext
+
+
 @asynccontextmanager
 async def _ingestion_guard(semaphore: asyncio.Semaphore | None):
     """Async context manager bounding a body to ``semaphore``; no-op when unlimited.
@@ -142,7 +164,8 @@ class RabbitHole:
         """Upload memories to the declarative memory from a JSON file (see ``_ingest_memory``).
 
         The rabbit hole of the instance serves every agent at the same time: every ingestion runs on a copy of its own,
-        which keeps the cat (and the chat) of that ingestion only.
+        which keeps the cat (and the chat) of that ingestion only. A memory file is not a source: it has no ingestion
+        state.
         """
         return await copy.copy(self)._ingest_memory(cat, file, filename)
 
@@ -152,39 +175,24 @@ class RabbitHole:
             return self.cat
         return self.stray or self.cat
 
-    # Ingestion states. The states of an ingestion belong to the RabbitHole, not to the plugins: these helpers mark
-    # the points of the lifecycle where the stateful ingestion records them.
+    def _collection(self, chat_id: str | None) -> str:
+        return str(VectorMemoryType.DECLARATIVE if chat_id is None else VectorMemoryType.EPISODIC)
 
-    async def _ingestion_start(self, source: str, metadata: Dict, is_url: bool):
-        """The ingestion of ``source`` starts: the source is known, nothing is downloaded, parsed or stored yet."""
-        # TODO stateful ingestion: record the ``uploaded`` state
+    @staticmethod
+    def _source_filter(source: IngestionSource) -> Dict:
+        return {"source": source.name} | ({"chat_id": source.chat_id} if source.chat_id is not None else {})
 
     async def _ingestion_url_downloading(self, url: str):
         """The download of ``url`` is about to start."""
-        # TODO stateful ingestion: record the ``downloading`` state
+        await crud_ingestions.update_status(
+            self.cat.agent_key, self.stray.id if self.stray else None, url, status=IngestionStatus.DOWNLOADING,
+        )
 
     async def _ingestion_url_downloaded(self, url: str):
         """The download of ``url`` completed successfully."""
-        # TODO stateful ingestion: record the ``downloaded`` state
-
-    async def _ingestion_processing(self, source: str):
-        """The source is persisted and its parse -> embed -> store body is about to start."""
-        # TODO stateful ingestion: record the ``processing`` state
-
-    async def _ingestion_processing_heartbeat_start(self, source: str):
-        """Keep the ``processing`` state of ``source`` fresh while its body runs.
-
-        The state is scoped by the chat of the ingestion (``self.stray.id``, ``"agent"`` without a chat).
-        """
-        # TODO backport the ingestion processing heartbeat start from the efficient ingestion
-
-    async def _ingestion_processing_heartbeat_stop(self, source: str):
-        """Stop the heartbeat of ``source``; called once at the end of every ingestion, whatever the outcome."""
-        # TODO backport the ingestion processing heartbeat stop from the efficient ingestion
-
-    async def _ingestion_error(self, source: str, error: str):
-        """The ingestion of ``source`` failed with ``error``."""
-        # TODO stateful ingestion: record the ``error`` state
+        await crud_ingestions.update_status(
+            self.cat.agent_key, self.stray.id if self.stray else None, url, status=IngestionStatus.DOWNLOADED,
+        )
 
     async def _ingest_memory(self, cat: "CheshireCat", file: BytesIO, filename: str):  # type: ignore[name-defined]
         """Upload memories to the declarative memory from a JSON file.
@@ -205,8 +213,6 @@ class RabbitHole:
         try:
             await self.setup(cat)
             lizard = self.cat.lizard
-
-            await self._ingestion_start(filename, {}, False)
 
             # Load fyle byte in a dict
             memories = json.loads(file.read().decode("utf-8"))
@@ -246,7 +252,6 @@ class RabbitHole:
             )
         except Exception as e:
             log.error(f"Error uploading memories from file '{filename}': {e}")
-            await self._ingestion_error(filename, str(e))
 
     async def ingest_file(
         self,
@@ -256,7 +261,7 @@ class RabbitHole:
         filename: str | None = None,
         store_file: bool = True,
         content_type: str | None = None,
-    ):
+    ) -> Dict | None:
         """Load a file in the Cat's memory (see ``_ingest_file``).
 
         The rabbit hole of the instance serves every agent at the same time: every ingestion runs on a copy of its own,
@@ -272,12 +277,16 @@ class RabbitHole:
         filename: str | None = None,
         store_file: bool = True,
         content_type: str | None = None,
-    ):
+    ) -> Dict | None:
         """
-        Load a file in the Cat's declarative memory.
+        Load a file in the Cat's memory: in the declarative memory, or in the episodic memory of the chat when ``cat`` is
+        a StrayCat.
 
-        The method splits and converts the file in Langchain `Document`. Then, it stores the `Document` in the Cat's
-        memory.
+        The source gets a row in the registry of the ingestion states (``cat.db.cruds.ingestions``) and goes through
+        its phases (``cat.rabbit_hole.phases``), holding the lock of the source: ``uploaded`` (``downloading`` and
+        ``downloaded`` for a URL), then ``processing``, then ``completed`` or ``error``. A new upload of the same source
+        starts its lifecycle again. The call returns when the source is done; errors are not raised (the ingestion runs
+        in background tasks): they are logged, notified to the chat and written in the row.
 
         Args:
             cat (CheshireCat | StrayCat): Cheshire Cat or Stray Cat instance.
@@ -287,93 +296,247 @@ class RabbitHole:
             store_file (bool): Whether to store the file in the Cat's file storage.
             content_type (str): The content type of the file. If not provided, it will be guessed based on the file extension.
 
+        Returns:
+            The final row of the source (None if it could not even be named).
+
         See Also:
             before_rabbithole_stores_documents
         """
-        source = ""
-        points = []
-
+        row = None
+        source = None
         try:
             await self.setup(cat)
 
             filename = filename or (file if isinstance(file, str) else None)
             if not filename:
                 raise ValueError("No filename provided.")
+            if not isinstance(file, (str, BytesIO)):
+                raise ValueError(f"{type(file)} is not a valid type.")
+            is_url = isinstance(file, str) and fnc_is_url(file)
+            name = file if is_url else _sanitize_filename(filename if isinstance(file, BytesIO) else os.path.basename(file))
+            source = IngestionSource(
+                self.cat.agent_key, self.stray.id if self.stray else None, name, "url" if is_url else "file",
+            )
 
-            # the source is the filename (for URLs the filename IS the URL), known before the file is downloaded/parsed
-            await self._ingestion_start(filename, metadata, filename.startswith("http"))
-
-            # bound the heavy ingestion body (parse -> embed -> store -> notify)
-            # to CAT_INGESTION_MAX_CONCURRENCY process-wide; None/<=0 = unlimited.
-            # setup() and the start state above run unconstrained, so a queued
-            # ingestion is visible as started.
-            async with _ingestion_guard(_get_ingestion_semaphore()):
-                # resolve the source bytes BEFORE parsing so the file can be
-                # persisted to the file manager first: a container restart during
-                # a long parse no longer loses the uploaded file.
-                source, file_bytes, content_type, is_url = await self._resolve_source_bytes(
-                    file=file, filename=filename, content_type=content_type
+            async with engine.source_lock(source):
+                # a new upload starts the lifecycle of the source again (empty diary: every phase runs)
+                await crud_ingestions.create_status(
+                    source.agent_id, source.chat_id, name, type_=source.type, metadata=metadata or {},
+                    content_type=content_type,
                 )
-                if not file_bytes:
-                    raise ValueError(f"Something went wrong with the source '{source}'")
-                assert source is not None, "Source should not be None after resolving source bytes"
-
-                # store the file bytes in the agent's persistent storage as early as
-                # possible, so the bytes survive a container restart even if
-                # processing/embedding is interrupted. LocalFileManager
-                # overwrites an existing destination, so this is idempotent.
-                if store_file and not is_url:
-                    chat_id = self.stray.id if self.stray else None
-                    await self.cat.save_file(file_bytes, content_type, source, chat_id)
-
-                # the worker has picked the file up (persisted to disk), before the potentially long parse/embed body
-                await self._ingestion_processing(source)
-
-                # keep the processing state fresh while the body runs, so a long
-                # parse is not re-claimed as stale by another worker
-                await self._ingestion_processing_heartbeat_start(source)
-
-                # split a file into a list of docs
-                docs, images = await self._parse_to_docs(source, file_bytes, content_type)
-
-                if not docs:
-                    raise Exception(f"No valid chunks found in the file '{filename}'.")
-
-                # store in memory
-                sha256 = hashlib.sha256()
-                sha256.update(file_bytes)
-                points = await self.store_documents(
-                    docs=docs,
-                    source=source,
-                    file_hash=sha256.hexdigest(),
-                    metadata=metadata,
-                    images=images,
-                    source_bytes=file_bytes,
-                )
-
-                # notify client
-                images_info = f" and {len(images)} images" if images else ""
-                await self._send_notification_message(
-                    f"Finished reading {source}, I made {len(docs)} thoughts{images_info} on it."
-                )
-
-                log.info(f"Agent id: {self.cat.agent_key}. Successfully ingested file: {filename}")
+                try:
+                    _, file_bytes, content_type, _ = await self._resolve_source_bytes(
+                        file=file, filename=filename, content_type=content_type
+                    )
+                    await self._check_still_wanted(source)  # e.g. the chat was deleted during the download
+                    if not file_bytes:
+                        raise ValueError(f"Something went wrong with the source '{name}'")
+                    await self._keep_source_bytes(source, file_bytes, content_type, store_file)
+                    if not await self._is_still_wanted(source):
+                        await self._drop_kept_bytes(source, store_file)
+                        raise engine.IngestionCanceled(name)
+                    self._pending = (name, file_bytes)  # the first parse reads the bytes from memory
+                    row = await engine.run_phases(self, self.cat, source)
+                except (engine.IngestionCanceled, engine.LockLost):
+                    raise
+                except Exception as e:
+                    await crud_ingestions.update_status(
+                        source.agent_id, source.chat_id, name,
+                        status=IngestionStatus.ERROR, phase=None, owner=None, error=str(e),
+                    )
+                    raise
+        except engine.IngestionCanceled:
+            log.warning(f"Ingestion of {filename} stopped: the source was deleted meanwhile")
+            return None
+        except engine.LockLost:
+            # another worker may own the source now: it notifies the outcome
+            log.warning(f"Ingestion of {filename} stopped: the lock of the source was lost")
+            return await crud_ingestions.get_status(source.agent_id, source.chat_id, source.name)
         except Exception as e:
             log.error(f"Error ingesting file {filename}: {e}")
-            # Don't raise in background tasks - just log the error
-            if self.stray:
-                try:
-                    await self.stray.notifier.send_error(f"Error processing {filename}: {str(e)}")
-                except Exception as notify_error:
-                    log.error(f"Failed to send error notification: {notify_error}")
-            await self._ingestion_error(str(source or filename), str(e))
+            await self._notify_error(filename, str(e))
+            await self._stored_points_hook(source.name if source else filename, [])
+            return await crud_ingestions.get_status(source.agent_id, source.chat_id, source.name) if source else None
         finally:
-            # stop the heartbeat so no orphan task keeps refreshing the processing state
-            await self._ingestion_processing_heartbeat_stop(str(source or filename))
-            # hook the points after they are stored in the vector memory
-            await self.cat.plugin_manager.execute_hook(
-                "after_rabbithole_stored_documents", source or filename, points, caller=self._resolve_caller(False),
+            self._pending = None
+            self._pending_chunks = None
+
+        if row and row["status"] == IngestionStatus.COMPLETED.value:
+            embedding = row["completed_phases"].get(PHASE_EMBEDDING) or {}
+            await self._send_notification_message(
+                f"Finished reading {source.name}, I made {embedding.get('processed') or 0} thoughts on it."
             )
+            log.info(f"Agent id: {self.cat.agent_key}. Successfully ingested file: {filename}")
+        elif row:
+            await self._notify_error(filename, row.get("error") or "ingestion failed")
+            if (row["completed_phases"].get(PHASE_EMBEDDING) or {}).get("state") != engine.STATE_COMPLETE:
+                # the embedding notifies the stored points; a failure before it notifies none, once
+                await self._stored_points_hook(source.name, [])
+        return row
+
+    async def delete_source(
+        self,
+        cat: "CheshireCat",  # type: ignore[name-defined]
+        name: str,
+        chat_id: str | None = None,
+        wait: float | None = None,
+        before: Callable[[], Awaitable[Any]] | None = None,
+    ) -> Any:
+        """Remove a source from the memory of the agent (``chat_id=None``: its knowledge base) or of a chat: what every
+        ingestion phase produced for it (its points among them), the files the RabbitHole kept for it and its state.
+
+        It waits for a running ingestion of the source to end: as long as needed, or ``wait`` seconds, then raises
+        ``SourceBusy`` without touching anything. ``before`` runs holding the lock, before the phases are removed
+        (e.g. a route removing the uploaded file, which is not removed here); its result is returned."""
+        rabbit_hole = copy.copy(self)
+        await rabbit_hole.setup(cat)
+        source = IngestionSource(rabbit_hole.cat.agent_key, chat_id, name, "url" if fnc_is_url(name) else "file")
+        try:
+            async with engine.source_lock(source, wait=wait):
+                result = await before() if before is not None else None
+                await engine.delete_source(rabbit_hole, rabbit_hole.cat, source)
+                return result
+        except engine.LockError as e:
+            raise SourceBusy(name) from e
+
+    async def _is_still_wanted(self, source: IngestionSource) -> bool:
+        """Whether the source is still to be ingested: its agent and its row exist (a deleted chat removes its rows)."""
+        return await engine.agent_exists(source.agent_id) and await crud_ingestions.get_status(
+            source.agent_id, source.chat_id, source.name,
+        ) is not None
+
+    async def _check_still_wanted(self, source: IngestionSource):
+        if not await self._is_still_wanted(source):
+            raise engine.IngestionCanceled(source.name)
+
+    async def _keep_source_bytes(self, source: IngestionSource, file_bytes: bytes, content_type: str | None, store_file: bool):
+        """Keep the bytes of the source before processing it, so that a restart resumes it: a file among the uploaded
+        files (``store_file``, or a file already there), a URL in the files of the RabbitHole. A file the caller does
+        not store is not kept: this run reads it from memory, a later one needing its bytes fails."""
+        await crud_ingestions.update_status(source.agent_id, source.chat_id, source.name, content_type=content_type)
+        file_manager = self.cat.file_manager
+        folder = chunks.owner_folder(source.agent_id, source.chat_id)
+        if source.type == "file":
+            if store_file:
+                await self.cat.save_file(file_bytes, content_type, source.name, source.chat_id)
+            if not store_file or await asyncio.to_thread(file_manager.file_exists, source.name, folder):
+                return
+        await asyncio.to_thread(
+            chunks.write_source_bytes, file_manager, source.agent_id, source.chat_id, source.name, file_bytes,
+        )
+
+    async def _drop_kept_bytes(self, source: IngestionSource, store_file: bool):
+        """Remove the bytes kept for a source whose ingestion was canceled before its phases."""
+        file_manager = self.cat.file_manager
+        await asyncio.to_thread(chunks.delete_all, file_manager, source.agent_id, source.chat_id, source.name)
+        if store_file and source.type == "file":
+            await asyncio.to_thread(
+                file_manager.remove_file, os.path.join(chunks.owner_folder(source.agent_id, source.chat_id), source.name),
+            )
+
+    async def _notify_error(self, filename: str, error: str):
+        # Don't raise in background tasks - just tell the chat
+        if self.stray:
+            try:
+                await self.stray.notifier.send_error(f"Error processing {filename}: {error}")
+            except Exception as notify_error:
+                log.error(f"Failed to send error notification: {notify_error}")
+
+    async def _stored_points_hook(self, source: str, points: List[PointStruct]):
+        await self.cat.plugin_manager.execute_hook(
+            "after_rabbithole_stored_documents", source, points, caller=self._resolve_caller(False),
+        )
+
+    async def run_parsing_chunking(self, source: IngestionSource, cat) -> PhaseResult:
+        """The ``parsing_chunking`` phase: parse the source, collect its images, split it in chunks and store them.
+
+        The heavy body is bounded to CAT_INGESTION_MAX_CONCURRENCY process-wide (with the embedding), whatever runs the
+        phase: an upload, a resume, a change of settings."""
+        async with _ingestion_guard(_get_ingestion_semaphore()):
+            return await self._parsing_chunking(source)
+
+    async def _parsing_chunking(self, source: IngestionSource) -> PhaseResult:
+        file_manager = self.cat.file_manager
+        pending = getattr(self, "_pending", None)
+        if pending and pending[0] == source.name:
+            file_bytes = pending[1]
+        else:
+            file_bytes = await asyncio.to_thread(
+                chunks.read_source_bytes, file_manager, source.agent_id, source.chat_id, source.name,
+            )
+        if file_bytes is None:
+            return PhaseResult(
+                status="error", reason=f"The source {source.name} was not kept: upload it again to process it",
+            )
+
+        row = await crud_ingestions.get_status(source.agent_id, source.chat_id, source.name) or {}
+        content_type = row.get("content_type") or mimetypes.guess_type(source.name)[0]
+        docs, images = await self._parse_to_docs(source.name, file_bytes, content_type)
+        if not docs:
+            return PhaseResult(status="error", reason=f"No valid chunks found in the file '{source.name}'.")
+
+        docs = await self._prepare_documents(
+            docs, source.name, hashlib.sha256(file_bytes).hexdigest(), row.get("metadata") or {}, source.chat_id,
+        )
+        await asyncio.to_thread(chunks.delete_all, file_manager, source.agent_id, source.chat_id, source.name, True)
+        await asyncio.to_thread(
+            chunks.write_chunks, file_manager, source.agent_id, source.chat_id, source.name, docs, images,
+        )
+        # the embedding of this run reads them from memory: a file manager may not keep files (e.g. the dummy one)
+        self._pending_chunks = (source.name, docs, images, file_bytes)
+        return PhaseResult(status="done", processed=len(docs))
+
+    async def delete_parsing_chunking(self, source: IngestionSource, cat) -> None:
+        await asyncio.to_thread(chunks.delete_all, self.cat.file_manager, source.agent_id, source.chat_id, source.name)
+
+    async def run_embedding(self, source: IngestionSource, cat) -> PhaseResult:
+        """The ``embedding`` phase: embed the stored chunks and replace the points of the source with the new ones
+        (bounded to CAT_INGESTION_MAX_CONCURRENCY, as the parsing)."""
+        async with _ingestion_guard(_get_ingestion_semaphore()):
+            return await self._embedding(source)
+
+    async def _embedding(self, source: IngestionSource) -> PhaseResult:
+        file_manager = self.cat.file_manager
+        pending = getattr(self, "_pending_chunks", None)
+        if pending and pending[0] == source.name:
+            _, docs, images, source_bytes = pending
+        else:
+            try:
+                docs, images = await asyncio.to_thread(
+                    chunks.read_chunks, file_manager, source.agent_id, source.chat_id, source.name,
+                )
+            except FileNotFoundError as e:
+                return PhaseResult(status="error", reason=str(e))
+            source_bytes = None
+            if images:
+                source_bytes = await asyncio.to_thread(
+                    chunks.read_source_bytes, file_manager, source.agent_id, source.chat_id, source.name,
+                )
+        row = await crud_ingestions.get_status(source.agent_id, source.chat_id, source.name) or {}
+        file_hash = next((d.metadata.get("hash") for d in docs if d.metadata.get("hash")), None)
+        points = await self._embed_documents(
+            docs, source.name, row.get("metadata") or {}, file_hash, images, source_bytes, source.chat_id,
+        )
+        if not points:
+            return PhaseResult(status="error", reason=f"Nothing to embed in the source '{source.name}'.")
+
+        # replace the points of the source: the new ones first, then the old ones go (no moment without the source)
+        collection = self._collection(source.chat_id)
+        handler = self.cat.vector_memory_handler
+        old, _ = await handler.get_all_tenant_points(collection, metadata=self._source_filter(source), with_vectors=False)
+        await handler.add_points_to_tenant(collection_name=collection, points=points)
+        new_ids = {p.id for p in points}
+        old_ids = [p.id for p in old or [] if p.id not in new_ids]
+        if old_ids:
+            await handler.delete_tenant_points_by_ids(collection, old_ids)
+
+        await self._stored_points_hook(source.name, points)
+        return PhaseResult(status="done", processed=len(points))
+
+    async def delete_embedding(self, source: IngestionSource, cat) -> None:
+        await self.cat.vector_memory_handler.delete_tenant_points(
+            self._collection(source.chat_id), self._source_filter(source),
+        )
 
     async def _resolve_source_bytes(
         self, file: str | BytesIO, filename: str, content_type: str | None
@@ -399,19 +562,9 @@ class RabbitHole:
         if not isinstance(file, BytesIO) and not isinstance(file, str):
             raise ValueError(f"{type(file)} is not a valid type.")
 
-        def sanitize_filename(file_name: str) -> str:
-            if "." not in file_name:
-                return file_name
-            # Split on the LAST dot only (if any)
-            base, ext = file_name.rsplit(".", 1)
-            ext = "." + ext
-            # Replace any sequence of dots or spaces in the base name only
-            base = re.sub(r"[.\s]+", "_", base)
-            return base + ext
-
         if isinstance(file, BytesIO):
             # Get the source of UploadFile, file bytes and whether it's a URL
-            return sanitize_filename(filename), file.read(), content_type, False
+            return _sanitize_filename(filename), file.read(), content_type, False
         if fnc_is_url(file):
             try:
                 await self._ingestion_url_downloading(file)
@@ -433,7 +586,7 @@ class RabbitHole:
                 return None, None, content_type, True
         # Get file bytes - use async file reading
         fb = await asyncio.to_thread(lambda: open(file, "rb").read())  # type: ignore[union-attr]
-        return sanitize_filename(os.path.basename(file)), fb, mimetypes.guess_type(file)[0], False  # type: ignore[return-value]
+        return _sanitize_filename(os.path.basename(file)), fb, mimetypes.guess_type(file)[0], False  # type: ignore[return-value]
 
     async def _parse_to_docs(
         self, source: str, file_bytes: bytes, content_type: str | None
@@ -488,59 +641,13 @@ class RabbitHole:
         docs = await self._split_text(docs=super_docs)
         return docs, images
 
-    async def store_documents(
-        self,
-        docs: List[Document],
-        source: str,
-        file_hash: str | None = None,
-        metadata: Dict | None = None,
-        images: List[Dict] | None = None,
-        source_bytes: bytes | None = None,
-    ) -> List[PointStruct]:
-        """Add documents to the Cat's declarative memory.
-
-        This method loops a list of Langchain `Document` and adds some metadata. Namely, the source filename and the
-        timestamp of insertion. Once done, the method notifies the client via Websocket connection.
-
-        If a multimodal embedder is active and the multimodal parsers extracted some images, this method also embeds
-        the images via ``embed_images``, saves them as files in the agent/chat storage via ``save_file`` and stores
-        them in the same collection, keeping the file name in the point metadata (``image_file``, no base64 payload).
-
-        Args:
-            docs (List[Document]): List of Langchain `Document` to be inserted in the Cat's declarative memory.
-            source (str): Source name to be added as a metadata. It can be a file name or an URL.
-            file_hash (str | None): Optional hash of the source to be added as a metadata.
-            metadata (Dict | None): Optional metadata to be stored with each chunk.
-            images (List[Dict] | None): Optional images extracted by multimodal parsers. Each entry has
-                ``image_base64``, ``image_bytes`` and ``image_mime_type`` keys. The images are embedded and saved
-                as files via ``save_file``; the point metadata only keeps the file name in ``image_file``.
-            source_bytes (bytes | None): Optional raw bytes of the ingested source file. Used when the source
-                itself is an image: the file is embedded as a single whole-image point instead of the parser
-                sub-crops, and no derived file is created.
-
-        Returns:
-            stored_points (List[PointStruct]): List of points stored in the Cat's declarative memory
-                (text chunks and, if any, image points).
-
-        See Also:
-            before_rabbithole_stores_documents
-            after_rabbithole_stored_documents
-
-        Notes
-        -------
-        At this point, it is possible to customize the Cat's behavior using the `before_rabbithole_stores_documents`
-        hook to edit the memories before they are inserted in the vector database.
-        The hook `after_rabbithole_stored_documents` could be used to track the end of the process, indeed.
-        """
-        log.info(f"Agent id: {self.cat.agent_key}. Preparing to memorize {len(docs)} vectors for {source}.")
-
-        embedder = await self.cat.lizard.embedder()
-        plugin_manager = self.cat.plugin_manager
-
-        # `metadata` is documented as optional: normalize it before the dict merge below
-        metadata = metadata or {}
-
-        # add custom metadata (sent via endpoint) and default metadata (source and when and eventual chat_id)
+    async def _prepare_documents(
+        self, docs: List[Document], source: str, file_hash: str | None, metadata: Dict, chat_id: str | None,
+    ) -> List[Document]:
+        """Add the metadata to the chunks (the custom ones, then source, when, hash and the chat) and pass them to the
+        ``before_rabbithole_stores_documents`` hook, once per ingestion of the source. ``when`` is the same for every
+        chunk of the ingestion."""
+        when = time.time()
         for doc in docs:
             # Drop the transient parser image payload, if any: images are embedded and
             # saved as files separately, so their content must never reach the vector
@@ -550,20 +657,45 @@ class RabbitHole:
             doc.metadata = (
                     doc.metadata
                     | metadata
-                    | {"source": source, "when": time.time(), "hash": file_hash}
-                    | ({"chat_id": self.stray.id} if self.stray else {})
+                    | {"source": source, "when": when, "hash": file_hash}
+                    | ({"chat_id": chat_id} if chat_id is not None else {})
             )
 
         # hook the docs before they are stored in the vector memory
-        docs = await plugin_manager.execute_hook(
+        return await self.cat.plugin_manager.execute_hook(
             "before_rabbithole_stores_documents", docs, caller=self._resolve_caller(False),
         )
+
+    async def _embed_documents(
+        self,
+        docs: List[Document],
+        source: str,
+        metadata: Dict,
+        file_hash: str | None,
+        images: List[Dict] | None,
+        source_bytes: bytes | None,
+        chat_id: str | None,
+    ) -> List[PointStruct]:
+        """The points of the chunks (and of the images, built by the plugins), embedded with the active embedder."""
+        plugin_manager = self.cat.plugin_manager
+
+        # Finalize the document list so no chunk exceeds the active embedder's max_input_tokens, right before the
+        # embedding (it depends on the embedder): the actual split is owned by a plugin through the
+        # finalize_oversized_chunks hook; the default no-op preserves the upstream behavior (no token-budget split).
+        try:
+            docs = await plugin_manager.execute_hook("finalize_oversized_chunks", docs, caller=self._resolve_caller(True))
+        except Exception as e:
+            # Log error but don't fail the entire process
+            log.warning(f"Failed to finalize oversized chunks: {e}. Proceeding with original chunks.")
+
+        log.info(f"Agent id: {self.cat.agent_key}. Preparing to memorize {len(docs)} vectors for {source}.")
+        embedder = await self.cat.lizard.embedder()
 
         # embed the non-empty docs, 1:1 with the stored points
         valid_documents = list(filter(lambda doc_: doc_.page_content.strip(), docs))
         storing_vectors = await run_in_ingestion_executor(
             lambda: embedder.embed_documents([doc_.page_content for doc_ in valid_documents])
-        )
+        ) if valid_documents else []
         points = [PointStruct(
             id=uuid.uuid4().hex,
             payload=doc.model_dump(),
@@ -575,17 +707,54 @@ class RabbitHole:
         # them to the same collection. With no plugin the no-op returns [] (upstream parity:
         # no image points).
         if images:
-            chat_id = self.stray.id if self.stray else None
             image_points = await plugin_manager.execute_hook(
                 "rabbithole_stores_image_points",
                 [], images, source, source_bytes, metadata, file_hash, chat_id,
                 caller=self._resolve_caller(True),
             )
             points.extend(image_points or [])
+        return points
 
-        collection_name = str(VectorMemoryType.DECLARATIVE if not self.stray else VectorMemoryType.EPISODIC)
-        await self.cat.vector_memory_handler.add_points_to_tenant(collection_name=collection_name, points=points)
+    async def store_documents(
+        self,
+        docs: List[Document],
+        source: str,
+        file_hash: str | None = None,
+        metadata: Dict | None = None,
+        images: List[Dict] | None = None,
+        source_bytes: bytes | None = None,
+    ) -> List[PointStruct]:
+        """Add documents to the Cat's declarative memory (or to the episodic memory of the chat), in one step.
 
+        The ingestion of a source goes through the phases (see ``ingest_file``); this method is for the callers that
+        hold their documents already. It adds the metadata (the custom ones, the source, the timestamp of insertion,
+        the hash and the chat), runs ``before_rabbithole_stores_documents``, embeds the documents and, if a multimodal
+        plugin collected images, lets it build their points; then it adds every point to the collection.
+
+        Args:
+            docs (List[Document]): List of Langchain `Document` to be inserted in the Cat's declarative memory.
+            source (str): Source name to be added as a metadata. It can be a file name or an URL.
+            file_hash (str | None): Optional hash of the source to be added as a metadata.
+            metadata (Dict | None): Optional metadata to be stored with each chunk.
+            images (List[Dict] | None): Optional images extracted by multimodal parsers. Each entry has
+                ``image_base64``, ``image_bytes`` and ``image_mime_type`` keys.
+            source_bytes (bytes | None): Optional raw bytes of the ingested source file. Used when the source
+                itself is an image: the file is embedded as a single whole-image point instead of the parser
+                sub-crops, and no derived file is created.
+
+        Returns:
+            stored_points (List[PointStruct]): List of points stored (text chunks and, if any, image points).
+
+        See Also:
+            before_rabbithole_stores_documents
+        """
+        metadata = metadata or {}
+        chat_id = self.stray.id if self.stray else None
+        docs = await self._prepare_documents(docs, source, file_hash, metadata, chat_id)
+        points = await self._embed_documents(docs, source, metadata, file_hash, images, source_bytes, chat_id)
+        await self.cat.vector_memory_handler.add_points_to_tenant(
+            collection_name=self._collection(chat_id), points=points,
+        )
         return points
 
     async def _split_text(self, docs: List[Document]):
@@ -624,22 +793,6 @@ class RabbitHole:
         except Exception as e:
             # Log error but don't fail the entire process
             log.warning(f"Error merging short chunks: {e}. Proceeding with original chunks.")
-
-        # Finalize the document list so no chunk exceeds the active embedder's
-        # max_input_tokens. This is a build-phase step, fully separate from the
-        # embedding loop in store_documents: it produces the correct final list
-        # (splitting oversized chunks into in-place sub-chunks) so the later
-        # 1:1 embed/store pairing is never broken by re-chunking mid-loop. The
-        # actual split is owned by a plugin through the finalize_oversized_chunks
-        # hook; the default no-op preserves the upstream behavior (no
-        # token-budget split).
-        try:
-            docs = await plugin_manager.execute_hook(
-                "finalize_oversized_chunks", docs, caller=self._resolve_caller(True),
-            )
-        except Exception as e:
-            # Log error but don't fail the entire process
-            log.warning(f"Failed to finalize oversized chunks: {e}. Proceeding with original chunks.")
 
         return docs
 

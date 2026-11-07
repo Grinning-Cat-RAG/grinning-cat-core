@@ -1,313 +1,295 @@
-"""Lifecycle of a RabbitHole ingestion.
+"""Stateful test of the lifecycle of the sources: uploads, crashes of a worker, resumes, changes of the embedder and
+deletions, with faults injected in the phases. The rules are checked after every operation:
 
-The ingestion states (start, URL download, processing, heartbeat, error) are RabbitHole helpers, not plugin hooks:
-the hooks left to the plugins are the ones that act on the content (parsers, documents, chunks, images, stored
-points). A stateful property test drives concurrent ingestions with injected faults and checks the lifecycle rules
-at every run.
+- no point without its vector, and the points of a source come from one ingestion only;
+- a ``completed`` source has its points (as many as the embedding made), its chunks and a diary of complete phases
+  with the current tags;
+- an ``error`` source says why, and has no owner;
+- a deleted source leaves no row, no points, no chunks;
+- a source whose worker crashed (its lock left to expire) stays ``processing`` until resumed, and then ends;
+- an interrupted deletion leaves the source ``deleting``, never brought back by a resume;
+- concurrent uploads and deletions of the same source run one at a time; a source whose row is deleted while it is
+  processed (its chat deleted) leaves nothing behind;
+- every upload notifies ``after_rabbithole_stored_documents`` exactly once (points, or none on failure).
 """
 import asyncio
-import json
+import copy
 import os
 from io import BytesIO
-from types import SimpleNamespace
+
 from unittest.mock import patch
 
-import httpx
-from hypothesis import given, settings
-from hypothesis import strategies as st
-from langchain_core.documents import Document
+import pytest
+from redis.asyncio.lock import Lock
+from redis.exceptions import LockError
 
-import cat.rabbit_hole.core as rabbit_hole_module
-from cat.core_plugins.base_plugin.hooks import file_manager as file_manager_hooks
-from cat.core_plugins.base_plugin.hooks import rabbithole as rabbithole_hooks
-from cat.looking_glass.mad_hatter.decorators.hook import CatHook
-from cat.rabbit_hole import RabbitHole
+from cat.core_plugins.base_plugin.file_managers.custom import LocalFileManager
+from cat.db.cruds import ingestions as crud_ingestions
+from cat.rabbit_hole import RabbitHole, chunks, engine
+from cat.rabbit_hole.phases import IngestionPhase, IngestionSource, PhaseResult, compute_tags
+from cat.services.memory.models import VectorMemoryType
 
-BASE_PLUGIN_HOOKS = {
-    name for module in (rabbithole_hooks, file_manager_hooks)
-    for name, value in vars(module).items() if isinstance(value, CatHook)
-}
+hypothesis = pytest.importorskip("hypothesis")
+from hypothesis import HealthCheck, given, settings, strategies as st  # noqa: E402
 
-REMOVED_STATE_HOOKS = [
-    "rabbithole_ingestion_start",
-    "rabbithole_url_downloading",
-    "rabbithole_url_download_completed",
-    "rabbithole_ingestion_processing",
-    "rabbithole_ingestion_error",
-    "rabbithole_processing_heartbeat_start",
-    "rabbithole_processing_heartbeat_stop",
-    "run_in_ingestion_executor",
-    "factory_allowed_ingestions",
-]
+SOURCES = ("alice.txt", "bob.txt")
+FAULTS = (None, None, "parse", "embed", "plugin_error", "plugin_not_ready", "empty")
+TEXT = ("Down, down, down. Would the fall never come to an end? " * 40).encode()
 
 
-def test_ingestion_state_hooks_are_not_offered_to_plugins(cheshire_cat):
-    for plugin_manager in (cheshire_cat.plugin_manager, cheshire_cat.lizard.plugin_manager):
-        offered = set(plugin_manager.hooks)
-        assert offered.isdisjoint(REMOVED_STATE_HOOKS), offered.intersection(REMOVED_STATE_HOOKS)
+class GraphPhase(IngestionPhase):
+    """A plugin phase after the embedding: fails or is not ready for the sources told so (instantiated for every run,
+    as the RabbitHole does with the classes of the plugins)."""
 
+    id = "graph"
+    depends_on = ("embedding",)
 
-# --- fake world -------------------------------------------------------------------------------------------------
+    async def process(self, source, cat):
+        world = CURRENT["world"]
+        fault = world.faults.get(source.name)
+        if fault == "plugin_error":
+            return PhaseResult(status="error", reason="graph failed")
+        if fault == "plugin_not_ready" and world.not_ready_left.get(source.name, 0) > 0:
+            world.not_ready_left[source.name] -= 1
+            return PhaseResult(status="not_ready", retry_after=0)
+        return PhaseResult(status="done")
 
-class RecordingPluginManager:
-    """Like ``MadHatter.execute_hook``, fails on a hook that no plugin offers (here: the base plugin's hooks)."""
-
-    def __init__(self, events):
-        self.events = events
-
-    async def execute_hook(self, hook_name, *args, caller):
-        if hook_name not in BASE_PLUGIN_HOOKS:
-            raise Exception(f"Hook {hook_name} not present in any plugin")
-        if hook_name == "after_rabbithole_stored_documents":
-            source, points = args
-            self.events.append((source, "stored", {"points": points, "caller": caller}))
-        return args[0] if args else None
-
-
-class FakeCat:
-    def __init__(self, events, failing_saves):
-        self.agent_key = "agent_test"
-        self.plugin_manager = RecordingPluginManager(events)
-        self.events = events
-        self.failing_saves = failing_saves
-
-    async def save_file(self, file_bytes, content_type, source, chat_id=None):
-        if source in self.failing_saves:
-            raise OSError("disk full")
-        self.events.append((source, "save", {"chat_id": chat_id}))
-
-
-class FakeNotifier:
-    def __init__(self):
-        self.errors = []
-
-    def has_ws_connection(self):
-        return False
-
-    async def send_error(self, message):
-        self.errors.append(message)
+    async def delete(self, source, cat):
+        world = CURRENT["world"]
+        if world.delete_fails.pop(source.name, False):
+            raise ConnectionError("graph store down")
+        world.graph_deleted.append(source.name)
 
 
 class World:
-    """Shared state of one example: the event log, the fault plan and the concurrency probe."""
-
-    def __init__(self, plans):
-        self.events = []
-        self.plans = {plan["id"]: plan for plan in plans}
-        self.cat = FakeCat(self.events, {p["id"] for p in plans if p["fault"] == "save"})
-        self.stray = SimpleNamespace(id="chat_abc", notifier=FakeNotifier())
-        self.active = 0
-        self.max_active = 0
-
-    def client_factory(self):
-        world = self
-
-        class FakeResponse:
-            headers = {"Content-Type": "text/html; charset=utf-8"}
-            content = b"<p>hello</p>"
-
-            def raise_for_status(self):
-                pass
-
-        class FakeClient:
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, *exc):
-                return False
-
-            async def get(self, url, headers=None):
-                await asyncio.sleep(0)
-                if world.plans[url]["fault"] == "download":
-                    raise httpx.ConnectError("unreachable")
-                return FakeResponse()
-
-        return FakeClient
+    def __init__(self):
+        self.faults = {}
+        self.not_ready_left = {}
+        self.graph_deleted = []
+        self.stored_hook = []
+        self.delete_fails = {}
+        self.embedder = "embedder-1"
 
 
-class ScriptedRabbitHole(RabbitHole):
-    """RabbitHole whose state helpers record the lifecycle and whose heavy steps follow the fault plan."""
-
-    world: World
-
-    async def setup(self, _cat):
-        self.cat = self.world.cat
-        self.stray = _cat if _cat is self.world.stray else None
-
-    def _record(self, source, event, **data):
-        self.world.events.append((source, event, data))
-
-    async def _ingestion_start(self, source, metadata, is_url):
-        self._record(source, "start", is_url=is_url, metadata=metadata)
-
-    async def _ingestion_url_downloading(self, url):
-        self._record(url, "downloading")
-
-    async def _ingestion_url_downloaded(self, url):
-        self._record(url, "downloaded")
-
-    async def _ingestion_processing(self, source):
-        self._record(source, "processing")
-
-    async def _ingestion_processing_heartbeat_start(self, source):
-        self._record(source, "hb_start")
-
-    async def _ingestion_processing_heartbeat_stop(self, source):
-        self._record(source, "hb_stop")
-
-    async def _ingestion_error(self, source, error):
-        self._record(source, "error", error=error)
-
-    async def _parse_to_docs(self, source, file_bytes, content_type):
-        world = self.world
-        world.active += 1
-        world.max_active = max(world.max_active, world.active)
-        try:
-            await asyncio.sleep(0)  # let the other ingestions run, if the guard allows it
-            fault = world.plans[source]["fault"]
-            if fault == "parse":
-                raise ValueError("unreadable file")
-            if fault == "empty":
-                return [], []
-            return [Document(page_content="hello")], []
-        finally:
-            world.active -= 1
-
-    async def store_documents(self, docs, source, file_hash=None, metadata=None, images=None, source_bytes=None):
-        if self.world.plans[source]["fault"] == "store":
-            raise RuntimeError("vector db down")
-        return [f"point-of-{source}"]
-
-    async def _send_notification_message(self, message):
-        if message.startswith("Finished reading"):
-            self._record(message.split()[2].rstrip(","), "finished")
+CURRENT = {}  # the world of the running example: the hypothesis examples share the monkeypatch of the test
 
 
-FAULTS_FOR_URL = [None, "download", "parse", "empty", "store"]
-FAULTS_FOR_UPLOAD = [None, "no_bytes", "save", "parse", "empty", "store"]
+def install(world: World, cheshire_cat, monkeypatch):
+    CURRENT["world"] = world
+    if getattr(monkeypatch, "_lifecycle_installed", False):
+        return
+    monkeypatch._lifecycle_installed = True
+    manager_class = type(cheshire_cat.plugin_manager)
+    original_hook = manager_class.execute_hook
+
+    async def execute_hook(self, name, *args, caller):
+        if name == "rabbithole_ingestion_phases":
+            return list(args[0]) + [GraphPhase]
+        if name == "after_rabbithole_stored_documents":
+            CURRENT["world"].stored_hook.append((args[0], len(args[1])))
+        return await original_hook(self, name, *args, caller=caller)
+
+    real_parse = RabbitHole._parse_to_docs
+    real_embed = RabbitHole._embed_documents
+
+    async def parse(self, source, file_bytes, content_type):
+        fault = CURRENT["world"].faults.get(source)
+        if fault == "parse":
+            raise ValueError("unreadable file")
+        parsed = await real_parse(self, source, file_bytes, content_type)
+        if fault == "row_gone":  # e.g. the chat of the source deleted while it is processed
+            await crud_ingestions.delete_status(self.cat.agent_key, None, source)
+        return parsed
+
+    async def embed(self, docs, source, *args):
+        await asyncio.sleep(0)  # the crash lands here
+        if CURRENT["world"].faults.get(source) == "embed":
+            raise ConnectionError("embedder down")
+        return await real_embed(self, docs, source, *args)
+
+    from cat.rabbit_hole import phases as phases_module
+    real_settings = phases_module.service_settings
+
+    async def service_settings(key_id, category):
+        if category == "embedder":
+            return {"name": CURRENT["world"].embedder}
+        return await real_settings(key_id, category)
+
+    # a crashed worker does not release its lock: it expires (short timeout, the heartbeat renews the live ones)
+    monkeypatch.setenv("CAT_INGESTION_HEARTBEAT_SECONDS", "1")
+    monkeypatch.setenv("CAT_INGESTION_LOCK_TIMEOUT_SECONDS", "2")
+    monkeypatch.setattr(manager_class, "execute_hook", execute_hook)
+    monkeypatch.setattr(RabbitHole, "_parse_to_docs", parse)
+    monkeypatch.setattr(RabbitHole, "_embed_documents", embed)
+    monkeypatch.setattr(phases_module, "service_settings", service_settings)
+    monkeypatch.setattr(cheshire_cat, "file_manager", LocalFileManager())
 
 
-@st.composite
-def ingestion_plan(draw, index):
-    is_url = draw(st.booleans())
-    store_file = draw(st.booleans())
-    faults = FAULTS_FOR_URL if is_url else FAULTS_FOR_UPLOAD
-    fault = draw(st.sampled_from([f for f in faults if f != "save" or store_file]))
-    return {
-        "id": f"http://example.com/doc{index}" if is_url else f"doc{index}.txt",
-        "is_url": is_url,
-        "store_file": store_file,
-        "on_stray": draw(st.booleans()),
-        "fault": fault,
-    }
+operation = st.one_of(
+    st.tuples(st.just("ingest"), st.sampled_from(SOURCES), st.sampled_from(FAULTS)),
+    st.tuples(st.just("crash"), st.sampled_from(SOURCES), st.none()),
+    st.tuples(st.just("resume"), st.sampled_from(SOURCES), st.none()),
+    st.tuples(st.just("embedder"), st.none(), st.none()),
+    st.tuples(st.just("delete"), st.sampled_from(SOURCES), st.none()),
+    st.tuples(st.just("delete_fails"), st.sampled_from(SOURCES), st.none()),
+    st.tuples(st.just("row_gone"), st.sampled_from(SOURCES), st.none()),
+    st.tuples(st.just("ingest_and_delete"), st.sampled_from(SOURCES), st.none()),
+    st.tuples(st.just("ingest_both"), st.none(), st.none()),
+)
 
 
-plans_strategy = st.integers(1, 4).flatmap(lambda n: st.tuples(*[ingestion_plan(i) for i in range(n)]))
+async def wipe(cheshire_cat):
+    """A new world for every example: no state, no points, no files, no lock left by a crashed worker."""
+    from cat.db.database import get_async_db
+
+    locks = [k async for k in get_async_db().scan_iter("lock:ingestion-source*")]
+    if locks:
+        await get_async_db().delete(*locks)
+    await crud_ingestions.destroy_all(cheshire_cat.agent_key)
+    await cheshire_cat.vector_memory_handler.delete_tenant_points(str(VectorMemoryType.DECLARATIVE))
+    LocalFileManager().remove_folder(cheshire_cat.agent_key)
 
 
-def _run(plans, max_concurrency):
-    world = World(plans)
-    ScriptedRabbitHole.world = world
-    rabbit_hole = ScriptedRabbitHole()  # one shared instance, as lizard.rabbit_hole
+async def prepared(cheshire_cat):
+    rabbit_hole = copy.copy(cheshire_cat.rabbit_hole)
+    await rabbit_hole.setup(cheshire_cat)
+    return rabbit_hole
 
-    async def ingest(plan):
-        file = plan["id"] if plan["is_url"] else BytesIO(b"" if plan["fault"] == "no_bytes" else b"content")
-        await rabbit_hole.ingest_file(
-            cat=world.stray if plan["on_stray"] else world.cat,
-            file=file,
-            metadata={"tag": plan["id"]},
-            filename=None if plan["is_url"] else plan["id"],
-            store_file=plan["store_file"],
-            content_type="text/plain",
+
+async def resume(cheshire_cat, name):
+    source = IngestionSource(cheshire_cat.agent_key, None, name)
+    async with engine.source_lock(source):
+        return await engine.run_phases(await prepared(cheshire_cat), cheshire_cat, source)
+
+
+@settings(max_examples=15, deadline=None, database=None,
+          suppress_health_check=[HealthCheck.function_scoped_fixture, HealthCheck.too_slow])
+@given(operations=st.lists(operation, min_size=1, max_size=6))
+async def test_the_lifecycle_of_the_sources(cheshire_cat, monkeypatch, operations):
+    world = World()
+    install(world, cheshire_cat, monkeypatch)
+    await wipe(cheshire_cat)
+    agent = cheshire_cat.agent_key
+    expected = {}  # source -> "completed" | "error" | "crashed" | "deleting"
+
+    async def upload(name):
+        return await cheshire_cat.rabbit_hole.ingest_file(
+            cat=cheshire_cat, file=BytesIO(TEXT), metadata={}, filename=name, content_type="text/plain",
         )
 
-    async def main():
-        await asyncio.gather(*[ingest(plan) for plan in plans])
-        return rabbit_hole_module._ingestion_semaphore
+    for kind, name, fault in operations:
+        hooks_before = len(world.stored_hook)
+        if kind == "ingest":
+            world.faults[name] = fault
+            world.not_ready_left[name] = 2
+            data = b"" if fault == "empty" else TEXT
+            row = await cheshire_cat.rabbit_hole.ingest_file(
+                cat=cheshire_cat, file=BytesIO(data), metadata={}, filename=name, content_type="text/plain",
+            )
+            expected[name] = "completed" if fault in (None, "plugin_not_ready") else "error"
+            assert row["status"] == expected[name], (kind, name, fault, row)
+            assert [h[0] for h in world.stored_hook[hooks_before:]] == [name]
+        elif kind == "crash":
+            world.faults[name] = None
+            task = asyncio.create_task(cheshire_cat.rabbit_hole.ingest_file(
+                cat=cheshire_cat, file=BytesIO(TEXT), metadata={}, filename=name, content_type="text/plain",
+            ))
+            for _ in range(500):  # until the embedding starts (the upload may wait for the lock of an earlier crash)
+                row = await crud_ingestions.get_status(agent, None, name)
+                if row and row.get("phase") == "embedding":
+                    break
+                await asyncio.sleep(0.01)
+            # the worker dies: its task stops, its lock is never released (it expires) and its heartbeat stops
+            with patch.object(Lock, "release", side_effect=LockError("the worker is dead")):
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            row = await crud_ingestions.get_status(agent, None, name)
+            assert row["status"] == "processing" and row["owner"] is not None
+            expected[name] = "crashed"
+        elif kind == "resume":
+            if name not in expected:
+                continue
+            row = await resume(cheshire_cat, name)
+            if expected[name] == "crashed":
+                expected[name] = "completed" if world.faults.get(name) in (None, "plugin_not_ready") else "error"
+            assert row["status"] == expected[name]  # a deleting row stays deleting
+            assert len(world.stored_hook) - hooks_before <= 1
+        elif kind == "embedder":
+            world.embedder = "embedder-2" if world.embedder == "embedder-1" else "embedder-1"
+            for source in [s for s, state in expected.items() if state == "completed"]:
+                row = await resume(cheshire_cat, source)
+                assert row["status"] == "completed"
+                assert row["completed_phases"]["parsing_chunking"]["state"] == "complete"
+        elif kind == "delete":
+            await cheshire_cat.rabbit_hole.delete_source(cheshire_cat, name)
+            expected.pop(name, None)
+        elif kind == "delete_fails":
+            if name not in expected:
+                continue
+            world.delete_fails[name] = True
+            with pytest.raises(ConnectionError):
+                await cheshire_cat.rabbit_hole.delete_source(cheshire_cat, name)
+            expected[name] = "deleting"
+        elif kind == "row_gone":
+            world.faults[name] = "row_gone"
+            assert await upload(name) is None
+            world.faults[name] = None
+            expected.pop(name, None)
+        elif kind == "ingest_and_delete":
+            # two actors on the same source: one at a time, in either order
+            world.faults[name] = None
+            await asyncio.gather(upload(name), cheshire_cat.rabbit_hole.delete_source(cheshire_cat, name))
+            if await crud_ingestions.get_status(agent, None, name):
+                expected[name] = "completed"
+            else:
+                expected.pop(name, None)
+        elif kind == "ingest_both":
+            for source in SOURCES:
+                world.faults[source] = None
+            rows = await asyncio.gather(*(upload(source) for source in SOURCES))
+            assert [row["status"] for row in rows] == ["completed"] * len(SOURCES)
+            expected.update({source: "completed" for source in SOURCES})
 
-    with (
-        patch.object(rabbit_hole_module, "_ingestion_semaphore", None),
-        patch.object(rabbit_hole_module, "AsyncClient", world.client_factory()),
-        patch.dict(os.environ, {"CAT_INGESTION_MAX_CONCURRENCY": str(max_concurrency)}),
-    ):
-        semaphore = asyncio.run(main())
-    return world, semaphore
+        await check_rules(cheshire_cat, world, expected)
 
 
-@settings(max_examples=300, deadline=None)
-@given(plans=plans_strategy, max_concurrency=st.sampled_from([0, 1, 2]))
-def test_every_ingestion_follows_the_lifecycle(plans, max_concurrency):
-    world, semaphore = _run(plans, max_concurrency)
+async def check_rules(cheshire_cat, world, expected):
+    agent = cheshire_cat.agent_key
+    rows = {r["source"]: r for r in await crud_ingestions.list_statuses(agent)}
+    assert set(rows) == set(expected)
+    points, _ = await cheshire_cat.vector_memory_handler.get_all_tenant_points(
+        str(VectorMemoryType.DECLARATIVE), with_vectors=True,
+    )
+    by_source = {}
+    for point in points:
+        assert point.vector, "a point without its vector"
+        by_source.setdefault(point.payload["metadata"]["source"], []).append(point)
+    for name in SOURCES:
+        whens = {p.payload["metadata"]["when"] for p in by_source.get(name, [])}
+        assert len(whens) <= 1, "points of two ingestions of the same source"
 
-    # the guard bounds the heavy bodies and is released on every exit path
-    if max_concurrency > 0:
-        assert world.max_active <= max_concurrency
-        assert semaphore._value == max_concurrency
-    else:
-        assert semaphore is None
-
-    stray_errors = list(world.stray.notifier.errors)
-    for plan in plans:
-        source = plan["id"]
-        run = [(event, data) for src, event, data in world.events if src == source]
-        names = [event for event, _ in run]
-        failed = plan["fault"] is not None
-
-        # one start, first, with the metadata and the URL flag of the request
-        assert names[0] == "start" and names.count("start") == 1
-        assert run[0][1] == {"is_url": plan["is_url"], "metadata": {"tag": source}}
-
-        # the heartbeat is always stopped once, then the stored points are notified once, last
-        assert names[-2:] == ["hb_stop", "stored"]
-        assert names.count("hb_stop") == 1 and names.count("stored") == 1
-        stored = run[-1][1]
-        assert stored["points"] == ([] if failed else [f"point-of-{source}"])
-        assert stored["caller"] is (world.stray if plan["on_stray"] else world.cat)
-
-        # the heartbeat starts at most once, after the processing state
-        assert names.count("hb_start") <= 1
-        if "hb_start" in names:
-            assert names.index("processing") < names.index("hb_start") < names.index("hb_stop")
-        reached_body = plan["fault"] in (None, "parse", "empty", "store")
-        assert ("hb_start" in names) == reached_body
-        assert ("processing" in names) == reached_body
-
-        # URL download states only for URLs; "downloaded" only after a successful download
-        assert ("downloading" in names) == plan["is_url"]
-        assert ("downloaded" in names) == (plan["is_url"] and plan["fault"] != "download")
-        if "downloaded" in names:
-            assert names.index("downloading") < names.index("downloaded")
-
-        # the file is persisted before processing, only for uploads asked to be stored
-        saved = plan["store_file"] and not plan["is_url"] and plan["fault"] not in ("no_bytes", "save")
-        assert ("save" in names) == saved
-        if saved:
-            assert names.index("save") < names.index("processing")
-            assert run[names.index("save")][1]["chat_id"] == ("chat_abc" if plan["on_stray"] else None)
-
-        # exactly one outcome: the error state or the success notification
-        assert names.count("error") == (1 if failed else 0)
-        assert names.count("finished") == (0 if failed else 1)
-
-        # the chat of a failed ingestion is told about the error
-        if failed and plan["on_stray"]:
-            stray_errors.remove(next(e for e in stray_errors if e.startswith(f"Error processing {source}:")))
-    assert stray_errors == []
-
-
-async def test_ingest_memory_records_start_and_error():
-    rabbit_hole = ScriptedRabbitHole()
-    world = World([])
-    ScriptedRabbitHole.world = world
-
-    async def embedder():
-        return SimpleNamespace()
-
-    world.cat.lizard = SimpleNamespace(embedder=embedder)
-    memories = {"embedder": "OtherEmbedder", "collections": {"declarative": []}}
-
-    await rabbit_hole.ingest_memory(cat=world.cat, file=BytesIO(json.dumps(memories).encode()), filename="mem.json")
-
-    events = [(src, event) for src, event, _ in world.events]
-    assert events == [("mem.json", "start"), ("mem.json", "error")]
-    assert "Embedder mismatch" in world.events[-1][2]["error"]
+    rabbit_hole = await prepared(cheshire_cat)
+    ordered = await engine.collect_phases(rabbit_hole, cheshire_cat)
+    tags = await compute_tags(ordered, cheshire_cat)
+    for name, state in expected.items():
+        row = rows[name]
+        if state == "completed":
+            assert row["status"] == "completed" and row["owner"] is None and row["error"] is None
+            diary = row["completed_phases"]
+            assert {pid: e["state"] for pid, e in diary.items()} == {pid: "complete" for pid in tags}
+            assert {pid: e["tag"] for pid, e in diary.items()} == tags
+            assert len(by_source.get(name, [])) == diary["embedding"]["processed"] > 0
+            docs, _ = chunks.read_chunks(cheshire_cat.file_manager, agent, None, name)
+            assert docs
+        elif state == "error":
+            assert row["status"] == "error" and row["error"] and row["owner"] is None
+        elif state == "deleting":
+            assert row["status"] == "deleting"
+        else:
+            assert row["status"] == "processing"
+    for name in set(SOURCES) - set(expected):
+        assert name not in by_source
+        assert not os.path.exists(os.path.join(
+            cheshire_cat.file_manager._root_dir, agent, chunks.FOLDER, chunks.source_id(name) + ".json",
+        ))
