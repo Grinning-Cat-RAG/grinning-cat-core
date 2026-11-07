@@ -138,6 +138,19 @@ async def test_upsert_ingestion_setting(secure_client, secure_client_headers, ch
     assert json["selected_configuration"] == ingestion_name
 
 
+async def test_upsert_same_profile_does_not_schedule_transition(
+    secure_client, secure_client_headers, cheshire_cat
+):
+    """A settings-only change on the same profile stays incremental."""
+    with patch("cat.routes.ingestion.run_background_task") as scheduled:
+        response = await secure_client.put(
+            "/ingestion/settings/CoreIngestionConfiguration", json={}, headers=secure_client_headers
+        )
+
+    assert response.status_code == 200
+    scheduled.assert_not_called()
+
+
 async def test_ingestion_engine_is_the_configured_one(secure_client, secure_client_headers, lizard, cheshire_cat):
     """The engine used by the upload routes is the one selected in the factory."""
     engine = await lizard.ingestion()

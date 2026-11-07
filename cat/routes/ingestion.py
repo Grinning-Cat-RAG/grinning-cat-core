@@ -1,14 +1,21 @@
 from typing import Dict
 
-from fastapi import APIRouter, Body
+from fastapi import APIRouter, BackgroundTasks, Body
 
 from cat.auth.connection import AuthorizedInfo
 from cat.auth.permissions import AuthPermission, AuthResource, check_permissions
+from cat.db.cruds import settings as crud_settings
 from cat.routes.routes_utils import (
     GetSettingResponse,
     GetSettingsResponse,
     UpsertSettingResponse,
+    run_background_task,
     has_write_permission,
+)
+from cat.services.factory.ingestion import resolve_ingestion_profile
+from cat.services.ingestion.switch import (
+    profile_changed,
+    transition_ingestion_profile,
 )
 from cat.services.service_factory import ServiceFactory
 
@@ -53,6 +60,7 @@ async def get_ingestion_setting(
 
 @router.put("/settings/{ingestion_name}", response_model=UpsertSettingResponse)
 async def upsert_ingestion_setting(
+    background_tasks: BackgroundTasks,
     ingestion_name: str,
     payload: Dict = Body(default={}),
     info: AuthorizedInfo = check_permissions(AuthResource.INGESTION, AuthPermission.WRITE),
@@ -67,5 +75,25 @@ async def upsert_ingestion_setting(
         schema_name="ingestionName",
     )
 
+    # Capture what is in force BEFORE the upsert: the profile that created the
+    # current artifacts and the stored setting to restore if a switch fails.
+    previous_setting = await crud_settings.get_settings_by_category(lizard.agent_key, "ingestion")
+    old_profile = await resolve_ingestion_profile(lizard)
+
     result = await sf.upsert_service(ingestion_name, payload)
+
+    # A different implementation was selected: delete what the old profile
+    # created, then re-ingest with the new engine. Same-profile settings
+    # changes stay incremental (the tags handle them) and never reach here.
+    new_profile = await resolve_ingestion_profile(lizard)
+    if profile_changed(old_profile, new_profile):
+        run_background_task(
+            background_tasks,
+            transition_ingestion_profile,
+            lizard,
+            old_profile,
+            new_profile,
+            previous_setting,
+        )
+
     return UpsertSettingResponse(**result)
