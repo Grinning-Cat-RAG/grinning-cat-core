@@ -9,6 +9,7 @@ from cat.services.factory.embedder import embedding_size
 from cat.auth.permissions import AuthUserInfo
 from cat.db.cruds import (
     conversations as crud_conversations,
+    ingestions as crud_ingestions,
     plugins as crud_plugins,
     settings as crud_settings,
     users as crud_users,
@@ -113,6 +114,7 @@ class CheshireCat(BotMixin, NonCopyableMixin):
         await crud_conversations.destroy_all(self._id)
         await crud_plugins.destroy_all(self._id)
         await crud_users.destroy_all(self._id)
+        await crud_ingestions.destroy_all(self._id)
 
         # notify plugins the agent has been destroyed (before shutdown tears down
         # the plugin manager), so plugin-owned namespaces can be cleaned up
@@ -142,6 +144,9 @@ class CheshireCat(BotMixin, NonCopyableMixin):
         owner = await crud_conversations.get_owner(self.agent_key, chat_id)
         for history_user_id in {owner, user_id} - {None}:
             await crud_conversations.delete_conversation(self.agent_key, history_user_id, chat_id)
+
+        # the ingestion states of the sources uploaded in the conversation
+        await crud_ingestions.destroy_chat(self.agent_key, chat_id)
 
         # the chat id can be used again
         await crud_conversations.release_conversation(self.agent_key, chat_id)

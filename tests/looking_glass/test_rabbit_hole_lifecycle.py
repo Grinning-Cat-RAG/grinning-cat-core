@@ -17,7 +17,7 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 from langchain_core.documents import Document
 
-import cat.rabbit_hole as rabbit_hole_module
+import cat.rabbit_hole.core as rabbit_hole_module
 from cat.core_plugins.base_plugin.hooks import file_manager as file_manager_hooks
 from cat.core_plugins.base_plugin.hooks import rabbithole as rabbithole_hooks
 from cat.looking_glass.mad_hatter.decorators.hook import CatHook

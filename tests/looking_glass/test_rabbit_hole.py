@@ -202,7 +202,7 @@ async def test_store_documents_embedding_runs_in_ingestion_executor(cheshire_cat
         calls["deferred_callables"].append(func)
         return [[0.1] * 4 for _ in range(2)]
 
-    monkeypatch.setattr("cat.rabbit_hole.run_in_ingestion_executor", fake_run_in_ingestion_executor)
+    monkeypatch.setattr("cat.rabbit_hole.core.run_in_ingestion_executor", fake_run_in_ingestion_executor)
     monkeypatch.setattr(cheshire_cat.vector_memory_handler, "add_points_to_tenant", fake_add_points)
 
     rabbit_hole = RabbitHole()
@@ -299,7 +299,7 @@ async def test_parse_to_docs_runs_off_event_loop(cheshire_cat, monkeypatch):
         calls["parse_calls"] += 1
         return [Document(page_content="parsed content")]
 
-    monkeypatch.setattr("cat.rabbit_hole.run_in_ingestion_executor", fake_run_in_ingestion_executor)
+    monkeypatch.setattr("cat.rabbit_hole.core.run_in_ingestion_executor", fake_run_in_ingestion_executor)
     monkeypatch.setattr(MimeTypeBasedParser, "parse", fake_parse)
 
     rabbit_hole = RabbitHole()
@@ -382,7 +382,7 @@ async def test_ingest_file_concurrency_bounded_by_max_concurrency(cheshire_cat, 
     # force a fresh module-level semaphore so the env value below is read
     # (raising=False: on pre-change code the attribute does not exist yet and
     # the test must still run to prove the concurrency is unbounded)
-    monkeypatch.setattr("cat.rabbit_hole._ingestion_semaphore", None, raising=False)
+    monkeypatch.setattr("cat.rabbit_hole.core._ingestion_semaphore", None, raising=False)
     monkeypatch.setenv("CAT_INGESTION_MAX_CONCURRENCY", "1")
 
     await asyncio.gather(
@@ -405,7 +405,7 @@ async def test_ingest_file_unlimited_when_max_concurrency_non_positive(cheshire_
     state = {"active": 0, "max_active": 0, "entered": 0}
     rabbit_hole_a, rabbit_hole_b = _mock_ingestion_pipeline(monkeypatch, cheshire_cat, state)
 
-    monkeypatch.setattr("cat.rabbit_hole._ingestion_semaphore", None, raising=False)
+    monkeypatch.setattr("cat.rabbit_hole.core._ingestion_semaphore", None, raising=False)
     monkeypatch.setenv("CAT_INGESTION_MAX_CONCURRENCY", "0")
 
     await asyncio.gather(

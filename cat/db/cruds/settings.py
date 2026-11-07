@@ -1,3 +1,4 @@
+import re
 from typing import Dict, List, Any
 from redis.exceptions import RedisError
 
@@ -377,7 +378,9 @@ async def clone_agent(source_prefix: str, target_prefix: str, skip_keys: List[st
     Args:
         source_prefix: Source key prefix (e.g., "agent_test")
         target_prefix: Target key prefix (e.g., "test_clone_agent_2")
-        skip_keys: List of specific keys to skip during cloning (e.g., ["analytics"]). Optional.
+        skip_keys: The kinds of keys to skip during cloning (e.g., ["conversations"]): a key is skipped when the segment
+            after the agent id starts with one of them (``agents:<id>:conversations_owners:...`` is skipped by
+            "conversations"; ``agents:<id>:plugins:cat_multimodal_ingestion`` is not skipped by "ingestion"). Optional.
 
     Returns:
         Number of keys cloned
@@ -386,16 +389,13 @@ async def clone_agent(source_prefix: str, target_prefix: str, skip_keys: List[st
     try:
         db = get_async_db()
 
-        # Find all keys with the source prefix
-        pattern = f"{DEFAULT_AGENTS_KEY}:{source_prefix}:*"
-        keys = [k async for k in db.scan_iter(pattern)]
-        # Filter out keys to skip
-        keys = [
-            kd
-            for k in keys
-            for skip_key in skip_keys  # type: ignore[assignment]
-            if skip_key not in (kd := (k.decode() if isinstance(k, bytes) else k))
-        ]
+        # Find all keys with the source prefix (the agent id is a literal in the pattern)
+        source_key_prefix = f"{DEFAULT_AGENTS_KEY}:{source_prefix}:"
+        pattern = re.sub(r"([*?\[\]\\])", r"\\\1", source_key_prefix) + "*"
+        keys = [k.decode() if isinstance(k, bytes) else k async for k in db.scan_iter(pattern)]
+        # Filter out keys to skip, by the kind of the key (the segment after the agent id)
+        prefix_length = len(source_key_prefix)
+        keys = [k for k in keys if not k[prefix_length:].startswith(tuple(skip_keys))] if skip_keys else keys
 
         if not keys:
             log.warning(f"No keys found with prefix '{source_prefix}'")
@@ -403,8 +403,8 @@ async def clone_agent(source_prefix: str, target_prefix: str, skip_keys: List[st
 
         cloned_count = 0
         for source_key in keys:
-            # Determine the target key by replacing the prefix
-            target_key = source_key.replace(source_prefix, target_prefix, 1)
+            # The target key: the same key, under the prefix of the target agent
+            target_key = f"{DEFAULT_AGENTS_KEY}:{target_prefix}:{source_key[prefix_length:]}"
 
             # Read the source data
             source_data = await db.json().get(source_key, "$")

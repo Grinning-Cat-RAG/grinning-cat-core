@@ -6,10 +6,11 @@ from cat.services.factory.embedder import embedding_size
 from cat.auth.auth_utils import DEFAULT_ADMIN_USERNAME, hash_password
 from cat.auth.permissions import get_full_permissions
 from cat.db import crud
+from cat.db.cruds import ingestions as crud_ingestions
 from cat.db.cruds import plugins as crud_plugins
 from cat.db.cruds import settings as crud_settings
 from cat.db.cruds import users as crud_users
-from cat.db.database import DEFAULT_CONVERSATIONS_KEY, DEFAULT_SYSTEM_KEY
+from cat.db.database import DEFAULT_CONVERSATIONS_KEY, DEFAULT_INGESTION_KEY, DEFAULT_SYSTEM_KEY
 from cat.db.models import Setting
 from cat.env import get_env
 from cat.exceptions import UnknownAgentException
@@ -219,7 +220,10 @@ class BillTheLizard(OrchestratorMixin, NonCopyableMixin):
         """
         # clone the settings from the provided agent
         log.info(f"Cloning settings from agent {ccat.agent_key} to agent {new_agent_id}")
-        await crud_settings.clone_agent(ccat.agent_key, new_agent_id, [DEFAULT_CONVERSATIONS_KEY])
+        # the conversations are not cloned; of the ingestion states, only the finished rows of the knowledge base, whose
+        # points and files the clone gets
+        await crud_settings.clone_agent(ccat.agent_key, new_agent_id, [DEFAULT_CONVERSATIONS_KEY, DEFAULT_INGESTION_KEY])
+        await crud_ingestions.clone_knowledge_base(ccat.agent_key, new_agent_id)
 
         # delegate cloning of in-memory data/resources from the source Cheshire Cat to the new one
         cloned_ccat = await self.get_cheshire_cat(new_agent_id)

@@ -1,4 +1,4 @@
-"""The dedicated ingestion lane of ``cat.rabbit_hole`` (``run_in_ingestion_executor``).
+"""The dedicated ingestion lane of ``cat.rabbit_hole.core`` (``run_in_ingestion_executor``).
 
 ``CAT_INGESTION_WORKERS > 0`` runs the heavy ingestion callables (parse, embed) on a process-wide pool of
 de-prioritized threads; ``<= 0`` falls back to the default executor.
@@ -10,8 +10,8 @@ from types import SimpleNamespace
 import pytest
 from langchain_core.documents import Document
 
-import cat.rabbit_hole as rabbit_hole_module
-from cat.rabbit_hole import _set_worker_niceness, run_in_ingestion_executor
+import cat.rabbit_hole.core as rabbit_hole_module
+from cat.rabbit_hole.core import _set_worker_niceness, run_in_ingestion_executor
 
 
 @pytest.fixture
