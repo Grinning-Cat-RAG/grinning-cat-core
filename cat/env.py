@@ -3,7 +3,7 @@ import os
 
 def get_supported_env_variables():
     return {
-        "CAT_ADMIN_DEFAULT_PASSWORD": "admin",
+        "CAT_ADMIN_DEFAULT_PASSWORD": None,  # REQUIRED: no default, the app refuses to start without a strong secret,
         "CAT_API_KEY": None,
         "CAT_DEBUG": "true",
         "CAT_LOG_LEVEL": "INFO",

@@ -90,7 +90,9 @@ def validate_env() -> EnvReport:
     _check_number(report, "CAT_AUTH_MAX_REFRESH_PER_IP", int, min_value=1)
 
     api_key = get_env("CAT_API_KEY")
-    if api_key is not None and len(api_key) < 16:
+    if api_key is None:
+        report.errors.append("CAT_API_KEY is not set")
+    elif len(api_key) < 16:
         report.warnings.append("CAT_API_KEY is shorter than 16 characters")
 
     # --- storage --------------------------------------------------------------------------------------------------
@@ -103,8 +105,7 @@ def validate_env() -> EnvReport:
     # only warnings: existing data may be encrypted with the defaults, changing them would make it unreadable
     _check_required(report, "CAT_CRYPTO_KEY")
     _check_required(report, "CAT_CRYPTO_SALT")
-    if get_env("CAT_ADMIN_DEFAULT_PASSWORD") == "admin":
-        report.warnings.append("CAT_ADMIN_DEFAULT_PASSWORD uses the public default 'admin'")
+    _check_required(report, "CAT_ADMIN_DEFAULT_PASSWORD")
 
     # --- CORS / Origin allow-list ---------------------------------------------------------------------------------
     for origin in parse_allowed_origins() or []:
