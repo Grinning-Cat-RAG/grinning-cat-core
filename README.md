@@ -199,7 +199,33 @@ the first user of the agent who uses its chat id, from any endpoint (a message, 
 other user of the agent is refused (`401`, as for credentials that are not valid) until the owner deletes the
 conversation, since its files, its episodic memories and its deletion are identified by the chat id alone. The system
 users (administrators of every agent) access every conversation, without owning it. Deleting a conversation removes its files, its
-episodic memories and its history; deleting a user removes all their conversations.
+episodic memories, its history and the ingestion states of its sources; deleting a user removes all their conversations.
+
+# Ingestion
+
+Every source (a file or a URL, in the knowledge base of an agent or in a conversation) is ingested through **phases**,
+recorded in its **ingestion state**:
+
+- `parsing_chunking` parses the source and splits it in chunks, kept in the agent storage (in a `.rabbithole` folder
+  next to the uploaded files, never listed by the file manager);
+- `embedding` computes the vectors of the chunks and replaces the points of the source in the vector memory;
+- plugins can add their own phases (the `rabbithole_ingestion_phases` hook), run after the phases they depend on.
+
+A source goes through `uploaded` (`downloading` and `downloaded` for a URL), `processing`, then `completed` or `error`.
+A phase runs again only when needed: a change of the **embedder** re-embeds the kept chunks without parsing the files
+again; a change of the **chunker** (or of the settings of a phase) runs the source again from the parsing.
+An ingestion interrupted by a crash or a restart is **resumed automatically** by any instance of the Cat, every
+`CAT_INGESTION_RESUME_INTERVAL_SECONDS`; a source is processed by one instance at a time.
+
+| Endpoint | Description |
+| --- | --- |
+| `GET /ingestion/status` | the ingestion states of the sources of the knowledge base, or of the conversation of the `X-Chat-ID` header |
+| `GET /ingestion/phases` | the phases of the agent, in execution order, and the states a source goes through |
+| `DELETE /ingestion/status?source=` | dismisses a failed ingestion (`409` for any other state: a source is removed by deleting its file) |
+
+Deleting a file (or the points of a whole source) removes everything its phases produced; it answers `409` while the
+source is being ingested, so retry later. Deleting all the files of the knowledge base (or of a conversation) removes all
+its sources, URLs included, and reports the ones being ingested with a `409`.
 
 # Webhooks
 

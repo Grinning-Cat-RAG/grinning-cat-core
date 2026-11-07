@@ -124,3 +124,6 @@ Here, I have introduced some new features and improvements, such as:
 - **The current version is agnostic to the vector database and chunking strategy**, meaning that you can use your own
   vector database and chunking strategy.
 - The current version provides **histories of conversations and documents**.
+- **Stateful, resumable ingestion**: every source goes through recorded phases (parsing and chunking, embedding, plus the
+  phases added by plugins); a change of the embedder re-embeds the kept chunks without parsing the files again, and an
+  ingestion interrupted by a crash or a restart is resumed automatically (see the `Ingestion` section of the README).
