@@ -34,7 +34,7 @@ from cat.rabbit_hole.phases import IngestionPhase, PhaseResult, compute_tags
 from cat.services.memory.models import VectorMemoryType
 
 hypothesis = pytest.importorskip("hypothesis")
-from hypothesis import HealthCheck, given, settings, strategies as st  # noqa: E402
+from hypothesis import HealthCheck, example, given, settings, strategies as st  # noqa: E402
 
 SOURCES = ("alice.txt", "bob.txt")
 FAULTS = (None, None, "parse", "embed", "plugin_error", "plugin_not_ready", "empty")
@@ -163,7 +163,9 @@ async def wipe(cheshire_cat):
     if locks:
         await get_async_db().delete(*locks)
     await crud_ingestions.destroy_all(cheshire_cat.agent_key)
-    await cheshire_cat.vector_memory_handler.delete_tenant_points(str(VectorMemoryType.DECLARATIVE))
+    collection = str(VectorMemoryType.DECLARATIVE)
+    if await cheshire_cat.vector_memory_handler.check_collection_existence(collection):
+        await cheshire_cat.vector_memory_handler.delete_tenant_points(collection)
     LocalFileManager().remove_folder(cheshire_cat.agent_key)
 
 
@@ -192,6 +194,7 @@ async def restart(lizard, cheshire_cat, expected):
 
 @settings(max_examples=15, deadline=None, database=None,
           suppress_health_check=[HealthCheck.function_scoped_fixture, HealthCheck.too_slow])
+@example(operations=[("ingest", "alice.txt", "parse"), ("dismiss", "alice.txt", None)])
 @given(operations=st.lists(operation, min_size=1, max_size=6))
 async def test_the_lifecycle_of_the_sources(lizard, cheshire_cat, monkeypatch, operations):
     world = World()
@@ -327,9 +330,10 @@ async def check_rules(cheshire_cat, world, expected):
     agent = cheshire_cat.agent_key
     rows = {r["source"]: r for r in await crud_ingestions.list_statuses(agent)}
     assert set(rows) == set(expected)
-    points, _ = await cheshire_cat.vector_memory_handler.get_all_tenant_points(
-        str(VectorMemoryType.DECLARATIVE), with_vectors=True,
-    )
+    collection = str(VectorMemoryType.DECLARATIVE)
+    points = []
+    if await cheshire_cat.vector_memory_handler.check_collection_existence(collection):
+        points, _ = await cheshire_cat.vector_memory_handler.get_all_tenant_points(collection, with_vectors=True)
     by_source = {}
     for point in points:
         assert point.vector, "a point without its vector"
