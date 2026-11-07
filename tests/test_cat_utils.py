@@ -68,3 +68,29 @@ async def test_load_settings_no_agent_key_from_cheshire_cat(cheshire_cat):
     assert utils.inspect_calling_agent().agent_key == agent_id
 
     utils.inspect_calling_folder = original_fnc
+
+
+@pytest.mark.parametrize("char", ["è", "€", "😀"])  # 2, 3 and 4 bytes in UTF-8
+def test_guess_file_type_utf8_text_with_a_character_across_the_sample_limit(char):
+    """Regression: the first 8192 bytes were decoded strictly: a multi-byte character cut by the limit made a valid
+    UTF-8 text file "unknown" (None), and its upload or its re-embed failed."""
+    from io import BytesIO
+
+    encoded = char.encode("utf-8")
+    for cut in range(1, len(encoded)):
+        data = b"a" * (8192 - cut) + encoded + b" resto del testo"
+        bytes_io = BytesIO(data)
+        bytes_io.seek(5)
+        assert utils.guess_file_type(bytes_io) == ("text/plain", "txt"), cut
+        assert bytes_io.tell() == 5, "the position of the stream is kept"
+
+
+def test_guess_file_type_invalid_utf8_is_not_text():
+    from io import BytesIO
+
+    # the whole file ends with a truncated character: not cut by the sample, invalid
+    assert utils.guess_file_type(BytesIO(b"a" * 8190 + "€".encode("utf-8")[:2])) == (None, None)
+    assert utils.guess_file_type(BytesIO(b"testo \xff\xfe non utf-8")) == (None, None)
+    # an invalid byte before the limit, in a longer file
+    assert utils.guess_file_type(BytesIO(b"a" * 100 + b"\xff" + b"a" * 9000)) == (None, None)
+    assert utils.guess_file_type(BytesIO("testo è".encode("utf-8"))) == ("text/plain", "txt")

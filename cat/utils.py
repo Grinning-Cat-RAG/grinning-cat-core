@@ -1,3 +1,4 @@
+import codecs
 import copy
 import socket
 import base64
@@ -486,12 +487,12 @@ def guess_file_type(bytes_io: BytesIO) -> Tuple[str | None, str | None]:
     if kind is None:
         # Fallback: check if it's a text file
         bytes_io.seek(0)
-        sample = bytes_io.read(8192)  # Read first 8KB
+        sample = bytes_io.read(8193)  # Read first 8KB, and one byte more: does the file go on after them?
         bytes_io.seek(current_pos)
 
         try:
-            # Try to decode as text
-            sample.decode("utf-8")
+            # Try to decode as text; when the file goes on, a character cut by the limit is not an error
+            codecs.getincrementaldecoder("utf-8")().decode(sample[:8192], final=len(sample) <= 8192)
             return "text/plain", "txt"
         except (UnicodeDecodeError, AttributeError):
             # Not valid UTF-8 text
