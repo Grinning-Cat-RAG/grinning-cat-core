@@ -31,7 +31,7 @@ async def test_delete_file_fires_image_cascade_hook(monkeypatch):
             hook_calls.append((name, args))
 
     fake_cheshire_cat = types.SimpleNamespace(
-        agent_key="agent",
+        agent_key="path",
         vector_memory_handler=handler,
         file_manager=FakeFileManager(),
         plugin_manager=FakePluginManager(),

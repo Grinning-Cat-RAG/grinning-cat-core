@@ -258,32 +258,19 @@ async def _teardown_memory_and_files(ccat, sources) -> None:
     marker cannot leave a half-deleted agent.
     """
     # Lazy imports keep the startup import graph small and avoid cycles.
-    from cat.routes.routes_utils import sanitize_source_name
-    from cat.services.memory.models import VectorMemoryType
+    from cat.services.factory.ingestion import resolve_ingestion_profile
+
+    # Resolve the system-level profile once: every source goes through the same
+    # deletion operation as the file-manager route.
+    profile = await resolve_ingestion_profile(ccat)
 
     for source in sources:
-        sanitized_source = sanitize_source_name(source, ccat.agent_key)
-
-        # Plugins see the file gone from the list but its memory points still
-        # present (e.g. multimodal_ingestion removes extracted images).
-        await ccat.plugin_manager.execute_hook(
-            "before_file_manager_file_delete",
-            sanitized_source,
-            _AGENT_FILE_SCOPE,
-            caller=ccat,
-        )
-
-        await ccat.vector_memory_handler.delete_tenant_points(
-            str(VectorMemoryType.DECLARATIVE), {"source": sanitized_source}
-        )
-
-        # Points are gone: plugins can drop per-source rows (ingestion status).
-        await ccat.plugin_manager.execute_hook(
-            "after_file_manager_file_deleted",
-            sanitized_source,
-            _AGENT_FILE_SCOPE,
-            caller=ccat,
-        )
+        # Per-source isolation: one broken source must not stop the rest of the
+        # cascade. The blanket ``destroy_memory`` below remains the catch-all.
+        try:
+            await profile.pipeline.delete(source, ccat, _AGENT_FILE_SCOPE)
+        except Exception as e:  # noqa: BLE001 - continue with the other sources
+            log.error(f"Failed to delete artifacts for source '{source}' of agent {ccat.agent_key}: {e}")
 
     # Catch-all purge for any memory not tied to a captured source. Runs after
     # the per-source cascade, and always, even when no sources were captured.

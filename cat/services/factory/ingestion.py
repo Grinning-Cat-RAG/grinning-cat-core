@@ -1,9 +1,11 @@
 from abc import abstractmethod, ABC
 from typing import Type
 
+from cat.db.database import DEFAULT_SYSTEM_KEY
 from cat.log import log
 from cat.services.factory.models import BaseFactoryConfigModel
 from cat.services.ingestion.locks import IngestionLockManager, NoopLockManager
+from cat.services.ingestion.models import IngestionStatus
 from cat.services.ingestion.pipeline import CoreSinglePassPipeline, IngestionPipeline
 from cat.services.ingestion.profile import IngestionProfile
 from cat.services.ingestion.recovery import IngestionRecovery, NoopRecovery
@@ -72,15 +74,48 @@ class CoreIngestionEngine(BaseIngestionEngine):
         # and the engine must stay import-safe for the core plugin manager)
         from cat.rabbit_hole import RabbitHole
 
+        source = filename or getattr(file, "name", None)
+        if not isinstance(source, str) or not source:
+            # The source name is unknown: never invent a status key.
+            source = None
+
+        await self._record_status(cat, source, IngestionStatus.PROCESSING)
+
         rabbit_hole = getattr(cat, "rabbit_hole", None) or RabbitHole()
-        await rabbit_hole.ingest_file(
-            cat=cat,
-            file=file,
-            filename=filename,
-            metadata=metadata or {},
-            store_file=store_file,
-            content_type=content_type,
-        )
+        try:
+            await rabbit_hole.ingest_file(
+                cat=cat,
+                file=file,
+                filename=filename,
+                metadata=metadata or {},
+                store_file=store_file,
+                content_type=content_type,
+            )
+        except Exception as e:
+            await self._record_status(cat, source, IngestionStatus.ERROR, error=str(e))
+            raise
+        else:
+            await self._record_status(cat, source, IngestionStatus.COMPLETED)
+
+    async def _record_status(self, cat, source: str | None, status: IngestionStatus, error: str | None = None) -> None:
+        """Record the source lifecycle when a profile and source name are known.
+
+        Status is observational: a failure to write it must never fail the
+        ingestion itself, so any store error is logged and swallowed.
+        """
+        store = self.profile.state_store if self.profile is not None else None
+        agent_id = getattr(cat, "agent_key", None)
+        if store is None or source is None or not isinstance(agent_id, str):
+            return
+
+        scope = getattr(cat, "id", None)
+        if not isinstance(scope, str) or not scope:
+            scope = "agent"
+
+        try:
+            await store.set(agent_id, scope, source, status=status, error=error)
+        except Exception as e:  # noqa: BLE001 - status is observational
+            log.warning(f"Could not record ingestion status for '{source}': {e}")
 
 
 class BaseIngestionConfiguration(BaseFactoryConfigModel, ABC):
@@ -167,3 +202,23 @@ class CoreIngestionConfiguration(BaseIngestionConfiguration):
     @classmethod
     def tags(cls) -> type[IngestionTagResolver]:
         return SettingsVersionTags
+
+
+async def resolve_ingestion_profile(cat) -> IngestionProfile:
+    """Resolve the system-level ingestion profile for ``cat``.
+
+    The profile is global (``DEFAULT_SYSTEM_KEY``), never agent-scoped: the
+    same implementation deletes artifacts for every agent. A missing or broken
+    engine must not make deletion impossible, so any resolution failure falls
+    back to the core profile.
+    """
+    try:
+        engine = await cat.service_provider.get_ingestion(DEFAULT_SYSTEM_KEY, cat.plugin_manager)
+        if engine.profile is not None:
+            return engine.profile
+        log.warning("Ingestion engine has no profile; falling back to the core ingestion profile")
+    except Exception as e:  # noqa: BLE001 - deletion must always have a profile
+        log.warning(f"Could not resolve the ingestion profile ({e}); falling back to the core profile")
+
+    return CoreIngestionConfiguration.profile()
+

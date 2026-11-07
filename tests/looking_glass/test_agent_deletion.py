@@ -44,6 +44,10 @@ class _FakeFileManager:
         self.log.append("list_files")
         return [_Source(name) for name in self._sources]
 
+    def remove_file(self, file_path):
+        self.log.append(f"remove_file:{file_path}")
+        return True
+
     def remove_folder(self, remote_root_dir):
         self.removed.append(remote_root_dir)
         self.log.append("remove_folder")

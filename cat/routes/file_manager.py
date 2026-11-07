@@ -7,7 +7,7 @@ from starlette.responses import StreamingResponse
 
 from cat.auth.connection import AuthorizedInfo
 from cat.auth.permissions import AuthPermission, AuthResource, check_permissions
-from cat.exceptions import CustomNotFoundException, CustomValidationException
+from cat.exceptions import CustomNotFoundException
 from cat.routes.routes_utils import (
     GetSettingResponse,
     GetSettingsResponse,
@@ -17,6 +17,7 @@ from cat.routes.routes_utils import (
     has_write_permission,
 )
 from cat.services.factory.file_manager import FileResponse
+from cat.services.factory.ingestion import resolve_ingestion_profile
 from cat.services.memory.models import VectorMemoryType
 from cat.services.service_factory import ServiceFactory
 
@@ -149,42 +150,16 @@ async def delete_file(
     info: AuthorizedInfo = check_permissions(AuthResource.MEMORY, AuthPermission.DELETE),
 ) -> FileManagerDeletedFiles:
     """Delete a file"""
-    path, collection_id, metadata = get_from_info(info)
-    metadata = {"source": source_name} | metadata
+    ccat = info.cheshire_cat
+    scope = info.stray_cat.id if info.stray_cat else "agent"
 
-    sanitized_source = sanitize_source_name(source_name, path=path)
+    # One deletion operation: the same pipeline the agent teardown uses, so the
+    # storage removal, the cascade hooks, the memory points and the status row
+    # cannot diverge between the route and the teardown.
+    profile = await resolve_ingestion_profile(ccat)
+    res = await profile.pipeline.delete(source_name, ccat, scope)
 
-    try:
-        # delete the file from the file storage
-        res = info.cheshire_cat.file_manager.remove_file(os.path.join(path, sanitized_source))
-
-        # the file is gone from storage: notify the plugins BEFORE the memory
-        # points are deleted so multimodal_ingestion can cascade-remove the
-        # extracted-image files (their names live in the point metadata)
-        chat_or_agent = path.split(os.sep, 1)[1] if os.sep in path else "agent"
-        await info.cheshire_cat.plugin_manager.execute_hook(
-            "before_file_manager_file_delete",
-            sanitized_source,
-            str(chat_or_agent),
-            caller=info.cheshire_cat,
-        )
-
-        # delete points
-        await info.cheshire_cat.vector_memory_handler.delete_tenant_points(str(collection_id), metadata)  # type: ignore[arg-type]
-
-        # the file is gone: notify the plugins so a stale ingestion-status row
-        # cannot linger (the row is owned by the ingestion_status plugin; the
-        # core only fires the deletion hook)
-        await info.cheshire_cat.plugin_manager.execute_hook(
-            "after_file_manager_file_deleted",
-            sanitized_source,
-            str(chat_or_agent),
-            caller=info.cheshire_cat,
-        )
-
-        return FileManagerDeletedFiles(deleted=res)
-    except Exception as e:
-        raise CustomValidationException(f"Failed to delete memory points: {e}")
+    return FileManagerDeletedFiles(deleted=res)
 
 
 @router.delete("/files")
@@ -192,30 +167,17 @@ async def delete_files(
     info: AuthorizedInfo = check_permissions(AuthResource.MEMORY, AuthPermission.DELETE),
 ) -> FileManagerDeletedFiles:
     """Delete all files"""
-    path, collection_id, metadata = get_from_info(info)
+    ccat = info.cheshire_cat
+    path, _, _ = get_from_info(info)
+    scope = info.stray_cat.id if info.stray_cat else "agent"
 
-    try:
-        file_manager = info.cheshire_cat.file_manager
-        # get the list of files
-        files = file_manager.list_files(path)
+    files = ccat.file_manager.list_files(path)
+    profile = await resolve_ingestion_profile(ccat)
 
-        # delete all the files from the file storage
-        res = file_manager.remove_folder(path)
+    deleted = True
+    for file in files:
+        # Each source goes through the ONE deletion operation, exactly like a
+        # single-file delete and the agent teardown cascade.
+        deleted = await profile.pipeline.delete(file.name, ccat, scope) and deleted
 
-        # delete points
-        for file in files:
-            metadata |= {"source": file.name}
-            await info.cheshire_cat.vector_memory_handler.delete_tenant_points(str(collection_id), metadata)  # type: ignore[arg-type]
-            # drop the ingestion-status row for each removed file (plugin-owned:
-            # the core only fires the deletion hook)
-            chat_or_agent = path.split(os.sep, 1)[1] if os.sep in path else "agent"
-            await info.cheshire_cat.plugin_manager.execute_hook(
-                "after_file_manager_file_deleted",
-                file.name,
-                str(chat_or_agent),
-                caller=info.cheshire_cat,
-            )
-
-        return FileManagerDeletedFiles(deleted=res)
-    except Exception as e:
-        raise CustomValidationException(f"Failed to delete memory points: {e}")
+    return FileManagerDeletedFiles(deleted=deleted)
