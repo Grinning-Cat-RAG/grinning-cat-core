@@ -168,7 +168,7 @@ async def test_file_saved_before_processing_completes(
         )
     )
 
-    # wait for the early save to happen (it runs right after _file_to_docs,
+    # wait for the early save to happen (it runs right after the source bytes are resolved,
     # before store_documents)
     for _ in range(50):
         files = cheshire_cat.file_manager.list_files(cheshire_cat.agent_key)

@@ -75,14 +75,8 @@ async def upsert_embedder_setting(
 
     current_embedder = await lizard.embedder()
 
-    # a characterizing feature of the embedder has been updated: run the
-    # replaceable ingestion engine (factory: ingestion category)
+    # a characterizing feature of the embedder has been updated: inform the Cheshire Cats
     if previous_embedder != current_embedder:
-        engine = await lizard.ingestion()
-        run_background_task(
-            background_tasks,
-            engine.run,
-            info.lizard,
-        )
+        run_background_task(background_tasks, info.lizard.embed_all_in_cheshire_cats)
 
     return UpsertSettingResponse(**result)

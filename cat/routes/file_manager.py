@@ -159,8 +159,7 @@ async def delete_file(
         res = info.cheshire_cat.file_manager.remove_file(os.path.join(path, sanitized_source))
 
         # the file is gone from storage: notify the plugins BEFORE the memory
-        # points are deleted so multimodal_ingestion can cascade-remove the
-        # extracted-image files (their names live in the point metadata)
+        # points are deleted
         chat_or_agent = path.split(os.sep, 1)[1] if os.sep in path else "agent"
         await info.cheshire_cat.plugin_manager.execute_hook(
             "before_file_manager_file_delete",
@@ -172,9 +171,7 @@ async def delete_file(
         # delete points
         await info.cheshire_cat.vector_memory_handler.delete_tenant_points(str(collection_id), metadata)  # type: ignore[arg-type]
 
-        # the file is gone: notify the plugins so a stale ingestion-status row
-        # cannot linger (the row is owned by the ingestion_status plugin; the
-        # core only fires the deletion hook)
+        # the file is gone: notify the plugins
         await info.cheshire_cat.plugin_manager.execute_hook(
             "after_file_manager_file_deleted",
             sanitized_source,
@@ -206,8 +203,8 @@ async def delete_files(
         for file in files:
             metadata |= {"source": file.name}
             await info.cheshire_cat.vector_memory_handler.delete_tenant_points(str(collection_id), metadata)  # type: ignore[arg-type]
-            # drop the ingestion-status row for each removed file (plugin-owned:
-            # the core only fires the deletion hook)
+
+            # notify the plugins that the file is gone
             chat_or_agent = path.split(os.sep, 1)[1] if os.sep in path else "agent"
             await info.cheshire_cat.plugin_manager.execute_hook(
                 "after_file_manager_file_deleted",

@@ -197,13 +197,12 @@ async def test_store_documents_embedding_runs_in_ingestion_executor(cheshire_cat
     async def fake_add_points(collection_name, points):
         stored["points"] = points
 
-    async def fake_run_in_ingestion_executor(self, func, *args):
+    async def fake_run_in_ingestion_executor(func, *args, **kwargs):
         # Record the deferred embedding callable and return a fixed vector list.
         calls["deferred_callables"].append(func)
         return [[0.1] * 4 for _ in range(2)]
 
-    # detection reports a text-only embedder so only the text-embedding lane runs
-    monkeypatch.setattr(RabbitHole, "_run_in_ingestion_executor", fake_run_in_ingestion_executor)
+    monkeypatch.setattr("cat.rabbit_hole.run_in_ingestion_executor", fake_run_in_ingestion_executor)
     monkeypatch.setattr(cheshire_cat.vector_memory_handler, "add_points_to_tenant", fake_add_points)
 
     rabbit_hole = RabbitHole()
@@ -280,17 +279,17 @@ def test_agent_id_is_test_agent(cheshire_cat):
     assert cheshire_cat.agent_key == agent_id
 
 
-async def test_file_to_docs_parse_runs_off_event_loop(cheshire_cat, monkeypatch):
+async def test_parse_to_docs_runs_off_event_loop(cheshire_cat, monkeypatch):
     """The synchronous parser must be deferred via ``run_in_ingestion_executor``.
 
     ``MimeTypeBasedParser.parse`` is CPU/IO-bound (e.g. PyMuPDF on a large PDF)
     and must not run inline on the asyncio event loop. This test records every
-    ``run_in_ingestion_executor`` call made by ``_file_to_docs`` and asserts the
+    ``run_in_ingestion_executor`` call made by ``_parse_to_docs`` and asserts the
     parse happens inside the deferred callable, not inline.
     """
     calls = {"deferred_callables": [], "parse_calls": 0}
 
-    async def fake_run_in_ingestion_executor(self, func, *args):
+    async def fake_run_in_ingestion_executor(func, *args, **kwargs):
         # Record the deferred callable but do NOT run it: the test asserts the
         # parse is deferred, then invokes the callable itself to prove it.
         calls["deferred_callables"].append(func)
@@ -300,7 +299,7 @@ async def test_file_to_docs_parse_runs_off_event_loop(cheshire_cat, monkeypatch)
         calls["parse_calls"] += 1
         return [Document(page_content="parsed content")]
 
-    monkeypatch.setattr(RabbitHole, "_run_in_ingestion_executor", fake_run_in_ingestion_executor)
+    monkeypatch.setattr("cat.rabbit_hole.run_in_ingestion_executor", fake_run_in_ingestion_executor)
     monkeypatch.setattr(MimeTypeBasedParser, "parse", fake_parse)
 
     rabbit_hole = RabbitHole()
@@ -313,14 +312,11 @@ async def test_file_to_docs_parse_runs_off_event_loop(cheshire_cat, monkeypatch)
 
     monkeypatch.setattr(RabbitHole, "_split_text", fake_split)
 
-    await rabbit_hole._file_to_docs(
-        file=BytesIO(b"hello world"), filename="test.txt", content_type="text/plain",
-    )
+    await rabbit_hole._parse_to_docs(source="test.txt", file_bytes=b"hello world", content_type="text/plain")
 
     # the parse must NOT have run inline on the event loop
     assert calls["parse_calls"] == 0
-    # it must have been deferred through run_in_ingestion_executor (exactly once:
-    # the BytesIO path skips the file-read to_thread at the top of _file_to_docs)
+    # it must have been deferred through run_in_ingestion_executor, exactly once
     assert len(calls["deferred_callables"]) == 1
 
     # invoking the deferred callable performs the actual parse
@@ -426,8 +422,7 @@ async def test_ingest_file_saves_file_before_parsing(cheshire_cat, monkeypatch):
     """The uploaded file bytes are persisted BEFORE the parser runs.
 
     ``ingest_file`` must call ``save_file`` before ``_parse_to_docs`` so a
-    container restart during a long parse does not lose the uploaded file
-    (the resume mechanism reads it back from disk).
+    container restart during a long parse does not lose the uploaded file.
     """
     order: list = []
     saved_files: list = []
@@ -469,9 +464,9 @@ async def test_ingest_file_saves_file_before_parsing(cheshire_cat, monkeypatch):
 async def test_ingest_file_sets_processing_before_parse(cheshire_cat, monkeypatch):
     """The ``processing`` status is recorded BEFORE the parser runs.
 
-    ``ingest_file`` must fire ``rabbithole_ingestion_processing`` after the
-    file is persisted (``save_file``) and before ``_parse_to_docs``, so a long
-    parse is visible as ``processing`` (and the heartbeat keeps it fresh).
+    ``ingest_file`` must record the ``processing`` state after the file is
+    persisted (``save_file``) and before ``_parse_to_docs``, so a long parse is
+    visible as ``processing``.
     """
     order: list = []
 
@@ -485,14 +480,13 @@ async def test_ingest_file_sets_processing_before_parse(cheshire_cat, monkeypatc
     async def fake_store_documents(self, docs, source, file_hash=None, metadata=None, images=None, source_bytes=None):
         return []
 
-    async def fake_execute_hook(hook_name, *args, **kwargs):
-        if hook_name == "rabbithole_ingestion_processing":
-            order.append("processing")
+    async def fake_processing(self, source):
+        order.append("processing")
 
     monkeypatch.setattr(cheshire_cat, "save_file", fake_save_file)
     monkeypatch.setattr(RabbitHole, "_parse_to_docs", fake_parse_to_docs)
     monkeypatch.setattr(RabbitHole, "store_documents", fake_store_documents)
-    monkeypatch.setattr(cheshire_cat.plugin_manager, "execute_hook", fake_execute_hook)
+    monkeypatch.setattr(RabbitHole, "_ingestion_processing", fake_processing)
 
     rabbit_hole = RabbitHole()
     rabbit_hole.cat = cheshire_cat

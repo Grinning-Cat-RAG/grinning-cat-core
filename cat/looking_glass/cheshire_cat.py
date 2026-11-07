@@ -1,4 +1,3 @@
-import asyncio
 import mimetypes
 import os
 import tempfile
@@ -20,6 +19,7 @@ from cat.looking_glass.mad_hatter.procedures import CatProcedureType
 from cat.looking_glass.models import StoredSourceWithMetadata
 from cat.looking_glass.stray_cat import StrayCat
 from cat.mixins import BotMixin, NonCopyableMixin
+from cat.rabbit_hole import run_in_ingestion_executor
 from cat.services.factory.file_manager import BaseFileManager
 from cat.services.factory.vector_db import BaseVectorDatabaseHandler
 from cat.services.memory.models import PointStruct, VectorMemoryType
@@ -115,8 +115,7 @@ class CheshireCat(BotMixin, NonCopyableMixin):
         await crud_users.destroy_all(self._id)
 
         # notify plugins the agent has been destroyed (before shutdown tears down
-        # the plugin manager), so plugin-owned namespaces can be cleaned up —
-        # e.g. ingestion_status drops its agents:<id>:ingestion:* registry rows
+        # the plugin manager), so plugin-owned namespaces can be cleaned up
         if self.plugin_manager is not None:
             await self.plugin_manager.execute_hook(
                 "after_cheshire_cat_destroy", self._id, caller=self,
@@ -183,22 +182,6 @@ class CheshireCat(BotMixin, NonCopyableMixin):
 
         return {k: list(v) for k, v in results.items()}
 
-    async def _run_in_ingestion_executor(self, func, *args):
-        """Run a heavy ingestion callable via the dedicated ingestion lane.
-
-        Dispatches through the ``run_in_ingestion_executor`` hook (the
-        efficient_ingestion plugin provides the dedicated pool); falls back to
-        the default executor when no plugin provides it (upstream parity).
-        """
-        task = func if not args else (lambda: func(*args))
-        result = await self.plugin_manager.execute_hook(
-            "run_in_ingestion_executor", None, task, caller=self,
-        )
-        if result is None:
-            result = await asyncio.to_thread(task)
-        return result
-
-
     async def embed_procedures(self, pt: CatProcedureType | None = None):
         # Collect all texts up-front so we can embed them in one batch call
         # instead of N individual embed_query calls.
@@ -212,9 +195,9 @@ class CheshireCat(BotMixin, NonCopyableMixin):
             return
 
         # Single batched embed call — much cheaper than N × embed_query, and offloaded
-        # to a thread so the event loop is not blocked by the (synchronous) embedder.
+        # to the ingestion lane so the event loop is not blocked by the (synchronous) embedder.
         embedder = await self.embedder()
-        vectors = await self._run_in_ingestion_executor(
+        vectors = await run_in_ingestion_executor(
             embedder.embed_documents, [document.page_content for document in documents]
         )
 

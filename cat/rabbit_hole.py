@@ -1,5 +1,6 @@
 import copy
 import asyncio
+import functools
 import hashlib
 import json
 import mimetypes
@@ -7,6 +8,7 @@ import os
 import re
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from io import BytesIO
 from typing import Dict, List, Tuple
@@ -27,6 +29,11 @@ from cat.utils import is_url as fnc_is_url
 # ``CAT_INGESTION_MAX_CONCURRENCY`` (``None`` or ``<= 0`` means unlimited).
 _ingestion_semaphore: asyncio.Semaphore | None = None
 
+# Process-wide pool of de-prioritized threads running the heavy ingestion callables (parse, embed).
+# Created lazily on first use; the size is read at runtime from ``CAT_INGESTION_WORKERS`` and the
+# niceness of its threads from ``CAT_INGESTION_NICENESS``.
+_pool: ThreadPoolExecutor | None = None
+
 
 def _get_ingestion_semaphore() -> asyncio.Semaphore | None:
     """Return the process-wide ingestion semaphore, creating it on first use.
@@ -43,6 +50,54 @@ def _get_ingestion_semaphore() -> asyncio.Semaphore | None:
             return None
         _ingestion_semaphore = asyncio.Semaphore(max_concurrency)
     return _ingestion_semaphore
+
+
+def _set_worker_niceness(niceness: int) -> None:
+    """Lower the priority of the current worker thread.
+
+    Sets an absolute nicer value for the *current thread* on Linux
+    (``PRIO_PROCESS`` with ``who=0`` is implemented per-thread in the kernel
+    ``task_struct``). Raising niceness (de-prioritizing) is always permitted;
+    only lowering (negative values) would require privileges.
+    """
+    if niceness > 0:
+        os.setpriority(os.PRIO_PROCESS, 0, niceness)
+
+
+def _get_ingestion_pool() -> ThreadPoolExecutor | None:
+    """Return the process-wide ingestion pool, creating it on first use.
+
+    The worker count is read at runtime from ``CAT_INGESTION_WORKERS`` (default 2) and the
+    pool is then cached for the process lifetime. ``<= 0`` means the lane is disabled: no
+    pool is created and callers fall back to the default executor.
+    """
+    global _pool
+    if _pool is None:
+        max_workers = get_env_int("CAT_INGESTION_WORKERS")
+        if max_workers is None or max_workers <= 0:
+            return None
+        niceness = get_env_int("CAT_INGESTION_NICENESS") or 0
+        # ``initializer`` runs in each worker thread; ``_set_worker_niceness``
+        # is a no-op when ``niceness <= 0`` (de-prioritization disabled).
+        _pool = ThreadPoolExecutor(
+            max_workers=max_workers,
+            thread_name_prefix="cat-ingestion",
+            initializer=_set_worker_niceness,
+            initargs=(niceness,),
+        )
+    return _pool
+
+
+async def run_in_ingestion_executor(func, *args, **kwargs):
+    """Run ``func(*args, **kwargs)`` on the dedicated ingestion pool, off the event loop.
+
+    Used by the RabbitHole for the heavy ingestion steps (parse, embed) and available to the plugins doing heavy
+    ingestion work of their own (e.g. embedding the images of a source). If the ingestion lane is disabled
+    (``CAT_INGESTION_WORKERS <= 0``), the call is dispatched to the default executor.
+    """
+    return await asyncio.get_running_loop().run_in_executor(
+        _get_ingestion_pool(), functools.partial(func, *args, **kwargs)
+    )
 
 
 @asynccontextmanager
@@ -91,6 +146,46 @@ class RabbitHole:
         """
         return await copy.copy(self)._ingest_memory(cat, file, filename)
 
+    def _resolve_caller(self, on_cat: bool):
+        """The caller of the plugin hooks: the agent (``on_cat``), or the chat of the ingestion when there is one."""
+        if on_cat:
+            return self.cat
+        return self.stray or self.cat
+
+    # Ingestion states. The states of an ingestion belong to the RabbitHole, not to the plugins: these helpers mark
+    # the points of the lifecycle where the stateful ingestion records them.
+
+    async def _ingestion_start(self, source: str, metadata: Dict, is_url: bool):
+        """The ingestion of ``source`` starts: the source is known, nothing is downloaded, parsed or stored yet."""
+        # TODO stateful ingestion: record the ``uploaded`` state
+
+    async def _ingestion_url_downloading(self, url: str):
+        """The download of ``url`` is about to start."""
+        # TODO stateful ingestion: record the ``downloading`` state
+
+    async def _ingestion_url_downloaded(self, url: str):
+        """The download of ``url`` completed successfully."""
+        # TODO stateful ingestion: record the ``downloaded`` state
+
+    async def _ingestion_processing(self, source: str):
+        """The source is persisted and its parse -> embed -> store body is about to start."""
+        # TODO stateful ingestion: record the ``processing`` state
+
+    async def _ingestion_processing_heartbeat_start(self, source: str):
+        """Keep the ``processing`` state of ``source`` fresh while its body runs.
+
+        The state is scoped by the chat of the ingestion (``self.stray.id``, ``"agent"`` without a chat).
+        """
+        # TODO backport the ingestion processing heartbeat start from the efficient ingestion
+
+    async def _ingestion_processing_heartbeat_stop(self, source: str):
+        """Stop the heartbeat of ``source``; called once at the end of every ingestion, whatever the outcome."""
+        # TODO backport the ingestion processing heartbeat stop from the efficient ingestion
+
+    async def _ingestion_error(self, source: str, error: str):
+        """The ingestion of ``source`` failed with ``error``."""
+        # TODO stateful ingestion: record the ``error`` state
+
     async def _ingest_memory(self, cat: "CheshireCat", file: BytesIO, filename: str):  # type: ignore[name-defined]
         """Upload memories to the declarative memory from a JSON file.
 
@@ -111,10 +206,7 @@ class RabbitHole:
             await self.setup(cat)
             lizard = self.cat.lizard
 
-            # fire the hook with the source before the memories are stored
-            await self.cat.plugin_manager.execute_hook(
-                "rabbithole_ingestion_start", filename, {}, False, caller=self.cat,
-            )
+            await self._ingestion_start(filename, {}, False)
 
             # Load fyle byte in a dict
             memories = json.loads(file.read().decode("utf-8"))
@@ -154,10 +246,7 @@ class RabbitHole:
             )
         except Exception as e:
             log.error(f"Error uploading memories from file '{filename}': {e}")
-            # fire the error hook alongside the existing log
-            await self.cat.plugin_manager.execute_hook(
-                "rabbithole_ingestion_error", filename, str(e), caller=self.cat,
-            )
+            await self._ingestion_error(filename, str(e))
 
     async def ingest_file(
         self,
@@ -211,53 +300,38 @@ class RabbitHole:
             if not filename:
                 raise ValueError("No filename provided.")
 
-            # fire the hook with the source (the filename; for URLs the filename IS the URL)
-            # before the file is downloaded/parsed, so plugins can observe the full lifecycle
-            await self.cat.plugin_manager.execute_hook(
-                "rabbithole_ingestion_start", filename, metadata, filename.startswith("http"),
-                caller=self.stray or self.cat,
-            )
+            # the source is the filename (for URLs the filename IS the URL), known before the file is downloaded/parsed
+            await self._ingestion_start(filename, metadata, filename.startswith("http"))
 
             # bound the heavy ingestion body (parse -> embed -> store -> notify)
             # to CAT_INGESTION_MAX_CONCURRENCY process-wide; None/<=0 = unlimited.
-            # setup() and the ingestion_start hook above run unconstrained so
-            # status hooks are always visible.
+            # setup() and the start state above run unconstrained, so a queued
+            # ingestion is visible as started.
             async with _ingestion_guard(_get_ingestion_semaphore()):
                 # resolve the source bytes BEFORE parsing so the file can be
                 # persisted to the file manager first: a container restart during
-                # a long parse no longer loses the uploaded file (the resume
-                # mechanism reads it back from disk).
+                # a long parse no longer loses the uploaded file.
                 source, file_bytes, content_type, is_url = await self._resolve_source_bytes(
                     file=file, filename=filename, content_type=content_type
                 )
                 if not file_bytes:
                     raise ValueError(f"Something went wrong with the source '{source}'")
+                assert source is not None, "Source should not be None after resolving source bytes"
 
                 # store the file bytes in the agent's persistent storage as early as
-                # possible, so a container restart can resume reading the bytes from
-                # disk even if processing/embedding is interrupted. LocalFileManager
+                # possible, so the bytes survive a container restart even if
+                # processing/embedding is interrupted. LocalFileManager
                 # overwrites an existing destination, so this is idempotent.
                 if store_file and not is_url:
                     chat_id = self.stray.id if self.stray else None
                     await self.cat.save_file(file_bytes, content_type, source, chat_id)
 
-                # fire the processing hook once the worker has picked the file up
-                # (persisted to disk), before the potentially long parse/embed body
-                await self.cat.plugin_manager.execute_hook(
-                    "rabbithole_ingestion_processing", source, caller=self.stray or self.cat,
-                )
+                # the worker has picked the file up (persisted to disk), before the potentially long parse/embed body
+                await self._ingestion_processing(source)
 
-                # keep the PROCESSING row fresh while the body runs, so a long
-                # parse is not re-claimed as stale by another worker. The
-                # heartbeat task itself is owned by the ingestion_status plugin:
-                # the core only fires the start hook.
-                scope = self.stray.id if self.stray else "agent"
-                heartbeat_interval = get_env_int("CAT_INGESTION_HEARTBEAT_SECONDS") or 30
-                await self.cat.plugin_manager.execute_hook(
-                    "rabbithole_processing_heartbeat_start",
-                    source, scope, heartbeat_interval,
-                    caller=self.stray or self.cat,
-                )
+                # keep the processing state fresh while the body runs, so a long
+                # parse is not re-claimed as stale by another worker
+                await self._ingestion_processing_heartbeat_start(source)
 
                 # split a file into a list of docs
                 docs, images = await self._parse_to_docs(source, file_bytes, content_type)
@@ -269,7 +343,11 @@ class RabbitHole:
                 sha256 = hashlib.sha256()
                 sha256.update(file_bytes)
                 points = await self.store_documents(
-                    docs=docs, source=source, file_hash=sha256.hexdigest(), metadata=metadata, images=images,
+                    docs=docs,
+                    source=source,
+                    file_hash=sha256.hexdigest(),
+                    metadata=metadata,
+                    images=images,
                     source_bytes=file_bytes,
                 )
 
@@ -288,51 +366,14 @@ class RabbitHole:
                     await self.stray.notifier.send_error(f"Error processing {filename}: {str(e)}")
                 except Exception as notify_error:
                     log.error(f"Failed to send error notification: {notify_error}")
-            # fire the error hook alongside the existing log/notify
-            await self.cat.plugin_manager.execute_hook(
-                "rabbithole_ingestion_error", source or filename, str(e), caller=self.stray or self.cat,
-            )
+            await self._ingestion_error(str(source or filename), str(e))
         finally:
-            # stop the plugin-owned heartbeat so no orphan task keeps bumping
-            # the row (the ingestion_status plugin cancels its task here)
-            await self.cat.plugin_manager.execute_hook(
-                "rabbithole_processing_heartbeat_stop",
-                source or filename,
-                self.stray.id if self.stray else "agent",
-                caller=self.stray or self.cat,
-            )
+            # stop the heartbeat so no orphan task keeps refreshing the processing state
+            await self._ingestion_processing_heartbeat_stop(str(source or filename))
             # hook the points after they are stored in the vector memory
             await self.cat.plugin_manager.execute_hook(
-                "after_rabbithole_stored_documents", source, points, caller=self.stray or self.cat,
+                "after_rabbithole_stored_documents", source or filename, points, caller=self._resolve_caller(False),
             )
-
-    async def _file_to_docs(
-        self, file: str | BytesIO, filename: str, content_type: str | None = None
-    ) -> Tuple[str, bytes, str | None, List[Document], List[Dict], bool]:
-        """
-        Load and convert files to Langchain `Document`.
-
-        This method takes a file either from a Python script, from the `/rabbithole/` or `/rabbithole/web` endpoints.
-        Hence, it loads it in memory and splits it in chunks.
-
-        Args:
-            file (str | BytesIO): The file can be either a string path if loaded programmatically, a `BytesIO` if coming from the `/rabbithole/` endpoint, or a URL if coming from the `/rabbithole/web` endpoint.
-            filename (str): The filename of the file to be ingested.
-            content_type (str): The content type of the file. If not provided, it will be guessed based on the file extension.
-
-        Returns:
-            (source, file_bytes, content_type, docs, images, is_url): Tuple[str, bytes, str | None, List[Document], List[Dict], bool].
-                The file name, the file content in bytes, the content type, the list of chunked Langchain `Document`,
-                the list of images extracted by multimodal parsers (empty for text-only embedders) and
-                a boolean indicating if the file was loaded from a URL.
-        """
-        source, file_bytes, content_type, is_url = await self._resolve_source_bytes(
-            file=file, filename=filename, content_type=content_type
-        )
-        if not file_bytes:
-            raise ValueError(f"Something went wrong with the source '{source}'")
-        docs, images = await self._parse_to_docs(source, file_bytes, content_type)
-        return source, file_bytes, content_type, docs, images, is_url  # type: ignore[return-value]
 
     async def _resolve_source_bytes(
         self, file: str | BytesIO, filename: str, content_type: str | None
@@ -373,10 +414,7 @@ class RabbitHole:
             return sanitize_filename(filename), file.read(), content_type, False
         if fnc_is_url(file):
             try:
-                # notify plugins that the URL download is about to start
-                await self.cat.plugin_manager.execute_hook(
-                    "rabbithole_url_downloading", file, filename, caller=self.stray or self.cat,
-                )
+                await self._ingestion_url_downloading(file)
                 # Make a request with a fake browser name - use async httpx
                 async with AsyncClient() as client:
                     response = await client.get(file, headers={"User-Agent": "Magic Browser"})
@@ -388,10 +426,7 @@ class RabbitHole:
                     ).split(";")[0]
                     # Get binary content of url
                     content = response.content
-                # notify plugins that the URL download completed successfully
-                await self.cat.plugin_manager.execute_hook(
-                    "rabbithole_url_download_completed", file, filename, caller=self.stray or self.cat,
-                )
+                await self._ingestion_url_downloaded(file)
                 return file, content, ct, True
             except Exception as e:
                 log.error(f"Agent id: {self.cat.agent_key}. Error: {e}")
@@ -399,22 +434,6 @@ class RabbitHole:
         # Get file bytes - use async file reading
         fb = await asyncio.to_thread(lambda: open(file, "rb").read())  # type: ignore[union-attr]
         return sanitize_filename(os.path.basename(file)), fb, mimetypes.guess_type(file)[0], False  # type: ignore[return-value]
-
-    async def _run_in_ingestion_executor(self, func, *args):
-        """Run a heavy ingestion callable via the dedicated ingestion lane.
-
-        Dispatches through the ``run_in_ingestion_executor`` hook: when a plugin
-        (efficient_ingestion) provides a dedicated low-concurrency pool the
-        callable runs there; otherwise falls back to the default executor
-        (upstream parity via ``asyncio.to_thread``).
-        """
-        task = func if not args else (lambda: func(*args))
-        result = await self.cat.plugin_manager.execute_hook(
-            "run_in_ingestion_executor", None, task, caller=self.cat,
-        )
-        if result is None:
-            result = await asyncio.to_thread(task)
-        return result
 
     async def _parse_to_docs(
         self, source: str, file_bytes: bytes, content_type: str | None
@@ -440,7 +459,7 @@ class RabbitHole:
         # Load the bytes in the Blob schema and parse the content. Parser based on the mime type.
         # The parser is CPU/IO-bound (e.g. PyMuPDF on a large PDF): run it off the event loop.
         await self._send_notification_message("I'm parsing the content. Big content could require some minutes...")
-        super_docs = await self._run_in_ingestion_executor(
+        super_docs = await run_in_ingestion_executor(
             lambda: MimeTypeBasedParser(handlers=fh).parse(
                 Blob(data=file_bytes, mimetype=content_type).from_data(data=file_bytes, mime_type=content_type, path=source)
             )
@@ -457,11 +476,11 @@ class RabbitHole:
         # Collect the images extracted by multimodal parsers (if a multimodal embedder is
         # active) BEFORE chunking: the chunkers may drop or alter the metadata that carries
         # the image payload (e.g. PLUS SemanticChunker discards metadata, _merge_short_chunks
-        # keeps only the first chunk's metadata). The multimodal_ingestion plugin owns the
-        # extraction AND strips the transient image_base64 from the docs; with no plugin the
-        # no-op returns [] (upstream parity: no image handling).
+        # keeps only the first chunk's metadata). A multimodal plugin owns the extraction AND
+        # strips the transient image_base64 from the docs; with no plugin the no-op returns []
+        # (upstream parity: no image handling).
         images = await self.cat.plugin_manager.execute_hook(
-            "rabbithole_collects_document_images", [], super_docs, caller=self.stray or self.cat,
+            "rabbithole_collects_document_images", [], super_docs, caller=self._resolve_caller(False),
         ) or []
 
         # Split
@@ -535,17 +554,14 @@ class RabbitHole:
                     | ({"chat_id": self.stray.id} if self.stray else {})
             )
 
-# hook the docs before they are stored in the vector memory
-        docs = await plugin_manager.execute_hook("before_rabbithole_stores_documents", docs, caller=self.stray or self.cat)
+        # hook the docs before they are stored in the vector memory
+        docs = await plugin_manager.execute_hook(
+            "before_rabbithole_stores_documents", docs, caller=self._resolve_caller(False),
+        )
 
-        # The token-budget split (formerly _split_oversized) is owned by the
-        # efficient_ingestion plugin via the before/finalize hooks: the docs
-        # may be re-sized so the embed below is 1:1 with the stored points.
-        # The default no-op preserves upstream behavior (no sizing).
-
-        # hook the points before they are stored in the vector memory
+        # embed the non-empty docs, 1:1 with the stored points
         valid_documents = list(filter(lambda doc_: doc_.page_content.strip(), docs))
-        storing_vectors = await self._run_in_ingestion_executor(
+        storing_vectors = await run_in_ingestion_executor(
             lambda: embedder.embed_documents([doc_.page_content for doc_ in valid_documents])
         )
         points = [PointStruct(
@@ -554,16 +570,16 @@ class RabbitHole:
             vector=vector,
         ) for doc, vector in zip(valid_documents, storing_vectors)]
 
-        # If the multimodal_ingestion plugin collected images for this source, let it
-        # build the image points (embed_images + save_file + PointStruct metadata): the
-        # core only appends them to the same collection. With no plugin the no-op returns
-        # [] (upstream parity: no image points).
+        # If a multimodal plugin collected images for this source, let it build the image
+        # points (embed_images + save_file + PointStruct metadata): the core only appends
+        # them to the same collection. With no plugin the no-op returns [] (upstream parity:
+        # no image points).
         if images:
             chat_id = self.stray.id if self.stray else None
             image_points = await plugin_manager.execute_hook(
                 "rabbithole_stores_image_points",
                 [], images, source, source_bytes, metadata, file_hash, chat_id,
-                caller=self.cat,
+                caller=self._resolve_caller(True),
             )
             points.extend(image_points or [])
 
@@ -595,7 +611,9 @@ class RabbitHole:
         plugin_manager = self.cat.plugin_manager
 
         # do something on the docs before they are split
-        docs = await plugin_manager.execute_hook("before_rabbithole_splits_documents", docs, caller=self.stray or self.cat)
+        docs = await plugin_manager.execute_hook(
+            "before_rabbithole_splits_documents", docs, caller=self._resolve_caller(False),
+        )
 
         # split docs
         docs = await self.cat.chunker.split_documents(docs)
@@ -612,12 +630,12 @@ class RabbitHole:
         # embedding loop in store_documents: it produces the correct final list
         # (splitting oversized chunks into in-place sub-chunks) so the later
         # 1:1 embed/store pairing is never broken by re-chunking mid-loop. The
-        # actual split is owned by a plugin (efficient_ingestion) through the
-        # finalize_oversized_chunks hook; the default no-op preserves the
-        # upstream behavior (no token-budget split).
+        # actual split is owned by a plugin through the finalize_oversized_chunks
+        # hook; the default no-op preserves the upstream behavior (no
+        # token-budget split).
         try:
-            docs = await self.cat.plugin_manager.execute_hook(
-                "finalize_oversized_chunks", docs, caller=self.cat,
+            docs = await plugin_manager.execute_hook(
+                "finalize_oversized_chunks", docs, caller=self._resolve_caller(True),
             )
         except Exception as e:
             # Log error but don't fail the entire process

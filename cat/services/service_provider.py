@@ -9,7 +9,6 @@ from cat.services.factory.agentic_workflow import BaseAgenticWorkflowHandler
 from cat.services.factory.auth_handler import BaseAuthHandler
 from cat.services.factory.context_retriever import BaseContextRetriever
 from cat.services.factory.embedder import Embeddings
-from cat.services.factory.ingestion import BaseIngestionEngine
 from cat.services.factory.llm import LargeLanguageModel
 from cat.services.service_factory import ServiceFactory
 from cat.services.factory.chunker import BaseChunker
@@ -54,9 +53,6 @@ class ServiceProvider:
 
     async def get_embedder(self, agent_key: str, plugin_manager: MadHatter) -> Embeddings:
         return await self._get_service_object(agent_key, plugin_manager, self._factory_services_params["embedder"])
-
-    async def get_ingestion(self, agent_key: str, plugin_manager: MadHatter) -> BaseIngestionEngine:
-        return await self._get_service_object(agent_key, plugin_manager, self._factory_services_params["ingestion"])
 
     async def get_large_language_model(self, agent_key: str, plugin_manager: MadHatter) -> LargeLanguageModel:
         return await self._get_service_object(
@@ -115,11 +111,6 @@ class ServiceProvider:
                 factory_allowed_handler_name="factory_allowed_embedders",
                 setting_category="embedder",
                 schema_name="languageEmbedderName",
-            ),
-            "ingestion": FactoryParams(
-                factory_allowed_handler_name="factory_allowed_ingestions",
-                setting_category="ingestion",
-                schema_name="ingestionName",
             ),
         }
 

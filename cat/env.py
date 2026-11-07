@@ -33,8 +33,6 @@ def get_supported_env_variables():
         "CAT_INGESTION_MAX_CONCURRENCY": "2",
         "CAT_INGESTION_WORKERS": "2",
         "CAT_INGESTION_NICENESS": "5",
-        "CAT_INGESTION_RESUME_INTERVAL_SECONDS": "60",
-        "CAT_INGESTION_HEARTBEAT_SECONDS": "30",
     }
 
 

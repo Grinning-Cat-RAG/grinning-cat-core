@@ -16,8 +16,6 @@ def before_agentic_workflow(task: AgenticWorkflowTask, cat) -> AgenticWorkflowTa
     """Hook to enrich or modify the agentic workflow task before it runs.
 
     Fired by ``StrayCat.__call__`` right before ``self._agentic_workflow.run``.
-    The ``multimodal_ingestion`` plugin uses it to attach the recalled
-    multimodal images (``task.images``) so a vision-capable LLM can see them.
     No-op default: returns the task unchanged.
     """
     return task

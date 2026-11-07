@@ -268,8 +268,7 @@ class StrayCat(BotMixin, NonCopyableMixin):
         # (it ran concurrently with recalls + hooks); this await is typically instant.
         tools = await procedures_task
 
-        # prepare agent input (multimodal_ingestion plugin enriches it with
-        # the recalled images via before_agentic_workflow)
+        # prepare agent input
         agent_input = AgenticWorkflowTask(
             system_prompt=system_prompt,
             user_prompt=self.working_memory.user_message.text,  # type: ignore[arg-type]

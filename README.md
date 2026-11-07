@@ -75,13 +75,16 @@ Everything can be done via the [Admin Panel](https://www.github.com/Grinning-Cat
 > - `Factories`: extending objects like LLMs, Embedders, File Managers, Chunkers;
 > - `Interactions`: add the interaction handler to the language model;
 > - `March Hare`: keeps the PODs aligned through a Redis Stream (installation, uninstallation and system-level toggle of the plugins);
+> - `Management Message`: stores a global management message and a global notice message, and gates access to the whole instance in management mode;
 > - `Memory`: interacting with Working Memory and adding a handler to trace the activities of the Embedder;
-> - `Multimodality`: a plugin that adds multimodal capabilities to the Grinning Cat framework, enabling the processing of images;
+> - `Webhooks`: lets the API consumers register webhooks to be notified when certain events occur (see [Webhooks](#webhooks));
 > - `White Rabbit`: cron and schedule tasks;
 > - `Why`: add the context and the reasoning behind the answers of the LLM.
 > - `Analytics`: recover the analytics data about the usage of the Grinning Cat, which depends on the `Interactions` and `Memory` plugins.
 >
-> You can disable one or more (e.g., `March Hare` if you don't need to autoscale over cloud PODs) by using the Admin Toggle endpoint.
+> You can disable one or more (e.g., `Why` if you don't need the reasoning behind the answers) by using the Admin Toggle
+> endpoint. `Factories`, `March Hare`, `Management Message` and `White Rabbit` exist for the whole instance and are
+> always on: they cannot be disabled.
 
 Enjoy the Grinning Cat!
 
