@@ -169,7 +169,7 @@ async def test_upsert_embedder_settings_updates_collections(secure_client, lizar
     assert len(files) == 0
 
 
-async def test_upsert_embedder_settings_with_episodic_memory_without_conversation(secure_client, lizard, cheshire_cat):
+async def test_upsert_embedder_settings_reembeds_the_sources_of_a_chat(secure_client, lizard, cheshire_cat):
     agent_id = "test_embedder_settings_updates_collections"
     cheshire_cat = await lizard.create_cheshire_cat(agent_id)
 
@@ -210,8 +210,8 @@ async def test_upsert_embedder_settings_with_episodic_memory_without_conversatio
 
         await asyncio.sleep(1)  # give some time for the background tasks to complete
 
+        # the source of the chat has an ingestion state: it is re-embedded with the new embedder, from its chunks
         episodic_memories_after = await cheshire_cat.vector_memory_handler.get_tenant_vectors_count(
             str(VectorMemoryType.EPISODIC)
         )
-        assert episodic_memories_after != episodic_memories_before
-        assert episodic_memories_after == 0
+        assert episodic_memories_after == episodic_memories_before

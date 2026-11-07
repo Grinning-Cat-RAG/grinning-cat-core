@@ -6,8 +6,11 @@ deletions, with faults injected in the phases. The rules are checked after every
   with the current tags;
 - an ``error`` source says why, and has no owner;
 - a deleted source leaves no row, no points, no chunks;
-- a source whose worker crashed (its lock left to expire) stays ``processing`` until resumed, and then ends;
-- an interrupted deletion leaves the source ``deleting``, never brought back by a resume;
+- a source whose worker crashed (its lock left to expire) stays ``processing`` until the automatic resume of a pod
+  completes it; a change of the embedder caught by the resume re-embeds the stored chunks without parsing again;
+- an interrupted deletion leaves the source ``deleting`` until the resume completes it: it is never brought back;
+- a change of the embedder recreates the collections and re-embeds every source from its stored chunks, also while an
+  upload runs;
 - concurrent uploads and deletions of the same source run one at a time; a source whose row is deleted while it is
   processed (its chat deleted) leaves nothing behind;
 - every upload notifies ``after_rabbithole_stored_documents`` exactly once (points, or none on failure).
@@ -25,8 +28,8 @@ from redis.exceptions import LockError
 
 from cat.core_plugins.base_plugin.file_managers.custom import LocalFileManager
 from cat.db.cruds import ingestions as crud_ingestions
-from cat.rabbit_hole import RabbitHole, chunks, engine
-from cat.rabbit_hole.phases import IngestionPhase, IngestionSource, PhaseResult, compute_tags
+from cat.rabbit_hole import RabbitHole, chunks, engine, recovery
+from cat.rabbit_hole.phases import IngestionPhase, PhaseResult, compute_tags
 from cat.services.memory.models import VectorMemoryType
 
 hypothesis = pytest.importorskip("hypothesis")
@@ -68,6 +71,7 @@ class World:
         self.graph_deleted = []
         self.stored_hook = []
         self.delete_fails = {}
+        self.parsed = []
         self.embedder = "embedder-1"
 
 
@@ -96,6 +100,7 @@ def install(world: World, cheshire_cat, monkeypatch):
         fault = CURRENT["world"].faults.get(source)
         if fault == "parse":
             raise ValueError("unreadable file")
+        CURRENT["world"].parsed.append(source)
         parsed = await real_parse(self, source, file_bytes, content_type)
         if fault == "row_gone":  # e.g. the chat of the source deleted while it is processed
             await crud_ingestions.delete_status(self.cat.agent_key, None, source)
@@ -122,12 +127,21 @@ def install(world: World, cheshire_cat, monkeypatch):
     monkeypatch.setattr(RabbitHole, "_parse_to_docs", parse)
     monkeypatch.setattr(RabbitHole, "_embed_documents", embed)
     monkeypatch.setattr(phases_module, "service_settings", service_settings)
-    monkeypatch.setattr(cheshire_cat, "file_manager", LocalFileManager())
+
+    async def initialize(self, embedder_name, embedder_size):
+        # a change of the embedder recreates the collections: every point is gone
+        await self.delete_tenant_points(str(VectorMemoryType.DECLARATIVE))
+
+    monkeypatch.setattr(type(cheshire_cat.vector_memory_handler), "initialize", initialize)
+    # every CheshireCat of the agent (the resume loads its own) keeps its files
+    local = LocalFileManager()
+    monkeypatch.setattr(type(cheshire_cat), "file_manager", property(lambda self: local, lambda self, value: None))
 
 
 operation = st.one_of(
     st.tuples(st.just("ingest"), st.sampled_from(SOURCES), st.sampled_from(FAULTS)),
     st.tuples(st.just("crash"), st.sampled_from(SOURCES), st.none()),
+    st.tuples(st.just("crash_restart"), st.sampled_from(SOURCES), st.none()),
     st.tuples(st.just("resume"), st.sampled_from(SOURCES), st.none()),
     st.tuples(st.just("embedder"), st.none(), st.none()),
     st.tuples(st.just("delete"), st.sampled_from(SOURCES), st.none()),
@@ -156,16 +170,27 @@ async def prepared(cheshire_cat):
     return rabbit_hole
 
 
-async def resume(cheshire_cat, name):
-    source = IngestionSource(cheshire_cat.agent_key, None, name)
-    async with engine.source_lock(source):
-        return await engine.run_phases(await prepared(cheshire_cat), cheshire_cat, source)
+def restarted(expected):
+    """The model after a resume (or a change of the embedder, which reruns every source): the interrupted ingestions
+    are completed (the crash clears the faults of its source), the interrupted deletions too."""
+    for source, state in list(expected.items()):
+        if state == "crashed":
+            expected[source] = "completed"
+        elif state == "deleting":
+            expected.pop(source)
+
+
+async def restart(lizard, cheshire_cat, expected):
+    """A pod starts again: the automatic resume passes on the agent, after the locks of the crashed workers expired."""
+    if "crashed" in expected.values():
+        await asyncio.sleep(engine.lock_timeout_seconds() + 0.2)
+    await recovery.resume_agent(lizard, cheshire_cat.agent_key)
 
 
 @settings(max_examples=15, deadline=None, database=None,
           suppress_health_check=[HealthCheck.function_scoped_fixture, HealthCheck.too_slow])
 @given(operations=st.lists(operation, min_size=1, max_size=6))
-async def test_the_lifecycle_of_the_sources(cheshire_cat, monkeypatch, operations):
+async def test_the_lifecycle_of_the_sources(lizard, cheshire_cat, monkeypatch, operations):
     world = World()
     install(world, cheshire_cat, monkeypatch)
     await wipe(cheshire_cat)
@@ -176,6 +201,22 @@ async def test_the_lifecycle_of_the_sources(cheshire_cat, monkeypatch, operation
         return await cheshire_cat.rabbit_hole.ingest_file(
             cat=cheshire_cat, file=BytesIO(TEXT), metadata={}, filename=name, content_type="text/plain",
         )
+
+    async def crash_source(name):
+        """An upload whose worker dies during the embedding: its lock is never released (it expires)."""
+        world.faults[name] = None
+        task = asyncio.create_task(upload(name))
+        for _ in range(500):  # until the embedding starts (the upload may wait for the lock of an earlier crash)
+            row = await crud_ingestions.get_status(agent, None, name)
+            if row and row.get("phase") == "embedding":
+                break
+            await asyncio.sleep(0.01)
+        with patch.object(Lock, "release", side_effect=LockError("the worker is dead")):
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        row = await crud_ingestions.get_status(agent, None, name)
+        assert row["status"] == "processing" and row["owner"] is not None
 
     for kind, name, fault in operations:
         hooks_before = len(world.stored_hook)
@@ -189,38 +230,26 @@ async def test_the_lifecycle_of_the_sources(cheshire_cat, monkeypatch, operation
             expected[name] = "completed" if fault in (None, "plugin_not_ready") else "error"
             assert row["status"] == expected[name], (kind, name, fault, row)
             assert [h[0] for h in world.stored_hook[hooks_before:]] == [name]
-        elif kind == "crash":
-            world.faults[name] = None
-            task = asyncio.create_task(cheshire_cat.rabbit_hole.ingest_file(
-                cat=cheshire_cat, file=BytesIO(TEXT), metadata={}, filename=name, content_type="text/plain",
-            ))
-            for _ in range(500):  # until the embedding starts (the upload may wait for the lock of an earlier crash)
-                row = await crud_ingestions.get_status(agent, None, name)
-                if row and row.get("phase") == "embedding":
-                    break
-                await asyncio.sleep(0.01)
-            # the worker dies: its task stops, its lock is never released (it expires) and its heartbeat stops
-            with patch.object(Lock, "release", side_effect=LockError("the worker is dead")):
-                task.cancel()
-                with pytest.raises(asyncio.CancelledError):
-                    await task
-            row = await crud_ingestions.get_status(agent, None, name)
-            assert row["status"] == "processing" and row["owner"] is not None
+        elif kind in ("crash", "crash_restart"):
+            await crash_source(name)
             expected[name] = "crashed"
+            if kind == "crash_restart":  # the pod starts again: its resume completes every interrupted operation
+                await restart(lizard, cheshire_cat, expected)
+                restarted(expected)
         elif kind == "resume":
-            if name not in expected:
-                continue
-            row = await resume(cheshire_cat, name)
-            if expected[name] == "crashed":
-                expected[name] = "completed" if world.faults.get(name) in (None, "plugin_not_ready") else "error"
-            assert row["status"] == expected[name]  # a deleting row stays deleting
-            assert len(world.stored_hook) - hooks_before <= 1
+            await restart(lizard, cheshire_cat, expected)
+            restarted(expected)
+            assert len(world.stored_hook) - hooks_before <= len(SOURCES)
         elif kind == "embedder":
+            # a change of the embedder (the collections are recreated) while an upload of a source runs
             world.embedder = "embedder-2" if world.embedder == "embedder-1" else "embedder-1"
-            for source in [s for s, state in expected.items() if state == "completed"]:
-                row = await resume(cheshire_cat, source)
-                assert row["status"] == "completed"
-                assert row["completed_phases"]["parsing_chunking"]["state"] == "complete"
+            uploaded = SOURCES[0]
+            world.faults[uploaded] = None
+            parsed_before = len(world.parsed)
+            await asyncio.gather(lizard.embed_all_in_cheshire_cats(), upload(uploaded))
+            restarted(expected)
+            expected[uploaded] = "completed"
+            assert world.parsed[parsed_before:] == [uploaded]  # the others reuse their chunks
         elif kind == "delete":
             await cheshire_cat.rabbit_hole.delete_source(cheshire_cat, name)
             expected.pop(name, None)

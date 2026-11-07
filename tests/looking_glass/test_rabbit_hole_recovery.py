@@ -1,0 +1,472 @@
+"""Bringing the sources up to date: ``RabbitHole.rerun_source``, the automatic resume (``cat.rabbit_hole.recovery``) and the
+re-embedding on a change of the embedder (``BillTheLizard.embed_all_in_cheshire_cats``)."""
+import asyncio
+from io import BytesIO
+
+import pytest
+
+from cat.core_plugins.base_plugin.file_managers.custom import LocalFileManager
+from cat.db.cruds import conversations as crud_conversations
+from cat.db.cruds import ingestions as crud_ingestions
+from cat.db.cruds import users as crud_users
+from cat.looking_glass import CheshireCat
+from cat.rabbit_hole import RabbitHole, chunks, engine, recovery
+from cat.rabbit_hole.phases import IngestionSource
+from cat.services.memory.models import VectorMemoryType
+
+TEXT = ("Curiouser and curiouser! cried Alice, she was so much surprised. " * 30).encode()
+
+
+@pytest.fixture
+def files(monkeypatch):
+    """Every CheshireCat of the test keeps its files (the default file manager of the tests keeps none)."""
+    local = LocalFileManager()
+    monkeypatch.setattr(CheshireCat, "file_manager", property(lambda self: local, lambda self, value: None))
+    return local
+
+
+@pytest.fixture
+def embedder_name(monkeypatch):
+    """The name of the embedder in the material settings: changing it is a change of the embedder."""
+    from cat.rabbit_hole import phases
+
+    current = {"name": "embedder-1"}
+    real = phases.service_settings
+
+    async def service_settings(key_id, category):
+        return {"name": current["name"]} if category == "embedder" else await real(key_id, category)
+
+    monkeypatch.setattr(phases, "service_settings", service_settings)
+    return current
+
+
+@pytest.fixture
+def parses(monkeypatch):
+    calls = []
+    real = RabbitHole._parse_to_docs
+
+    async def counting(self, source, file_bytes, content_type):
+        calls.append(source)
+        return await real(self, source, file_bytes, content_type)
+
+    monkeypatch.setattr(RabbitHole, "_parse_to_docs", counting)
+    return calls
+
+
+async def ingest(cat, name="story.txt", data=TEXT):
+    return await cat.rabbit_hole.ingest_file(
+        cat=cat, file=BytesIO(data), metadata={}, filename=name, content_type="text/plain",
+    )
+
+
+async def points_of(ccat, name, collection=VectorMemoryType.DECLARATIVE):
+    points, _ = await ccat.vector_memory_handler.get_all_tenant_points(
+        str(collection), metadata={"source": name}, with_vectors=False,
+    )
+    return points
+
+
+async def chat_of_a_user(ccat):
+    """A chat owned by a stored user, as a client opening it does."""
+    user = await crud_users.create_user(ccat.agent_key, {"username": "alice", "password": "alice-password"})
+    await crud_conversations.claim_conversation(ccat.agent_key, "chat-1", user["id"])
+    return await ccat._find_stray_cat("chat-1")
+
+
+async def crash(ccat, name):
+    """A worker that died in the middle of the source: the row in flight, its lock expired."""
+    await crud_ingestions.update_status(ccat.agent_key, None, name, status="processing", owner=engine.OWNER)
+    await crud_ingestions.reset_phase_entries(ccat.agent_key, None, name, ["embedding"])
+
+
+# --- rerun_source ------------------------------------------------------------------------------------------------
+
+async def test_a_source_held_by_a_live_worker_is_left_alone(cheshire_cat, files):
+    await ingest(cheshire_cat)
+    await crash(cheshire_cat, "story.txt")
+
+    async with engine.source_lock(IngestionSource(cheshire_cat.agent_key, None, "story.txt")):
+        assert await cheshire_cat.rabbit_hole.rerun_source(cheshire_cat, "story.txt", blocking=False) is None
+        row = await crud_ingestions.get_status(cheshire_cat.agent_key, None, "story.txt")
+
+    assert row["status"] == "processing" and "embedding" not in row["completed_phases"]
+
+
+async def test_a_crashed_ingestion_is_completed(cheshire_cat, files, parses):
+    await ingest(cheshire_cat)
+    await crash(cheshire_cat, "story.txt")
+
+    row = await cheshire_cat.rabbit_hole.rerun_source(cheshire_cat, "story.txt", blocking=False)
+
+    assert row["status"] == "completed" and parses == ["story.txt"]  # the chunks are reused
+    assert len(await points_of(cheshire_cat, "story.txt")) == row["completed_phases"]["embedding"]["processed"]
+
+
+async def test_an_interrupted_deletion_is_completed(cheshire_cat, files):
+    await ingest(cheshire_cat)
+    await crud_ingestions.update_status(cheshire_cat.agent_key, None, "story.txt", status="deleting")
+
+    assert await cheshire_cat.rabbit_hole.rerun_source(cheshire_cat, "story.txt") is None
+
+    assert await crud_ingestions.get_status(cheshire_cat.agent_key, None, "story.txt") is None
+    assert await points_of(cheshire_cat, "story.txt") == []
+
+
+async def test_a_url_interrupted_while_downloading_is_downloaded_again(cheshire_cat, files, monkeypatch):
+    downloads = []
+
+    async def resolve(self, file, filename, content_type):
+        downloads.append(file)
+        return file, TEXT, "text/plain", True
+
+    monkeypatch.setattr(RabbitHole, "_resolve_source_bytes", resolve)
+    await crud_ingestions.create_status(cheshire_cat.agent_key, None, "https://x.org/page", type_="url")
+    await crud_ingestions.update_status(cheshire_cat.agent_key, None, "https://x.org/page", status="downloading")
+
+    row = await cheshire_cat.rabbit_hole.rerun_source(cheshire_cat, "https://x.org/page", blocking=False)
+
+    assert row["status"] == "completed" and downloads == ["https://x.org/page"]
+    assert chunks.read_source_bytes(files, cheshire_cat.agent_key, None, "https://x.org/page") == TEXT
+
+
+async def test_a_url_that_cannot_be_downloaded_again_fails(cheshire_cat, files, monkeypatch):
+    async def unreachable(self, file, filename, content_type):
+        return None, None, None, True
+
+    monkeypatch.setattr(RabbitHole, "_resolve_source_bytes", unreachable)
+    await crud_ingestions.create_status(cheshire_cat.agent_key, None, "https://x.org/page", type_="url")
+
+    row = await cheshire_cat.rabbit_hole.rerun_source(cheshire_cat, "https://x.org/page")
+
+    assert row["status"] == "error" and "Cannot download" in row["error"]
+
+
+async def test_the_states_of_a_download_belong_to_the_upload_only(cheshire_cat, files, monkeypatch):
+    seen = []
+    real_update = crud_ingestions.update_status
+
+    async def update_status(agent_id, chat_id, source, **fields):
+        seen.append(fields.get("status"))
+        return await real_update(agent_id, chat_id, source, **fields)
+
+    class Response:
+        headers = {"Content-Type": "text/plain"}
+        content = TEXT
+
+        def raise_for_status(self):
+            pass
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def get(self, url, headers=None):
+            return Response()
+
+    monkeypatch.setattr("cat.rabbit_hole.core.AsyncClient", Client)
+    monkeypatch.setattr(crud_ingestions, "update_status", update_status)
+
+    await cheshire_cat.rabbit_hole.ingest_file(cat=cheshire_cat, file="https://x.org/page", metadata={})
+    assert "downloading" in seen and "downloaded" in seen
+
+    seen.clear()
+    chunks.delete_all(files, cheshire_cat.agent_key, None, "https://x.org/page")  # nothing kept: downloaded again
+    await crud_ingestions.reset_phase_entries(cheshire_cat.agent_key, None, "https://x.org/page", ["parsing_chunking"])
+    row = await cheshire_cat.rabbit_hole.rerun_source(cheshire_cat, "https://x.org/page")
+
+    assert row["status"] == "completed"
+    assert "downloading" not in seen and "downloaded" not in seen
+
+
+# --- the automatic resume ----------------------------------------------------------------------------------------
+
+async def test_the_resume_brings_every_source_up_to_date_and_leaves_the_others(
+    lizard, cheshire_cat, files, embedder_name, parses,
+):
+    for name in ("crashed.txt", "fresh.txt", "failed.txt", "stale.txt"):
+        await ingest(cheshire_cat, name)
+    await crash(cheshire_cat, "crashed.txt")
+    await crud_ingestions.update_status(cheshire_cat.agent_key, None, "failed.txt", status="error", error="boom")
+    await crud_ingestions.record_phase(cheshire_cat.agent_key, None, "stale.txt", "embedding", {"state": "complete", "tag": "old"})
+    fresh_before = await crud_ingestions.get_status(cheshire_cat.agent_key, None, "fresh.txt")
+    parses.clear()
+
+    await recovery.resume_agent(lizard, cheshire_cat.agent_key)
+
+    rows = {r["source"]: r for r in await crud_ingestions.list_statuses(cheshire_cat.agent_key)}
+    assert rows["crashed.txt"]["status"] == "completed"
+    assert rows["stale.txt"]["completed_phases"]["embedding"]["tag"] != "old"
+    assert rows["fresh.txt"] == fresh_before  # nothing written
+    assert rows["failed.txt"]["status"] == "error"
+    assert parses == []  # only embeddings ran
+
+
+async def test_a_change_of_the_embedder_is_caught_by_the_resume(lizard, cheshire_cat, files, embedder_name, parses):
+    await ingest(cheshire_cat)
+    parses.clear()
+    embedder_name["name"] = "embedder-2"
+
+    await recovery.resume_agent(lizard, cheshire_cat.agent_key)
+
+    row = await crud_ingestions.get_status(cheshire_cat.agent_key, None, "story.txt")
+    assert row["status"] == "completed" and parses == []
+
+
+async def test_an_agent_in_maintenance_or_held_by_another_pod_is_skipped(lizard, cheshire_cat, files):
+    await ingest(cheshire_cat)
+    await crash(cheshire_cat, "story.txt")
+
+    await crud_ingestions.set_maintenance(cheshire_cat.agent_key, ttl=60)
+    await recovery.resume_agent(lizard, cheshire_cat.agent_key)
+    assert (await crud_ingestions.get_status(cheshire_cat.agent_key, None, "story.txt"))["status"] == "processing"
+
+    await crud_ingestions.clear_maintenance(cheshire_cat.agent_key)
+    from cat.db import crud
+    async with crud.distributed_lock(f"ingestion-resume:{cheshire_cat.agent_key}", timeout=10):
+        await recovery.resume_agent(lizard, cheshire_cat.agent_key)
+    assert (await crud_ingestions.get_status(cheshire_cat.agent_key, None, "story.txt"))["status"] == "processing"
+
+
+async def test_the_resume_of_an_agent_without_sources_or_gone_does_nothing(lizard, cheshire_cat):
+    await recovery.resume_agent(lizard, cheshire_cat.agent_key)
+    await crud_ingestions.create_status("ghost-agent", None, "x.txt", type_="file")
+    await recovery.resume_agent(lizard, "ghost-agent")
+    assert (await crud_ingestions.get_status("ghost-agent", None, "x.txt"))["status"] == "uploaded"
+
+
+async def test_a_failing_agent_does_not_stop_the_resume_of_the_others(lizard, monkeypatch):
+    agents = []
+
+    async def resume_agent(lizard_, agent_id):
+        agents.append(agent_id)
+        if agent_id == "a1":
+            raise ConnectionError("redis blip")
+
+    async def agents_main_keys():
+        return ["a1", "a2"]
+
+    monkeypatch.setattr(recovery, "resume_agent", resume_agent)
+    monkeypatch.setattr(recovery.crud_settings, "get_agents_main_keys", agents_main_keys)
+
+    await recovery.resume_all(lizard)
+
+    assert agents == ["a1", "a2"]
+
+
+@pytest.mark.parametrize("interval", ["-1", "0"])
+async def test_the_resume_disabled_runs_no_pass(lizard, monkeypatch, interval):
+    calls = []
+
+    async def resume_all(lizard_):
+        calls.append(1)
+
+    monkeypatch.setenv("CAT_INGESTION_RESUME_INTERVAL_SECONDS", interval)
+    monkeypatch.setattr(recovery, "resume_all", resume_all)
+
+    await recovery.run(lizard)
+
+    assert calls == []
+
+
+async def test_the_periodic_resume_survives_a_failed_pass_and_stops_with_the_pod(lizard, monkeypatch):
+    calls = []
+
+    async def resume_all(lizard_):
+        calls.append(1)
+        if len(calls) == 1:
+            raise ConnectionError("redis blip")
+
+    monkeypatch.setenv("CAT_INGESTION_RESUME_INTERVAL_SECONDS", "1")
+    monkeypatch.setattr(recovery, "resume_all", resume_all)
+
+    task = asyncio.create_task(recovery.run(lizard))
+    await asyncio.sleep(1.5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert len(calls) == 2
+
+
+async def test_the_pod_starts_its_resume_and_stops_it(lizard):
+    started = lizard._ingestion_resume  # created by the bootstrap of the app (disabled in the tests: already done)
+    assert started is not None and started.done()
+
+    pending = asyncio.create_task(asyncio.sleep(3600))
+    lizard._ingestion_resume = pending
+    await lizard._stop_ingestion_resume()
+
+    assert pending.cancelled() and lizard._ingestion_resume is None
+    await lizard._stop_ingestion_resume()  # nothing to stop
+
+
+# --- the change of the embedder ----------------------------------------------------------------------------------
+
+async def test_a_change_of_the_embedder_reembeds_the_stored_chunks_and_reingests_the_old_sources(
+    lizard, cheshire_cat, files, embedder_name, parses,
+):
+    await ingest(cheshire_cat, "stateful.txt")
+    # a source ingested before the states existed: points and file, no row
+    files.write_file(TEXT, "legacy.txt", cheshire_cat.agent_key)
+    rabbit_hole = __import__("copy").copy(cheshire_cat.rabbit_hole)
+    await rabbit_hole.setup(cheshire_cat)
+    from langchain_core.documents import Document
+    await rabbit_hole.store_documents([Document(page_content="old knowledge")], "legacy.txt")
+    parses.clear()
+    embedder_name["name"] = "embedder-2"
+
+    await lizard.embed_all_in_cheshire_cats()
+
+    assert parses == ["legacy.txt"]  # the stateful source reuses its chunks
+    stateful = await crud_ingestions.get_status(cheshire_cat.agent_key, None, "stateful.txt")
+    legacy = await crud_ingestions.get_status(cheshire_cat.agent_key, None, "legacy.txt")
+    assert stateful["status"] == "completed" and legacy["status"] == "completed"
+    # the clearing of the collection for the old sources did not remove the re-embedded ones
+    assert len(await points_of(cheshire_cat, "stateful.txt")) == stateful["completed_phases"]["embedding"]["processed"]
+    assert await points_of(cheshire_cat, "legacy.txt")
+
+
+
+
+async def test_a_chat_source_is_rerun_in_its_chat_with_its_owner(cheshire_cat, files, monkeypatch):
+    stray = await chat_of_a_user(cheshire_cat)
+    await ingest(stray)
+    callers = []
+    original = type(cheshire_cat.plugin_manager).execute_hook
+
+    async def execute_hook(self, name, *args, caller):
+        if name == "after_rabbithole_stored_documents":
+            callers.append(getattr(caller, "id", None))
+        return await original(self, name, *args, caller=caller)
+
+    monkeypatch.setattr(type(cheshire_cat.plugin_manager), "execute_hook", execute_hook)
+
+    row = await cheshire_cat.rabbit_hole.rerun_source(cheshire_cat, "story.txt", "chat-1", invalidate=["embedding"])
+
+    assert row["status"] == "completed" and callers == ["chat-1"]
+    assert await points_of(cheshire_cat, "story.txt", VectorMemoryType.EPISODIC)
+
+
+async def test_invalidated_phases_run_again_with_their_dependents(cheshire_cat, files, parses):
+    await ingest(cheshire_cat)
+    parses.clear()
+
+    row = await cheshire_cat.rabbit_hole.rerun_source(cheshire_cat, "story.txt", invalidate=["parsing_chunking"])
+
+    assert parses == ["story.txt"] and row["status"] == "completed"
+    assert row["completed_phases"]["embedding"]["finished_at"] >= row["completed_phases"]["parsing_chunking"]["finished_at"]
+
+
+async def test_a_failing_source_does_not_stop_the_resume_of_the_others(lizard, cheshire_cat, files, monkeypatch):
+    for name in ("broken.txt", "crashed.txt"):
+        await ingest(cheshire_cat, name)
+        await crash(cheshire_cat, name)
+    real = RabbitHole.rerun_source
+
+    async def rerun_source(self, cat, name, chat_id=None, blocking=True, invalidate=None):
+        if name == "broken.txt":
+            raise ConnectionError("graph store down")
+        return await real(self, cat, name, chat_id, blocking, invalidate)
+
+    monkeypatch.setattr(RabbitHole, "rerun_source", rerun_source)
+
+    await recovery.resume_agent(lizard, cheshire_cat.agent_key)
+
+    assert (await crud_ingestions.get_status(cheshire_cat.agent_key, None, "crashed.txt"))["status"] == "completed"
+
+
+async def test_the_resume_stops_when_the_agent_goes_in_maintenance(lizard, cheshire_cat, files, monkeypatch):
+    for name in ("first.txt", "second.txt"):
+        await ingest(cheshire_cat, name)
+        await crash(cheshire_cat, name)
+    real = RabbitHole.rerun_source
+
+    async def rerun_then_maintenance(self, cat, name, chat_id=None, blocking=True, invalidate=None):
+        row = await real(self, cat, name, chat_id, blocking, invalidate)
+        await crud_ingestions.set_maintenance(cat.agent_key, ttl=60)  # e.g. a change of the embedder starts
+        return row
+
+    monkeypatch.setattr(RabbitHole, "rerun_source", rerun_then_maintenance)
+
+    await recovery.resume_agent(lizard, cheshire_cat.agent_key)
+
+    statuses = sorted(r["status"] for r in await crud_ingestions.list_statuses(cheshire_cat.agent_key))
+    assert statuses == ["completed", "processing"]
+
+
+async def test_a_change_of_the_embedder_redoes_the_embeddings_lost_with_the_old_collections(
+    lizard, cheshire_cat, files, embedder_name, monkeypatch,
+):
+    await ingest(cheshire_cat)
+    embedder_name["name"] = "embedder-2"
+    # the resume re-embeds with the new embedder before the collections are recreated: the diary looks up to date
+    await cheshire_cat.rabbit_hole.rerun_source(cheshire_cat, "story.txt")
+    handler_class = type(cheshire_cat.vector_memory_handler)
+    resumes = []
+
+    async def initialize(self, embedder_name_, embedder_size):
+        for collection in (VectorMemoryType.DECLARATIVE, VectorMemoryType.EPISODIC):
+            await self.delete_tenant_points(str(collection))  # the collections are recreated: their points are gone
+        resumes.append(await crud_ingestions.is_in_maintenance(cheshire_cat.agent_key))
+
+    monkeypatch.setattr(handler_class, "initialize", initialize)
+
+    await lizard.embed_all_in_cheshire_cats()
+
+    row = await crud_ingestions.get_status(cheshire_cat.agent_key, None, "story.txt")
+    assert row["status"] == "completed"
+    assert len(await points_of(cheshire_cat, "story.txt")) == row["completed_phases"]["embedding"]["processed"]
+    assert resumes == [True]  # the agent was in maintenance meanwhile
+    assert not await crud_ingestions.is_in_maintenance(cheshire_cat.agent_key)
+
+
+async def test_reingesting_old_sources_keeps_the_points_of_the_others(cheshire_cat, files):
+    await ingest(cheshire_cat, "stateful.txt")
+    files.write_file(TEXT, "legacy.txt", cheshire_cat.agent_key)
+    from cat.looking_glass.models import StoredSourceWithMetadata
+
+    await cheshire_cat.embed_stored_sources(
+        VectorMemoryType.DECLARATIVE,
+        [StoredSourceWithMetadata(name="legacy.txt", path=cheshire_cat.agent_key, content=BytesIO(TEXT), metadata={})],
+    )
+
+    assert await points_of(cheshire_cat, "stateful.txt")
+    assert await points_of(cheshire_cat, "legacy.txt")
+
+
+async def test_stopping_the_pod_during_a_resume_is_not_swallowed(lizard, cheshire_cat, files, monkeypatch):
+    await ingest(cheshire_cat)
+    await crash(cheshire_cat, "story.txt")
+
+    async def stopped(self, *args, **kwargs):
+        raise asyncio.CancelledError()  # the pod stops while the source is resumed
+
+    monkeypatch.setenv("CAT_INGESTION_RESUME_INTERVAL_SECONDS", "60")
+    monkeypatch.setattr(RabbitHole, "rerun_source", stopped)
+
+    with pytest.raises(asyncio.CancelledError):
+        await recovery.run(lizard)
+
+
+async def test_a_failed_change_of_the_embedder_leaves_no_agent_in_maintenance(lizard, cheshire_cat, monkeypatch):
+    outcomes = []
+    original = type(lizard.plugin_manager).execute_hook
+
+    async def initialize(self, embedder_name_, embedder_size):
+        raise ConnectionError("vector db down")
+
+    async def execute_hook(self, name, *args, caller):
+        if name == "after_all_cheshire_cats_embedded":
+            outcomes.append(args[0])
+        return await original(self, name, *args, caller=caller)
+
+    monkeypatch.setattr(type(cheshire_cat.vector_memory_handler), "initialize", initialize)
+    monkeypatch.setattr(type(lizard.plugin_manager), "execute_hook", execute_hook)
+
+    await lizard.embed_all_in_cheshire_cats()
+
+    assert outcomes == [False]
+    assert not await crud_ingestions.is_in_maintenance(cheshire_cat.agent_key)

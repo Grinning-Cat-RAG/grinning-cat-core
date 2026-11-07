@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 from typing import List, Dict
 from fastapi import FastAPI
 
@@ -20,9 +21,15 @@ from cat.looking_glass.mad_hatter.mad_hatter import MadHatter
 from cat.looking_glass.mad_hatter.registry import PluginRegistry
 from cat.mixins import NonCopyableMixin, OrchestratorMixin
 from cat.rabbit_hole import RabbitHole
+from cat.rabbit_hole.phases import PHASE_EMBEDDING
+from cat.rabbit_hole import recovery as ingestion_recovery
 from cat.services.factory.auth_handler import CoreAuthHandler
 from cat.services.websocket_manager import WebSocketManager
 from cat.utils import safe_deepcopy, sanitize_permissions, singleton
+
+
+#: TTL of the maintenance marker set on every agent while the embedder changes (cleared at the end of each agent)
+EMBED_ALL_MAINTENANCE_SECONDS = 2 * 3600
 
 
 @singleton
@@ -62,6 +69,7 @@ class BillTheLizard(OrchestratorMixin, NonCopyableMixin):
         self.websocket_manager = None
         self.rabbit_hole = None
         self.core_auth_handler = None
+        self._ingestion_resume: asyncio.Task | None = None
 
     async def bootstrap(self):
         """
@@ -104,7 +112,18 @@ class BillTheLizard(OrchestratorMixin, NonCopyableMixin):
         # local-only mode if Redis pub/sub is unavailable.
         await self.websocket_manager.start()
 
+        # resume what a crash or a restart left behind, in background (never blocks the bootstrap)
+        self._ingestion_resume = asyncio.create_task(ingestion_recovery.run(self))
+
         await self.plugin_manager.execute_hook("after_lizard_bootstrap", caller=self)
+
+    async def _stop_ingestion_resume(self) -> None:
+        """Stop the automatic resume of the ingestions of this pod (a source it was processing resumes at the next start)."""
+        if (resume := self._ingestion_resume) is not None:
+            resume.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await resume
+            self._ingestion_resume = None
 
     async def create_cheshire_cat(self, agent_id: str, metadata: Dict | None = None) -> CheshireCat:
         """
@@ -232,48 +251,68 @@ class BillTheLizard(OrchestratorMixin, NonCopyableMixin):
         return cloned_ccat  # type: ignore[return-value]
 
     async def embed_all_in_cheshire_cats(self) -> None:
-        """Re-embeds all the stored files and procedures in all the Cheshire Cats using the current embedder.
+        """Re-embeds the sources and the procedures of every Cheshire Cat with the current embedder.
 
-        Upstream-parity implementation with one fix: the upstream version runs
-        ``embed_with_limit`` inside the per-agent initialization loop, i.e. the
-        whole re-embed pass is executed once PER AGENT (N passes for N agents).
-        Here every database is initialized first (serialized), then the
-        re-embeds run exactly once under the concurrency cap.
+        Changing the embedder recreates the collections (``initialize``), shared by every agent: what each agent holds
+        is read first, then every database is initialized (serialized), then the re-embeds run under the concurrency
+        cap. A source without an ingestion state (ingested before the states existed) is ingested again from its file;
+        a source with a state runs its embedding again (the stored chunks are reused), whatever its diary says: the
+        collections were recreated. Meanwhile every agent is in maintenance, so the automatic resume leaves it alone.
         """
 
         async def embed_with_limit(entry_):
             async with semaphore:
-                # re-embed all the stored files
+                ccat = entry_["ccat"]
+                # first the sources without a state: embed_stored_sources clears the collection before ingesting them
                 tasks = [
-                    entry_["ccat"].embed_stored_sources(collection_name, sources)
-                    for collection_name, sources in entry_["stored_sources"].items()
+                    ccat.embed_stored_sources(collection_name, sources)
+                    for collection_name, sources in entry_["legacy_sources"].items()
                     if sources
-                ] + [entry_["ccat"].embed_procedures()]
+                ] + [ccat.embed_procedures()]
                 await asyncio.gather(*tasks)
+                # then the sources with a state: their embedding again (and the phases depending on it)
+                for row in entry_["rows"]:
+                    await self.rabbit_hole.rerun_source(ccat, row["source"], row["chat_id"], invalidate=[PHASE_EMBEDDING])
+                await crud_ingestions.clear_maintenance(ccat.agent_key)
 
         success = False
+        ccat_ids: List[str] = []
         try:
             embedder = await self.embedder()
             embedder_name = embedder.name
             embedder_size = await embedding_size(embedder)
 
             ccat_ids = await crud_settings.get_agents_main_keys()
+            # the automatic resume would re-embed meanwhile, into collections about to be recreated
+            for ccat_id in ccat_ids:
+                await crud_ingestions.set_maintenance(ccat_id, ttl=EMBED_ALL_MAINTENANCE_SECONDS)
             stored_files_by_ccat: List[Dict] = []
-            # first, I need to get all the stored files from all the Cheshire Cats with the metadata stored
-            # within the vector memory; I do not remove anything from the latter to avoid any race condition
+            # first, what each Cheshire Cat holds, read before the collections are recreated: the sources without an
+            # ingestion state (only in the vector memory and in the files) are ingested again from their files
             for ccat_id in ccat_ids:
                 if (ccat := await self.get_cheshire_cat(ccat_id)) is None:
                     continue
 
+                with_state = {(row["source"], row["chat_id"]) for row in await crud_ingestions.list_statuses(ccat_id)}
                 stored_files_by_ccat.append({
                     "ccat": ccat,
-                    "stored_sources": await ccat.get_stored_sources_with_metadata(),
+                    "legacy_sources": {
+                        collection: [
+                            source for source in sources
+                            if (source.name, source.metadata.get("chat_id")) not in with_state
+                        ]
+                        for collection, sources in (await ccat.get_stored_sources_with_metadata()).items()
+                    },
                 })
 
             # re-initialize all the vector databases in a serialized way, outside threads to avoid
             # race conditions
             for entry in stored_files_by_ccat:
                 await entry["ccat"].vector_memory_handler.initialize(embedder_name, embedder_size)
+
+            # the sources with a state, listed after the initialization: the ingestions ended meanwhile are included
+            for entry in stored_files_by_ccat:
+                entry["rows"] = await crud_ingestions.list_statuses(entry["ccat"].agent_key)
 
             # finally, re-embed all the stored files in an asynchronous way
             # limit concurrent embeddings to avoid overwhelming resources
@@ -283,6 +322,9 @@ class BillTheLizard(OrchestratorMixin, NonCopyableMixin):
             success = True
         except Exception as e:
             log.error(f"Error embedding all stored files: {e}")
+        finally:
+            for ccat_id in ccat_ids:  # also the agents not reached, if the pass failed
+                await crud_ingestions.clear_maintenance(ccat_id)
 
         await self.plugin_manager.execute_hook(
             "after_all_cheshire_cats_embedded", success, caller=self,
@@ -435,6 +477,7 @@ class BillTheLizard(OrchestratorMixin, NonCopyableMixin):
             None
         """
         await self.plugin_manager.execute_hook("before_lizard_shutdown", caller=self)
+        await self._stop_ingestion_resume()
         if self.websocket_manager:
             await self.websocket_manager.close_connections()
 

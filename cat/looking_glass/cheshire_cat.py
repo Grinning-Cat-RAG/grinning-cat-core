@@ -246,8 +246,8 @@ class CheshireCat(BotMixin, NonCopyableMixin):
         Embeds stored sources into a vector memory collection.
 
         This method retrieves and processes a list of stored sources with their associated metadata and incorporates
-        them into a vector memory collection. During this process, any pre-existing embeddings in the collection are
-        cleared, and files are systematically ingested. The method handles potential irregularities such as missing
+        them into a vector memory collection. During this process, the pre-existing embeddings of these sources are
+        cleared (not the other sources of the agent), and files are systematically ingested. The method handles potential irregularities such as missing
         content or stray references and logs appropriate messages.
 
         Args:
@@ -262,8 +262,12 @@ class CheshireCat(BotMixin, NonCopyableMixin):
         """
         log.info(f"Agent id: {self._id}. Embedding stored files to the vector memory")
 
-        # first, clear all existing declarative and episodic embeddings
-        await self.vector_memory_handler.delete_tenant_points(str(collection_name))
+        # first, clear the embeddings of these sources only (the other sources of the agent may be re-embedded already)
+        for source in stored_sources:
+            chat_id = source.metadata.get("chat_id")
+            await self.vector_memory_handler.delete_tenant_points(
+                str(collection_name), {"source": source.name} | ({"chat_id": chat_id} if chat_id else {}),
+            )
 
         rabbit_hole = self.rabbit_hole
         counter = 0

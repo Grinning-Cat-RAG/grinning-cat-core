@@ -11,7 +11,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from io import BytesIO
-from typing import Any, Awaitable, Callable, Dict, List, Tuple
+from typing import Any, Awaitable, Callable, Dict, Iterable, List, Tuple
 
 from httpx import AsyncClient
 from langchain_core.documents.base import Blob, Document
@@ -183,16 +183,15 @@ class RabbitHole:
         return {"source": source.name} | ({"chat_id": source.chat_id} if source.chat_id is not None else {})
 
     async def _ingestion_url_downloading(self, url: str):
-        """The download of ``url`` is about to start."""
-        await crud_ingestions.update_status(
-            self.cat.agent_key, self.stray.id if self.stray else None, url, status=IngestionStatus.DOWNLOADING,
-        )
+        """The download of ``url`` is about to start: the state of the upload says so (a download inside a phase, e.g.
+        a resume, leaves the state to the phase)."""
+        if (source := getattr(self, "_uploading", None)) is not None:
+            await crud_ingestions.update_status(source.agent_id, source.chat_id, url, status=IngestionStatus.DOWNLOADING)
 
     async def _ingestion_url_downloaded(self, url: str):
-        """The download of ``url`` completed successfully."""
-        await crud_ingestions.update_status(
-            self.cat.agent_key, self.stray.id if self.stray else None, url, status=IngestionStatus.DOWNLOADED,
-        )
+        """The download of ``url`` completed successfully (see ``_ingestion_url_downloading``)."""
+        if (source := getattr(self, "_uploading", None)) is not None:
+            await crud_ingestions.update_status(source.agent_id, source.chat_id, url, status=IngestionStatus.DOWNLOADED)
 
     async def _ingest_memory(self, cat: "CheshireCat", file: BytesIO, filename: str):  # type: ignore[name-defined]
         """Upload memories to the declarative memory from a JSON file.
@@ -325,9 +324,11 @@ class RabbitHole:
                     content_type=content_type,
                 )
                 try:
+                    self._uploading = source
                     _, file_bytes, content_type, _ = await self._resolve_source_bytes(
                         file=file, filename=filename, content_type=content_type
                     )
+                    self._uploading = None
                     await self._check_still_wanted(source)  # e.g. the chat was deleted during the download
                     if not file_bytes:
                         raise ValueError(f"Something went wrong with the source '{name}'")
@@ -360,6 +361,7 @@ class RabbitHole:
         finally:
             self._pending = None
             self._pending_chunks = None
+            self._uploading = None
 
         if row and row["status"] == IngestionStatus.COMPLETED.value:
             embedding = row["completed_phases"].get(PHASE_EMBEDDING) or {}
@@ -398,6 +400,41 @@ class RabbitHole:
                 return result
         except engine.LockError as e:
             raise SourceBusy(name) from e
+
+    async def rerun_source(
+        self,
+        cat: "CheshireCat",  # type: ignore[name-defined]
+        name: str,
+        chat_id: str | None = None,
+        blocking: bool = True,
+        invalidate: Iterable[str] | None = None,
+    ) -> Dict | None:
+        """Bring a source of the agent (``chat_id=None``: its knowledge base) or of a chat up to date: run its stale
+        phases (an ingestion interrupted by a crash, a change of the embedder, of the chunker or of the settings of a
+        phase), or complete an interrupted deletion. Nothing is written when nothing changed. Public API: the automatic
+        resume, the change of the embedder and the maintenance scripts use it.
+
+        ``invalidate``: phases to run again even if their diary says they are up to date (e.g. the embedding, once the
+        collections were recreated); their dependents run again too. It waits for a worker holding the source, unless
+        ``blocking=False``. Returns the row of the source, or None when the source is gone (deleted, canceled) or held by
+        a live worker (``blocking=False``)."""
+        rabbit_hole = copy.copy(self)
+        await rabbit_hole.setup(cat)
+        ccat = rabbit_hole.cat
+        if chat_id is not None:
+            rabbit_hole.stray = await ccat._find_stray_cat(chat_id)  # the owner of the chat
+        source = IngestionSource(ccat.agent_key, chat_id, name, "url" if fnc_is_url(name) else "file")
+        try:
+            async with engine.source_lock(source, blocking=blocking):
+                row = await crud_ingestions.get_status(source.agent_id, chat_id, name)
+                if row is not None and row["status"] == IngestionStatus.DELETING.value:
+                    await engine.delete_source(rabbit_hole, ccat, source)
+                    return None
+                if row is not None and invalidate:
+                    await crud_ingestions.reset_phase_entries(source.agent_id, chat_id, name, invalidate)
+                return await engine.run_phases(rabbit_hole, ccat, source)
+        except (engine.LockError, engine.IngestionCanceled, engine.LockLost):
+            return None
 
     async def _is_still_wanted(self, source: IngestionSource) -> bool:
         """Whether the source is still to be ingested: its agent and its row exist (a deleted chat removes its rows)."""
@@ -463,6 +500,15 @@ class RabbitHole:
         else:
             file_bytes = await asyncio.to_thread(
                 chunks.read_source_bytes, file_manager, source.agent_id, source.chat_id, source.name,
+            )
+        if file_bytes is None and source.type == "url":
+            # e.g. the worker crashed while downloading it: download it again, and keep it
+            _, file_bytes, content_type, _ = await self._resolve_source_bytes(source.name, source.name, None)
+            if not file_bytes:
+                return PhaseResult(status="error", reason=f"Cannot download the source {source.name}")
+            await crud_ingestions.update_status(source.agent_id, source.chat_id, source.name, content_type=content_type)
+            await asyncio.to_thread(
+                chunks.write_source_bytes, file_manager, source.agent_id, source.chat_id, source.name, file_bytes,
             )
         if file_bytes is None:
             return PhaseResult(

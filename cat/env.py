@@ -36,6 +36,7 @@ def get_supported_env_variables():
         "CAT_INGESTION_HEARTBEAT_SECONDS": "30",
         "CAT_INGESTION_LOCK_TIMEOUT_SECONDS": "300",
         "CAT_INGESTION_NOT_READY_MAX_SECONDS": "3600",
+        "CAT_INGESTION_RESUME_INTERVAL_SECONDS": "60",
     }
 
 

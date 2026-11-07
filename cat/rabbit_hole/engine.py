@@ -147,6 +147,11 @@ async def collect_phases(rabbit_hole, cat) -> List[IngestionPhase]:
     return execution_order(phases)
 
 
+async def current_tags(rabbit_hole, cat) -> Dict[str, str]:
+    """The current tag of every phase of the agent (the same for all its sources)."""
+    return await compute_tags(await collect_phases(rabbit_hole, cat), cat)
+
+
 def _entry(state: str, tag: str | None, result: PhaseResult | None = None, reason: str | None = None) -> Dict:
     entry = {"state": state, "tag": tag, "reason": reason, "finished_at": round(time.time(), 3)}
     if result is not None:
@@ -308,6 +313,7 @@ async def delete_source(rabbit_hole, cat, source: IngestionSource) -> None:
 
 
 __all__ = [
-    "BOOT_ID", "OWNER", "IngestionCanceled", "LockError", "LockLost", "agent_exists", "collect_phases", "delete_source",
+    "BOOT_ID", "OWNER", "IngestionCanceled", "LockError", "LockLost", "agent_exists", "collect_phases", "current_tags",
+    "delete_source",
     "heartbeat_seconds", "lock_timeout_seconds", "run_phases", "source_lock",
 ]
