@@ -3,6 +3,12 @@ from typing import Type
 
 from cat.log import log
 from cat.services.factory.models import BaseFactoryConfigModel
+from cat.services.ingestion.locks import IngestionLockManager, NoopLockManager
+from cat.services.ingestion.pipeline import CoreSinglePassPipeline, IngestionPipeline
+from cat.services.ingestion.profile import IngestionProfile
+from cat.services.ingestion.recovery import IngestionRecovery, NoopRecovery
+from cat.services.ingestion.state import CoreIngestionStateStore, IngestionStateStore
+from cat.services.ingestion.tags import IngestionTagResolver, SettingsVersionTags
 
 
 class BaseIngestionEngine(ABC):
@@ -13,7 +19,12 @@ class BaseIngestionEngine(ABC):
     configured engine and call ``ingest_file`` instead of calling
     ``rabbit_hole.ingest_file`` directly, so a plugin can fully replace the
     ingestion flow. The re-embed pass on embedder change is exposed via ``run``.
+
+    ``profile`` is the bundle of the five ingestion parts for the resolved
+    configuration, attached by the factory after construction. It is ``None``
+    on an engine built directly (no behaviour change for such callers).
     """
+    profile: IngestionProfile | None = None
     @abstractmethod
     async def run(self, lizard) -> bool:
         pass
@@ -82,9 +93,77 @@ class BaseIngestionConfiguration(BaseFactoryConfigModel, ABC):
     def base_class(cls) -> type:
         return BaseIngestionEngine
 
+    @classmethod
+    def pipeline(cls) -> type[IngestionPipeline]:
+        """The pipeline implementation for this configuration."""
+        return CoreSinglePassPipeline
+
+    @classmethod
+    def state_store(cls) -> type[IngestionStateStore]:
+        """The state-store implementation for this configuration."""
+        return CoreIngestionStateStore
+
+    @classmethod
+    def recovery(cls) -> type[IngestionRecovery]:
+        """The recovery implementation for this configuration."""
+        return NoopRecovery
+
+    @classmethod
+    def locks(cls) -> type[IngestionLockManager]:
+        """The lock-manager implementation for this configuration."""
+        return NoopLockManager
+
+    @classmethod
+    def tags(cls) -> type[IngestionTagResolver]:
+        """The tag-resolver implementation for this configuration."""
+        return SettingsVersionTags
+
+    @classmethod
+    def profile(cls) -> IngestionProfile:
+        """Instantiate the five parts into one per-configuration profile."""
+        return IngestionProfile(
+            pipeline=cls.pipeline()(),
+            state_store=cls.state_store()(),
+            recovery=cls.recovery()(),
+            locks=cls.locks()(),
+            tags=cls.tags()(),
+        )
+
+    @classmethod
+    def get_from_config(cls, config) -> Type:
+        """Build the engine, keeping the factory validation, then attach the profile.
+
+        The pyclass/base_class validation is delegated unchanged to
+        :meth:`BaseFactoryConfigModel.get_from_config`; only the profile
+        attachment is added on top.
+        """
+        obj = super().get_from_config(config)
+        obj.profile = cls.profile()
+        return obj
+
 
 class CoreIngestionConfiguration(BaseIngestionConfiguration):
     """Base configuration: the upstream-parity re-embed flow (core)."""
     @classmethod
     def pyclass(cls) -> Type:
         return CoreIngestionEngine
+
+    @classmethod
+    def pipeline(cls) -> type[IngestionPipeline]:
+        return CoreSinglePassPipeline
+
+    @classmethod
+    def state_store(cls) -> type[IngestionStateStore]:
+        return CoreIngestionStateStore
+
+    @classmethod
+    def recovery(cls) -> type[IngestionRecovery]:
+        return NoopRecovery
+
+    @classmethod
+    def locks(cls) -> type[IngestionLockManager]:
+        return NoopLockManager
+
+    @classmethod
+    def tags(cls) -> type[IngestionTagResolver]:
+        return SettingsVersionTags

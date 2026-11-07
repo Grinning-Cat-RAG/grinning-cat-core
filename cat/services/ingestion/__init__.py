@@ -29,6 +29,7 @@ from cat.services.ingestion.pipeline import (
     CoreSinglePassPipeline,
     IngestionPipeline,
 )
+from cat.services.ingestion.profile import IngestionProfile
 from cat.services.ingestion.recovery import IngestionRecovery, NoopRecovery
 from cat.services.ingestion.tags import IngestionTagResolver, SettingsVersionTags
 
@@ -50,6 +51,7 @@ __all__ = [
     "IngestionPipeline",
     "CoreSinglePassPipeline",
     "CoreIngestionPhase",
+    "IngestionProfile",
     "IngestionRecovery",
     "NoopRecovery",
     "IngestionLockManager",
