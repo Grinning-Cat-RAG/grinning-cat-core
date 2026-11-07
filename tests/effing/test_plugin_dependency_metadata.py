@@ -1,25 +1,16 @@
-"""Dependency-metadata alignment with upstream CAT (plan Todo 6).
+"""Host-side plugin dependency/loader contract kept in core.
 
-Upstream CAT resolves plugin-to-plugin dependencies from ``plugin.json``
-``dependencies`` — exact folder-id strings matched against the plugin folders
-(``Plugin.missing_dependencies``) — and installs pip dependencies from
-``pyproject.toml`` ``[project].dependencies`` via uv (``requirements.txt`` is
-not supported). This test pins both sides of that contract for EffING:
+The manifest-only assertions (dependency string shape, pyproject deps, version
+match) were handed to the plugin's own suite:
+``cat-efficient-ingestion/test_plugin_dependency_metadata.py``.
 
-- the declared dependency string is the real folder id of the multimodal
-  plugin (``cat_multimodal_ingestion``): the hyphenated repo name
-  (``cat-multimodal-ingestion``) is NOT a folder id and would be reported
-  missing, silently preventing the plugin from loading;
-- the plugin loads on CAT with the dependency resolved, and a genuinely
-  missing dependency is reported loudly (never silently skipped).
-
-Runs against upstream CAT: the plugin folder is resolved via ``cat.utils``
-when the file is copied into the host's ``tests/`` (the EffING-vs-CAT
-harness), or by walking up to the folder holding ``plugin.json`` when run
-from the plugin repo itself.
+What stays here needs the HOST: ``Plugin.missing_dependencies`` resolved against
+``cat/core_plugins``, the end-to-end ``lizard`` plugin-manager load, and the
+``min_cat_version`` pin against the host version actually running. Runs against
+upstream CAT: the plugin folder is resolved via ``cat.utils`` (the EffING-vs-CAT
+harness).
 """
 
-import json
 import tomllib
 from pathlib import Path
 
@@ -52,27 +43,9 @@ def _plugin_dir() -> Path:
 
 
 def _manifest() -> dict:
+    import json
+
     return json.loads((_plugin_dir() / "plugin.json").read_text())
-
-
-def test_plugin_json_dependency_matches_folder_id():
-    """The declared dependency is the folder id of the multimodal plugin.
-
-    Upstream matches dependencies against plugin folder ids exactly; the
-    hyphenated repo name (``cat-multimodal-ingestion``) is not a folder id and
-    would be reported missing, blocking the load.
-    """
-    assert _manifest()["dependencies"] == [MMODING_ID]
-    assert (_real_plugins_path() / MMODING_ID).is_dir(), (
-        f"multimodal plugin folder {MMODING_ID!r} not found in the plugins path"
-    )
-
-
-def test_pyproject_declares_project_dependencies():
-    """CAT installs plugin pip deps from ``pyproject.toml [project].dependencies`` (uv)."""
-    data = tomllib.loads((_plugin_dir() / "pyproject.toml").read_text())
-    deps = data["project"]["dependencies"]
-    assert deps, "pyproject.toml must declare [project].dependencies for CAT's uv-based install"
 
 
 def test_loads_on_cat_with_dependency_resolved():
@@ -104,18 +77,13 @@ async def test_plugin_manager_loads_effing_with_dependency_resolved(lizard, monk
     )
     assert loaded.missing_dependencies == []
 
+
 def _host_version() -> str:
     """The host CAT version this plugin is running against."""
     from cat import utils
 
     root = Path(utils.__file__).resolve().parent.parent
     return tomllib.loads((root / "pyproject.toml").read_text())["project"]["version"]
-
-
-def test_manifest_version_matches_pyproject():
-    """``plugin.json`` and ``pyproject.toml`` must advertise the same version."""
-    data = tomllib.loads((_plugin_dir() / "pyproject.toml").read_text())
-    assert _manifest()["version"] == data["project"]["version"]
 
 
 def test_manifest_min_cat_version_matches_the_host_it_needs():

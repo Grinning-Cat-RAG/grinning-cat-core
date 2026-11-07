@@ -85,11 +85,11 @@ async def test_url_bytes_persisted_and_reused_on_second_run(lizard, tmp_path):
         path = ccat.agent_key
         persisted = reembed._persisted_url_file_name(_URL, path)
 
-        _, first_points = await _run(ccat)
+        _, first_points, _, _ = await _run(ccat)
         assert calls == [_URL], "the first run must fetch the URL"
         assert ccat.file_manager.read_file(persisted, path) == _PAYLOAD
 
-        _, second_points = await _run(ccat)
+        _, second_points, _, _ = await _run(ccat)
         assert calls == [_URL], "the second run must read the persisted bytes, not refetch"
         assert ccat.file_manager.read_file(persisted, path) == _PAYLOAD
         assert _texts(second_points) == _texts(first_points), "chunk text must be identical"
@@ -118,7 +118,7 @@ async def test_missing_persisted_file_falls_back_to_resolver_and_logs(lizard, tm
         assert ccat.file_manager.read_file(persisted, path) is None
 
         monkeypatch.setattr(reembed.log, "warning", warnings.append)
-        _, points = await _run(ccat)
+        _, points, _, _ = await _run(ccat)
 
         assert calls == [_URL, _URL], "a missing persisted copy must refetch the URL"
         assert any("No persisted bytes" in w and _URL in w for w in warnings), (
