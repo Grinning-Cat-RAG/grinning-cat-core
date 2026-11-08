@@ -11,7 +11,7 @@ waiting for a live worker) when:
 - it completed, but a tag of its diary is not the current one: the chunker, the embedder or the settings of a phase
   changed, or a phase was added.
 
-Sources in error are left alone: a new upload, or the maintenance, runs them again.
+Sources in error are left alone: POST /ingestion/retry, a new upload, or the maintenance, runs them again.
 """
 import asyncio
 import copy

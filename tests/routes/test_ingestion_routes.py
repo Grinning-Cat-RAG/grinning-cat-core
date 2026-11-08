@@ -209,6 +209,131 @@ async def test_a_row_gone_while_waiting_is_not_found(secure_client, secure_clien
     assert response.status_code == 404
 
 
+# --- POST /ingestion/retry ------------------------------------------------------------------------------------
+
+class SummaryPhase(IngestionPhase):
+    id = "summary"
+    depends_on = ("graph",)
+    runs = 0
+
+    async def process(self, source, cat):
+        SummaryPhase.runs += 1
+        return PhaseResult(status="done")
+
+    async def delete(self, source, cat):
+        pass
+
+
+async def test_retrying_a_failed_source_runs_only_its_failed_phases_and_their_dependents(
+    secure_client, secure_client_headers, cheshire_cat, files, monkeypatch,
+):
+    plug(monkeypatch, cheshire_cat, GraphPhase, SummaryPhase)
+    GraphPhase.outcomes = ["error"]  # e.g. the LLM of the graph not ready within its budget
+    SummaryPhase.runs = 0
+    failed = await ingest(cheshire_cat)
+    assert failed["status"] == "error" and failed["completed_phases"]["summary"]["state"] == "error"
+    parsed = []
+    real_parse = RabbitHole._parse_to_docs
+
+    async def counting(self, source, file_bytes, content_type):
+        parsed.append(source)
+        return await real_parse(self, source, file_bytes, content_type)
+
+    monkeypatch.setattr(RabbitHole, "_parse_to_docs", counting)
+
+    response = await secure_client.post("/ingestion/retry", params={"source": "story.txt"}, headers=secure_client_headers)
+
+    assert (response.status_code, response.json()) == (200, {"retrying": True})
+    row = await crud_ingestions.get_status(cheshire_cat.agent_key, None, "story.txt")
+    assert row["status"] == "completed"
+    assert SummaryPhase.runs == 1 and parsed == []  # the graph and its dependent again; parsing and embedding kept
+    assert row["completed_phases"]["embedding"] == failed["completed_phases"]["embedding"]
+
+
+async def test_a_retried_source_waits_for_its_worker_and_cannot_be_retried_twice(
+    secure_client, secure_client_headers, cheshire_cat, files, monkeypatch,
+):
+    plug(monkeypatch, cheshire_cat, GraphPhase)
+    GraphPhase.outcomes = ["error"]
+    await ingest(cheshire_cat)
+    queued = []
+
+    async def not_started_yet(self, cat, name, chat_id=None, blocking=True, invalidate=None):
+        queued.append(name)  # the background run has not started yet
+
+    monkeypatch.setattr(RabbitHole, "rerun_source", not_started_yet)
+
+    first = await secure_client.post("/ingestion/retry", params={"source": "story.txt"}, headers=secure_client_headers)
+    seen = (await secure_client.get("/ingestion/status", headers=secure_client_headers)).json()[0]
+    second = await secure_client.post("/ingestion/retry", params={"source": "story.txt"}, headers=secure_client_headers)
+
+    assert first.status_code == 200 and queued == ["story.txt"]
+    assert (seen["status"], seen["error"], "graph" in seen["completed_phases"]) == ("uploaded", None, False)
+    assert second.status_code == 409  # the client sees the retry going on, a double click does not run it twice
+
+
+async def test_a_retry_whose_failed_phase_was_turned_off_completes(
+    secure_client, secure_client_headers, cheshire_cat, files, monkeypatch,
+):
+    plug(monkeypatch, cheshire_cat, GraphPhase)
+    GraphPhase.outcomes = ["error"]
+    await ingest(cheshire_cat)
+    plug(monkeypatch, cheshire_cat)  # the plugin of the failing phase is turned off
+
+    response = await secure_client.post("/ingestion/retry", params={"source": "story.txt"}, headers=secure_client_headers)
+
+    assert response.status_code == 200
+    assert (await crud_ingestions.get_status(cheshire_cat.agent_key, None, "story.txt"))["status"] == "completed"
+
+
+async def test_retrying_a_source_of_the_chat_of_the_request(secure_client, secure_client_headers, cheshire_cat, files, monkeypatch):
+    plug(monkeypatch, cheshire_cat, GraphPhase)
+    GraphPhase.outcomes = ["error"]
+    user = await crud_users.create_user(cheshire_cat.agent_key, {"username": "alice", "password": "alice-password"})
+    await crud_conversations.claim_conversation(cheshire_cat.agent_key, "chat-1", user["id"])
+    await ingest(await cheshire_cat._find_stray_cat("chat-1"))
+
+    response = await secure_client.post(
+        "/ingestion/retry", params={"source": "story.txt"}, headers=secure_client_headers | {"X-Chat-ID": "chat-1"},
+    )
+
+    assert response.status_code == 200
+    assert (await crud_ingestions.get_status(cheshire_cat.agent_key, "chat-1", "story.txt"))["status"] == "completed"
+
+
+async def test_retrying_a_source_that_did_not_fail_is_refused(secure_client, secure_client_headers, cheshire_cat, files):
+    await ingest(cheshire_cat)
+
+    response = await secure_client.post("/ingestion/retry", params={"source": "story.txt"}, headers=secure_client_headers)
+
+    assert response.status_code == 409 and "Only a failed ingestion" in response.json()["detail"]
+
+
+async def test_retrying_a_failure_before_the_phases_is_refused(secure_client, secure_client_headers, cheshire_cat, files):
+    await ingest(cheshire_cat, data=b"")  # nothing to parse: no phase failed, the source must be uploaded again
+
+    response = await secure_client.post("/ingestion/retry", params={"source": "story.txt"}, headers=secure_client_headers)
+
+    assert response.status_code == 409 and "upload it again" in response.json()["detail"]
+    assert (await crud_ingestions.get_status(cheshire_cat.agent_key, None, "story.txt"))["status"] == "error"
+
+
+async def test_retrying_an_unknown_source_is_not_found(secure_client, secure_client_headers, cheshire_cat):
+    response = await secure_client.post("/ingestion/retry", params={"source": "x.txt"}, headers=secure_client_headers)
+    assert response.status_code == 404
+
+
+async def test_retrying_a_source_being_ingested_is_refused(secure_client, secure_client_headers, cheshire_cat, monkeypatch):
+    monkeypatch.setattr("cat.routes.ingestion.DELETE_WAIT_SECONDS", 0.2)
+    await crud_ingestions.create_status(cheshire_cat.agent_key, None, "x.txt", type_="file")
+    await crud_ingestions.update_status(cheshire_cat.agent_key, None, "x.txt", status="error")
+
+    async with engine.source_lock(IngestionSource(cheshire_cat.agent_key, None, "x.txt")):
+        response = await secure_client.post("/ingestion/retry", params={"source": "x.txt"}, headers=secure_client_headers)
+
+    assert response.status_code == 409 and "being ingested" in response.json()["detail"]
+
+
 # --- maintenance: reingest_source, rerun_agent -----------------------------------------------------------------
 
 async def test_reingesting_a_source_runs_every_phase_again(cheshire_cat, files, monkeypatch):

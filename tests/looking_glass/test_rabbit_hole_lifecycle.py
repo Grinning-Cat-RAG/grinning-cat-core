@@ -14,7 +14,8 @@ deletions, with faults injected in the phases. The rules are checked after every
 - concurrent uploads and deletions of the same source run one at a time; a source whose row is deleted while it is
   processed (its chat deleted) leaves nothing behind;
 - every upload notifies ``after_rabbithole_stored_documents`` exactly once (points, or none on failure);
-- a reingest runs the source again from scratch; only a failed ingestion can be dismissed (409 otherwise).
+- a reingest runs the source again from scratch; only a failed ingestion can be dismissed or retried (409 otherwise),
+  a retry runs once even when asked twice at once.
 """
 import asyncio
 import copy
@@ -152,6 +153,7 @@ operation = st.one_of(
     st.tuples(st.just("ingest_both"), st.none(), st.none()),
     st.tuples(st.just("reingest"), st.sampled_from(SOURCES), st.none()),
     st.tuples(st.just("dismiss"), st.sampled_from(SOURCES), st.none()),
+    st.tuples(st.just("retry"), st.sampled_from(SOURCES), st.none()),
 )
 
 
@@ -195,8 +197,9 @@ async def restart(lizard, cheshire_cat, expected):
 @settings(max_examples=15, deadline=None, database=None,
           suppress_health_check=[HealthCheck.function_scoped_fixture, HealthCheck.too_slow])
 @example(operations=[("ingest", "alice.txt", "parse"), ("dismiss", "alice.txt", None)])
+@example(operations=[("ingest", "alice.txt", "plugin_error"), ("retry", "alice.txt", None)])
 @given(operations=st.lists(operation, min_size=1, max_size=6))
-async def test_the_lifecycle_of_the_sources(lizard, cheshire_cat, monkeypatch, operations):
+async def test_the_lifecycle_of_the_sources(lizard, cheshire_cat, monkeypatch, operations, secure_client, secure_client_headers):
     world = World()
     install(world, cheshire_cat, monkeypatch)
     await wipe(cheshire_cat)
@@ -208,16 +211,14 @@ async def test_the_lifecycle_of_the_sources(lizard, cheshire_cat, monkeypatch, o
             cat=cheshire_cat, file=BytesIO(TEXT), metadata={}, filename=name, content_type="text/plain",
         )
 
-    async def dismiss(name):
-        from httpx import ASGITransport, AsyncClient
-        from tests.utils import api_key
+    async def call(method, path, name):
+        # the client of the tests, with the API key it sets
+        return await secure_client.request(
+            method, path, params={"source": name}, headers=secure_client_headers | {"X-Agent-ID": agent},
+        )
 
-        app = lizard.fastapi_app
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            return await client.delete(
-                "/ingestion/status", params={"source": name},
-                headers={"Authorization": f"Bearer {api_key}", "X-Agent-ID": agent},
-            )
+    async def dismiss(name):
+        return await call("DELETE", "/ingestion/status", name)
 
     async def crash_source(name):
         """An upload whose worker dies during the embedding: its lock is never released (it expires)."""
@@ -316,6 +317,29 @@ async def test_the_lifecycle_of_the_sources(lizard, cheshire_cat, monkeypatch, o
                 expected.pop(name)
             else:
                 assert response.status_code == 409
+        elif kind == "retry":
+            # the client retries a failed ingestion, twice at once (a double click), after the cause was fixed
+            failed_in_phases = expected.get(name) == "error" and world.faults.get(name) not in ("empty",)
+            if failed_in_phases:
+                world.faults[name] = None
+            real_rerun = RabbitHole.rerun_source
+
+            async def started_later(self, *args, **kwargs):
+                await asyncio.sleep(0.3)  # the background run starts after the response, as in production
+                return await real_rerun(self, *args, **kwargs)
+
+            with patch.object(RabbitHole, "rerun_source", started_later):
+                responses = await asyncio.gather(
+                    call("POST", "/ingestion/retry", name), call("POST", "/ingestion/retry", name),
+                )
+            codes = sorted(r.status_code for r in responses)
+            if name not in expected:
+                assert codes == [404, 404]
+            elif failed_in_phases:
+                assert codes == [200, 409]  # one retry runs, the other is refused
+                expected[name] = "completed"
+            else:
+                assert codes == [409, 409]
         elif kind == "ingest_both":
             for source in SOURCES:
                 world.faults[source] = None

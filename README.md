@@ -222,6 +222,7 @@ An ingestion interrupted by a crash or a restart is **resumed automatically** by
 | `GET /ingestion/status` | the ingestion states of the sources of the knowledge base, or of the conversation of the `X-Chat-ID` header |
 | `GET /ingestion/phases` | the phases of the agent, in execution order, and the states a source goes through |
 | `DELETE /ingestion/status?source=` | dismisses a failed ingestion (`409` for any other state: a source is removed by deleting its file) |
+| `POST /ingestion/retry?source=` | retries a failed ingestion in background (the source turns `uploaded` at once): its failed phases run again, with the ones depending on them (`409` for any other state, a retry going on included, or when it failed before its phases: upload it again) |
 
 Deleting a file (or the points of a whole source) removes everything its phases produced; it answers `409` while the
 source is being ingested, so retry later. Deleting all the files of the knowledge base (or of a conversation) removes all
