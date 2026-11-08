@@ -495,6 +495,8 @@ def plug_settings_phase(monkeypatch, cheshire_cat):
         async def process(self, source, cat):
             SettingsPhase.runs += 1
             status = SettingsPhase.outcomes.pop(0) if SettingsPhase.outcomes else "done"
+            if status == "die":
+                raise asyncio.CancelledError()  # the worker dies in the middle of the phase (e.g. a restart)
             return PhaseResult(status=status, reason="graph failed" if status == "error" else None)
 
         async def delete(self, source, cat):
@@ -543,6 +545,38 @@ async def test_a_failed_source_is_resumed_when_the_settings_of_a_phase_it_depend
 
     row = await crud_ingestions.get_status(cheshire_cat.agent_key, None, "story.txt")
     assert row["status"] == "completed" and SettingsPhase.runs == 2
+
+
+async def test_the_dependents_of_an_invalidated_phase_run_again_after_a_crash(
+    lizard, cheshire_cat, files, monkeypatch,
+):
+    """``rerun_source`` invalidates the dependents too: a worker dying after the invalidated phase ran, before its
+    dependents (e.g. a restart during a change of the embedder), leaves them to do and the resume runs them."""
+    plug_settings_phase(monkeypatch, cheshire_cat)
+    await ingest(cheshire_cat)
+    SettingsPhase.outcomes = ["die"]
+
+    with pytest.raises(asyncio.CancelledError):
+        await cheshire_cat.rabbit_hole.rerun_source(cheshire_cat, "story.txt", invalidate=["embedding"])
+    assert SettingsPhase.runs == 2
+
+    await recovery.resume_agent(lizard, cheshire_cat.agent_key)
+
+    row = await crud_ingestions.get_status(cheshire_cat.agent_key, None, "story.txt")
+    assert row["status"] == "completed" and SettingsPhase.runs == 3, (row["status"], SettingsPhase.runs)
+
+
+async def test_an_invalidation_with_an_invalid_graph_of_phases_records_the_error(cheshire_cat, files, monkeypatch):
+    await ingest(cheshire_cat)
+    from cat.rabbit_hole.phases import PhaseGraphError
+
+    async def cycle(rabbit_hole, cat):
+        raise PhaseGraphError("Dependency cycle: graph -> graph")
+
+    monkeypatch.setattr(engine, "collect_phases", cycle)
+    row = await cheshire_cat.rabbit_hole.rerun_source(cheshire_cat, "story.txt", invalidate=["embedding"])
+
+    assert row["status"] == "error" and "cycle" in row["error"]
 
 
 async def test_a_source_that_failed_before_its_phases_is_not_resumed(lizard, cheshire_cat, files, embedder_name):

@@ -19,7 +19,7 @@ from langchain_core.documents.base import Blob, Document
 from cat.db.cruds import ingestions as crud_ingestions
 from cat.db.cruds.ingestions import IngestionStatus
 from cat.rabbit_hole import chunks, engine
-from cat.rabbit_hole.phases import PHASE_EMBEDDING, IngestionSource, PhaseResult
+from cat.rabbit_hole.phases import PHASE_EMBEDDING, IngestionSource, PhaseGraphError, PhaseResult
 from cat.services.factory.embedder import embedding_size
 from cat.core_plugins.base_plugin.parsers import MimeTypeBasedParser
 from cat.env import get_env_int
@@ -424,7 +424,8 @@ class RabbitHole:
         resume, the change of the embedder and the maintenance scripts use it.
 
         ``invalidate``: phases to run again even if their diary says they are up to date (e.g. the embedding, once the
-        collections were recreated); their dependents run again too. It waits for a worker holding the source, unless
+        collections were recreated); their dependents run again too (their entries are reset with them: a worker dying
+        in between leaves them to do). It waits for a worker holding the source, unless
         ``blocking=False``. Returns the row of the source, or None when the source is gone (deleted, canceled) or held by
         a live worker (``blocking=False``)."""
         rabbit_hole = copy.copy(self)
@@ -440,10 +441,27 @@ class RabbitHole:
                     await engine.delete_source(rabbit_hole, ccat, source)
                     return None
                 if row is not None and invalidate:
-                    await crud_ingestions.reset_phase_entries(source.agent_id, chat_id, name, invalidate)
+                    await crud_ingestions.reset_phase_entries(
+                        source.agent_id, chat_id, name, await self._with_dependents(rabbit_hole, ccat, invalidate),
+                    )
                 return await engine.run_phases(rabbit_hole, ccat, source)
         except (engine.LockError, engine.IngestionCanceled, engine.LockLost):
             return None
+
+    @staticmethod
+    async def _with_dependents(rabbit_hole, ccat, phase_ids: Iterable[str]) -> List[str]:
+        """The phases and every phase depending on them, directly or not. The dependents of a phase that ran run again
+        because the engine remembers it in memory: a worker dying before them would leave entries the resume takes for
+        up to date. An invalid graph of phases adds none (``run_phases`` records the error)."""
+        wanted = list(phase_ids)
+        try:
+            phases = await engine.collect_phases(rabbit_hole, ccat)  # in execution order: a dependency comes first
+        except PhaseGraphError:
+            return wanted
+        for phase in phases:
+            if phase.id not in wanted and any(dep in wanted for dep in phase.depends_on):
+                wanted.append(phase.id)
+        return wanted
 
     async def reingest_source(
         self, cat: "CheshireCat", name: str, chat_id: str | None = None,  # type: ignore[name-defined]
