@@ -3,6 +3,7 @@ import asyncio
 import itertools
 import threading
 import time
+from datetime import datetime, timezone
 from unittest.mock import patch
 
 from apscheduler.events import EVENT_JOB_EXECUTED, EVENT_JOB_MISSED
@@ -108,11 +109,14 @@ async def test_the_runs_missed_while_every_node_was_down_are_merged_into_one():
 
     events = []
     back = a_node()
-    back.scheduler.add_listener(lambda e: events.append(e.code), EVENT_JOB_MISSED | EVENT_JOB_EXECUTED)
-    await asyncio.sleep(0.3)  # its first pass
+    started = datetime.now(timezone.utc)
+    back.scheduler.add_listener(lambda e: events.append(e.scheduled_run_time), EVENT_JOB_MISSED | EVENT_JOB_EXECUTED)
+    await asyncio.sleep(1.5)  # its first pass, however slow its start (the regular runs after it are not counted)
 
     assert stored_jobs() == {"every-second"}
-    assert len(events) == 1  # one late run (run, or missed and logged once), not one per missed run
+    # one late run for the runs missed while every node was down (run, or missed and logged once), not one per missed
+    # run: the runs due before the node came back
+    assert len([run for run in events if run <= started]) == 1, events
     back.shutdown()
     clear_store()
 

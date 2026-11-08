@@ -6,8 +6,9 @@ For the source ``name`` of an agent (``<agent>/``) or of a chat (``<agent>/<chat
   ``before_rabbithole_stores_documents`` hook) and the images extracted by the parser: the ``embedding`` phase computes
   the vectors from them, so a change of embedder does not parse the sources again;
 - ``<sha>.img<n>``: the bytes of the n-th extracted image;
-- ``<sha>.source``: the bytes of a source not kept among the uploaded files (a URL, or a file ingested without storing
-  it), so that it can be processed again without downloading it.
+- ``<sha>.source``: the bytes of a source not kept among the uploaded files (a URL, or a file whose storing among them
+  did not land), so that it can be processed again without downloading it. A file ingested without storing it is not
+  kept at all: a later run needing its bytes fails.
 
 The folder lives inside the folder of the agent or of the chat, so removing them removes it too; the file listings
 skip it.
