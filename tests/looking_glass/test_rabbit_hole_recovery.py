@@ -470,3 +470,103 @@ async def test_a_failed_change_of_the_embedder_leaves_no_agent_in_maintenance(li
 
     assert outcomes == [False]
     assert not await crud_ingestions.is_in_maintenance(cheshire_cat.agent_key)
+
+
+# --- the resume and the failed sources -------------------------------------------------------------------------
+
+class SettingsPhase:
+    """A plugin phase whose settings and outcomes the test controls."""
+
+    settings_value = 1
+    outcomes: list = []
+    runs = 0
+
+
+def plug_settings_phase(monkeypatch, cheshire_cat):
+    from cat.rabbit_hole.phases import IngestionPhase, PhaseResult
+
+    class Graph(IngestionPhase):
+        id = "graph"
+        depends_on = ("embedding",)
+
+        async def settings(self, cat):
+            return SettingsPhase.settings_value
+
+        async def process(self, source, cat):
+            SettingsPhase.runs += 1
+            status = SettingsPhase.outcomes.pop(0) if SettingsPhase.outcomes else "done"
+            return PhaseResult(status=status, reason="graph failed" if status == "error" else None)
+
+        async def delete(self, source, cat):
+            pass
+
+    manager_class = type(cheshire_cat.plugin_manager)
+    original = manager_class.execute_hook
+
+    async def execute_hook(self, name, *args, caller):
+        if name == "rabbithole_ingestion_phases":
+            return list(args[0]) + [Graph]
+        return await original(self, name, *args, caller=caller)
+
+    monkeypatch.setattr(manager_class, "execute_hook", execute_hook)
+    SettingsPhase.settings_value, SettingsPhase.outcomes, SettingsPhase.runs = 1, [], 0
+
+
+async def test_a_failed_source_is_resumed_when_the_settings_of_its_failed_phase_change(
+    lizard, cheshire_cat, files, monkeypatch, parses,
+):
+    plug_settings_phase(monkeypatch, cheshire_cat)
+    SettingsPhase.outcomes = ["error"]
+    failed = await ingest(cheshire_cat)
+    assert failed["status"] == "error"
+
+    await recovery.resume_agent(lizard, cheshire_cat.agent_key)  # same settings: no retry, nothing written
+    assert await crud_ingestions.get_status(cheshire_cat.agent_key, None, "story.txt") == failed
+
+    SettingsPhase.settings_value = 2  # the settings of the graph fixed
+    parses.clear()
+    await recovery.resume_agent(lizard, cheshire_cat.agent_key)
+
+    row = await crud_ingestions.get_status(cheshire_cat.agent_key, None, "story.txt")
+    assert row["status"] == "completed" and SettingsPhase.runs == 2 and parses == []
+
+
+async def test_a_failed_source_is_resumed_when_the_settings_of_a_phase_it_depends_on_change(
+    lizard, cheshire_cat, files, monkeypatch, embedder_name,
+):
+    plug_settings_phase(monkeypatch, cheshire_cat)
+    SettingsPhase.outcomes = ["error"]
+    await ingest(cheshire_cat)
+
+    embedder_name["name"] = "embedder-2"  # the embedding, which the graph depends on, changes
+    await recovery.resume_agent(lizard, cheshire_cat.agent_key)
+
+    row = await crud_ingestions.get_status(cheshire_cat.agent_key, None, "story.txt")
+    assert row["status"] == "completed" and SettingsPhase.runs == 2
+
+
+async def test_a_source_that_failed_before_its_phases_is_not_resumed(lizard, cheshire_cat, files, embedder_name):
+    failed = await ingest(cheshire_cat, data=b"")  # nothing kept: only a new upload can process it
+    embedder_name["name"] = "embedder-2"
+
+    await recovery.resume_agent(lizard, cheshire_cat.agent_key)
+
+    assert await crud_ingestions.get_status(cheshire_cat.agent_key, None, "story.txt") == failed
+
+
+async def test_a_source_that_failed_upstream_is_left_alone_when_a_later_phase_changes(
+    lizard, cheshire_cat, files, monkeypatch,
+):
+    plug_settings_phase(monkeypatch, cheshire_cat)
+
+    async def unreadable(self, source, file_bytes, content_type):
+        raise ValueError("unreadable file")
+
+    monkeypatch.setattr(RabbitHole, "_parse_to_docs", unreadable)
+    failed = await ingest(cheshire_cat)  # parsing failed: the embedding and the graph inherit the error
+    assert failed["completed_phases"]["graph"]["state"] == "error"
+
+    SettingsPhase.settings_value = 2  # only the graph changes: the failure is elsewhere
+    await recovery.resume_agent(lizard, cheshire_cat.agent_key)
+
+    assert await crud_ingestions.get_status(cheshire_cat.agent_key, None, "story.txt") == failed

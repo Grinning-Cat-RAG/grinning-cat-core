@@ -14,6 +14,7 @@ deletions, with faults injected in the phases. The rules are checked after every
 - concurrent uploads and deletions of the same source run one at a time; a source whose row is deleted while it is
   processed (its chat deleted) leaves nothing behind;
 - every upload notifies ``after_rabbithole_stored_documents`` exactly once (points, or none on failure);
+- fixing the settings of a failed phase lets the resume run again the sources that failed there, and only those;
 - a reingest runs the source again from scratch; only a failed ingestion can be dismissed or retried (409 otherwise),
   a retry runs once even when asked twice at once.
 """
@@ -49,6 +50,9 @@ class GraphPhase(IngestionPhase):
     id = "graph"
     depends_on = ("embedding",)
 
+    async def settings(self, cat):
+        return CURRENT["world"].graph_settings
+
     async def process(self, source, cat):
         world = CURRENT["world"]
         fault = world.faults.get(source.name)
@@ -73,6 +77,7 @@ class World:
         self.graph_deleted = []
         self.stored_hook = []
         self.delete_fails = {}
+        self.graph_settings = 1
         self.parsed = []
         self.embedder = "embedder-1"
 
@@ -154,6 +159,7 @@ operation = st.one_of(
     st.tuples(st.just("reingest"), st.sampled_from(SOURCES), st.none()),
     st.tuples(st.just("dismiss"), st.sampled_from(SOURCES), st.none()),
     st.tuples(st.just("retry"), st.sampled_from(SOURCES), st.none()),
+    st.tuples(st.just("fix_graph"), st.none(), st.none()),
 )
 
 
@@ -198,6 +204,7 @@ async def restart(lizard, cheshire_cat, expected):
           suppress_health_check=[HealthCheck.function_scoped_fixture, HealthCheck.too_slow])
 @example(operations=[("ingest", "alice.txt", "parse"), ("dismiss", "alice.txt", None)])
 @example(operations=[("ingest", "alice.txt", "plugin_error"), ("retry", "alice.txt", None)])
+@example(operations=[("ingest", "alice.txt", "plugin_error"), ("ingest", "bob.txt", "parse"), ("fix_graph", None, None)])
 @given(operations=st.lists(operation, min_size=1, max_size=6))
 async def test_the_lifecycle_of_the_sources(lizard, cheshire_cat, monkeypatch, operations, secure_client, secure_client_headers):
     world = World()
@@ -340,6 +347,26 @@ async def test_the_lifecycle_of_the_sources(lizard, cheshire_cat, monkeypatch, o
                 expected[name] = "completed"
             else:
                 assert codes == [409, 409]
+        elif kind == "fix_graph":
+            # the settings of the graph are fixed: the resume runs again the sources whose graph failed (and only
+            # those among the failed ones: a failure of another phase is not retried by itself)
+            failed_in_graph = {
+                s for s, state in expected.items() if state == "error" and world.faults.get(s) == "plugin_error"
+            }
+            failed_elsewhere = {
+                s: await crud_ingestions.get_status(agent, None, s)
+                for s, state in expected.items() if state == "error" and s not in failed_in_graph
+            }
+            world.graph_settings += 1
+            for source, fault in list(world.faults.items()):
+                if fault == "plugin_error":
+                    world.faults[source] = None
+            await restart(lizard, cheshire_cat, expected)
+            restarted(expected)
+            for source in failed_in_graph:
+                expected[source] = "completed"
+            for source, row in failed_elsewhere.items():  # a failure elsewhere is left untouched
+                assert await crud_ingestions.get_status(agent, None, source) == row
         elif kind == "ingest_both":
             for source in SOURCES:
                 world.faults[source] = None

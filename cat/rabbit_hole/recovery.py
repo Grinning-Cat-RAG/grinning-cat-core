@@ -9,12 +9,17 @@ waiting for a live worker) when:
 - it is in flight (uploaded, downloading, downloaded, processing) or being deleted: the lock of its source is free, so its
   worker is dead (a live worker holds it);
 - it completed, but a tag of its diary is not the current one: the chunker, the embedder or the settings of a phase
-  changed, or a phase was added.
+  changed, or a phase was added;
+- it failed in a phase whose tag is not the current one anymore: the settings of that phase, or of a phase it depends on
+  (a tag includes the tags of the phases it depends on), changed since, e.g. to fix the failure. The failed phase runs
+  again, with the ones depending on it.
 
-Sources in error are left alone: POST /ingestion/retry, a new upload, or the maintenance, runs them again.
+Any other source in error is left alone (no endless retries of a permanent failure, e.g. paid LLM calls): POST
+/ingestion/retry, a new upload, or the maintenance, runs it again.
 """
 import asyncio
 import copy
+from typing import Dict
 
 from cat.db import crud
 from cat.db.cruds import ingestions as crud_ingestions
@@ -23,6 +28,7 @@ from cat.db.cruds.ingestions import IngestionStatus
 from cat.env import get_env_int
 from cat.log import log
 from cat.rabbit_hole import engine
+from cat.rabbit_hole.phases import compute_tags
 
 IN_FLIGHT = {
     IngestionStatus.UPLOADED.value,
@@ -33,12 +39,25 @@ IN_FLIGHT = {
 }
 
 
-def _needs_attention(row: dict, tags: dict) -> bool:
+def _needs_attention(row: dict, tags: Dict[str, str], depends_on: Dict[str, tuple]) -> bool:
     if row.get("status") in IN_FLIGHT:
         return True
-    if row.get("status") != IngestionStatus.COMPLETED.value:
-        return False
     diary = row.get("completed_phases") or {}
+    if row.get("status") == IngestionStatus.ERROR.value:
+        # the phase that failed itself, not the ones inheriting its failure: its tag includes the tags of the phases it
+        # depends on, so a change upstream shows there too
+        def failed_itself(phase_id: str) -> bool:
+            return not any(
+                (diary.get(dep) or {}).get("state") in (engine.STATE_ERROR, engine.STATE_SKIPPED)
+                for dep in depends_on.get(phase_id, ())
+            )
+
+        return any(
+            entry.get("state") == engine.STATE_ERROR and phase_id in tags and entry.get("tag") != tags[phase_id]
+            and failed_itself(phase_id)
+            for phase_id, entry in diary.items()
+        )
+    # completed (every other state is in flight or failed)
     return any((diary.get(phase_id) or {}).get("tag") != tag for phase_id, tag in tags.items())
 
 
@@ -55,9 +74,11 @@ async def resume_agent(lizard, agent_id: str) -> None:
                 return
             rabbit_hole = copy.copy(lizard.rabbit_hole)
             await rabbit_hole.setup(ccat)
-            tags = await engine.current_tags(rabbit_hole, ccat)
+            phases = await engine.collect_phases(rabbit_hole, ccat)
+            tags = await compute_tags(phases, ccat)
+            depends_on = {phase.id: phase.depends_on for phase in phases}
             for row in rows:
-                if not _needs_attention(row, tags):
+                if not _needs_attention(row, tags, depends_on):
                     continue
                 if await crud_ingestions.is_in_maintenance(agent_id):
                     return  # e.g. a change of the embedder started meanwhile: it brings the sources up to date
