@@ -570,3 +570,202 @@ async def test_a_source_that_failed_upstream_is_left_alone_when_a_later_phase_ch
     await recovery.resume_agent(lizard, cheshire_cat.agent_key)
 
     assert await crud_ingestions.get_status(cheshire_cat.agent_key, None, "story.txt") == failed
+
+
+# --- sources without a state (ingested before the states existed) ----------------------------------------------
+
+async def a_legacy_source(cheshire_cat, files, name="legacy.txt", chat=None, kept=True, data=TEXT):
+    """A source ingested before the states existed: its points (with the custom metadata of its upload), its file."""
+    from langchain_core.documents import Document
+
+    rabbit_hole = __import__("copy").copy(cheshire_cat.rabbit_hole)
+    await rabbit_hole.setup(chat or cheshire_cat)
+    if kept and not name.startswith("http"):
+        files.write_file(data, name, cheshire_cat.agent_key if chat is None else f"{cheshire_cat.agent_key}/{chat.id}")
+    await rabbit_hole.store_documents([Document(page_content="old knowledge")], name, metadata={"author": "alice"})
+
+
+async def test_a_change_of_the_embedder_gives_a_state_to_the_old_sources(
+    lizard, cheshire_cat, files, embedder_name, monkeypatch,
+):
+    await a_legacy_source(cheshire_cat, files)
+    await a_legacy_source(cheshire_cat, files, "https://x.org/page")
+
+    async def download(self, file, filename, content_type):
+        return file, TEXT, "text/html", True
+
+    monkeypatch.setattr(RabbitHole, "_resolve_source_bytes", download)
+    embedder_name["name"] = "embedder-2"
+
+    await lizard.embed_all_in_cheshire_cats()
+
+    for name in ("legacy.txt", "https://x.org/page"):
+        row = await crud_ingestions.get_status(cheshire_cat.agent_key, None, name)
+        assert row["status"] == "completed" and row["metadata"] == {"author": "alice"}
+        assert all(p.payload["metadata"]["author"] == "alice" for p in await points_of(cheshire_cat, name))
+    row = await crud_ingestions.get_status(cheshire_cat.agent_key, None, "legacy.txt")
+    assert row["content_type"] == "text/plain"
+
+
+async def test_an_old_source_deleted_during_a_change_of_the_embedder_stays_deleted(
+    lizard, cheshire_cat, files, embedder_name, monkeypatch,
+):
+    await a_legacy_source(cheshire_cat, files)
+    embedder_name["name"] = "embedder-2"
+    handler_class = type(cheshire_cat.vector_memory_handler)
+
+    async def initialize_while_deleted(self, embedder_name_, embedder_size):
+        # the file is deleted while the collections are recreated (DELETE /file_manager/files/legacy.txt)
+        files.remove_file(f"{cheshire_cat.agent_key}/legacy.txt")
+        await cheshire_cat.rabbit_hole.delete_source(cheshire_cat, "legacy.txt")
+
+    monkeypatch.setattr(handler_class, "initialize", initialize_while_deleted)
+
+    await lizard.embed_all_in_cheshire_cats()
+
+    assert await crud_ingestions.get_status(cheshire_cat.agent_key, None, "legacy.txt") is None
+    assert await points_of(cheshire_cat, "legacy.txt") == []
+
+
+async def test_a_source_ingested_during_a_change_of_the_embedder_is_not_taken_for_an_old_one(
+    lizard, cheshire_cat, files, embedder_name, monkeypatch,
+):
+    await ingest(cheshire_cat)  # its row exists: it has its own state
+    row_before = await crud_ingestions.get_status(cheshire_cat.agent_key, None, "story.txt")
+    adopted = []
+    real_create = crud_ingestions.create_status
+
+    async def create_status(agent_id, chat_id, source, **kwargs):
+        adopted.append(source)
+        return await real_create(agent_id, chat_id, source, **kwargs)
+
+    monkeypatch.setattr(crud_ingestions, "create_status", create_status)
+    embedder_name["name"] = "embedder-2"
+
+    await lizard.embed_all_in_cheshire_cats()
+
+    row = await crud_ingestions.get_status(cheshire_cat.agent_key, None, "story.txt")
+    assert adopted == [] and row["created_at"] == row_before["created_at"] and row["status"] == "completed"
+
+
+async def test_an_old_source_whose_file_is_gone_is_not_brought_back(lizard, cheshire_cat, files, embedder_name):
+    await a_legacy_source(cheshire_cat, files, kept=False)
+    embedder_name["name"] = "embedder-2"
+
+    await lizard.embed_all_in_cheshire_cats()
+
+    assert await crud_ingestions.get_status(cheshire_cat.agent_key, None, "legacy.txt") is None
+
+
+async def test_an_old_chat_source_gets_its_state_in_its_chat(lizard, cheshire_cat, files, embedder_name):
+    stray = await chat_of_a_user(cheshire_cat)
+    await a_legacy_source(cheshire_cat, files, "notes.txt", chat=stray)
+    embedder_name["name"] = "embedder-2"
+
+    await lizard.embed_all_in_cheshire_cats()
+
+    row = await crud_ingestions.get_status(cheshire_cat.agent_key, "chat-1", "notes.txt")
+    assert row["status"] == "completed" and row["metadata"] == {"author": "alice"}
+    assert await points_of(cheshire_cat, "notes.txt", VectorMemoryType.EPISODIC)
+
+
+async def test_reingesting_an_old_source_keeps_its_metadata_and_content_type(cheshire_cat, files):
+    await a_legacy_source(cheshire_cat, files)
+
+    row = await cheshire_cat.rabbit_hole.reingest_source(cheshire_cat, "legacy.txt")
+
+    assert row["status"] == "completed" and row["metadata"] == {"author": "alice"}
+    assert row["content_type"] == "text/plain"
+
+
+async def test_an_adopted_source_keeps_the_metadata_of_its_upload_only(cheshire_cat, files):
+    from langchain_core.documents import Document
+
+    files.write_file(TEXT, "legacy.txt", cheshire_cat.agent_key)
+    rabbit_hole = __import__("copy").copy(cheshire_cat.rabbit_hole)
+    await rabbit_hole.setup(cheshire_cat)
+    await rabbit_hole.store_documents(
+        [Document(page_content="one", metadata={"page": 1, "chunk_index": 0}),
+         Document(page_content="two", metadata={"page": 2, "chunk_index": 1}),
+         Document(page_content="[Image]", metadata={"image_file": "legacy_img_0.png"})],
+        "legacy.txt", metadata={"author": "alice"},
+    )
+
+    assert await cheshire_cat.rabbit_hole.adopt_source(cheshire_cat, "legacy.txt")
+
+    row = await crud_ingestions.get_status(cheshire_cat.agent_key, None, "legacy.txt")
+    assert row["metadata"] == {"author": "alice"}
+
+
+@pytest.mark.parametrize("name, data, content_type", [
+    ("table.csv", TEXT, "text/csv"), ("notes.md", TEXT, "text/markdown"), ("doc.txt", TEXT, "text/plain"),
+    ("scan.bin", b"%PDF-1.4\n%binary", "application/pdf"),  # the bytes win when they tell a precise format
+])
+async def test_an_adopted_text_source_keeps_the_type_of_its_name(cheshire_cat, files, name, data, content_type):
+    await a_legacy_source(cheshire_cat, files, name, data=data)
+
+    assert await cheshire_cat.rabbit_hole.adopt_source(cheshire_cat, name)
+
+    assert (await crud_ingestions.get_status(cheshire_cat.agent_key, None, name))["content_type"] == content_type
+
+
+async def test_a_source_whose_upload_ends_after_the_listing_is_not_adopted(
+    lizard, cheshire_cat, files, embedder_name, monkeypatch,
+):
+    await a_legacy_source(cheshire_cat, files)
+    real_listing = type(lizard)._sources_without_state
+
+    async def upload_ends_meanwhile(ccat):
+        found = await real_listing(ccat)
+        await ingest(cheshire_cat, "legacy.txt")  # its upload ends right after the listing: it has its own state now
+        return found
+
+    monkeypatch.setattr(type(lizard), "_sources_without_state", staticmethod(upload_ends_meanwhile))
+    embedder_name["name"] = "embedder-2"
+    adopted = []
+    real_adopt = RabbitHole._adopt
+
+    async def recording_adopt(self, source, require_points):
+        result = await real_adopt(self, source, require_points)
+        adopted.append(result)
+        return result
+
+    monkeypatch.setattr(RabbitHole, "_adopt", recording_adopt)
+
+    await lizard.embed_all_in_cheshire_cats()
+
+    row = await crud_ingestions.get_status(cheshire_cat.agent_key, None, "legacy.txt")
+    assert adopted == [False] and row["status"] == "completed"
+
+
+async def test_an_old_source_deleted_after_the_listing_is_not_adopted(
+    lizard, cheshire_cat, files, embedder_name, monkeypatch,
+):
+    await a_legacy_source(cheshire_cat, files)
+    real_listing = type(lizard)._sources_without_state
+
+    async def deleted_meanwhile(ccat):
+        found = await real_listing(ccat)
+        await cheshire_cat.vector_memory_handler.delete_tenant_points(  # its points go, its file not yet
+            str(VectorMemoryType.DECLARATIVE), {"source": "legacy.txt"},
+        )
+        return found
+
+    monkeypatch.setattr(type(lizard), "_sources_without_state", staticmethod(deleted_meanwhile))
+    embedder_name["name"] = "embedder-2"
+
+    await lizard.embed_all_in_cheshire_cats()
+
+    assert await crud_ingestions.get_status(cheshire_cat.agent_key, None, "legacy.txt") is None
+
+
+async def test_a_memory_without_a_source_is_not_taken_for_an_old_source(lizard, cheshire_cat, files):
+    await a_legacy_source(cheshire_cat, files)
+    point = (await cheshire_cat.vector_memory_handler.get_all_tenant_points(
+        str(VectorMemoryType.DECLARATIVE), limit=1, with_vectors=True,
+    ))[0][0]
+    await cheshire_cat.vector_memory_handler.add_point_to_tenant(  # a memory stored without a source
+        str(VectorMemoryType.DECLARATIVE), "loose", point.vector, {"when": 1.0},
+    )
+
+    assert await type(lizard)._sources_without_state(cheshire_cat) == [("legacy.txt", None)]

@@ -14,6 +14,8 @@ deletions, with faults injected in the phases. The rules are checked after every
 - concurrent uploads and deletions of the same source run one at a time; a source whose row is deleted while it is
   processed (its chat deleted) leaves nothing behind;
 - every upload notifies ``after_rabbithole_stored_documents`` exactly once (points, or none on failure);
+- a source ingested before the states existed gets its state at a change of the embedder, unless it is deleted
+  meanwhile: then it stays deleted;
 - fixing the settings of a failed phase lets the resume run again the sources that failed there, and only those;
 - a reingest runs the source again from scratch; only a failed ingestion can be dismissed or retried (409 otherwise),
   a retry runs once even when asked twice at once.
@@ -78,6 +80,7 @@ class World:
         self.stored_hook = []
         self.delete_fails = {}
         self.graph_settings = 1
+        self.legacy = set()  # sources ingested before the states existed: points and file, no row
         self.parsed = []
         self.embedder = "embedder-1"
 
@@ -160,6 +163,8 @@ operation = st.one_of(
     st.tuples(st.just("dismiss"), st.sampled_from(SOURCES), st.none()),
     st.tuples(st.just("retry"), st.sampled_from(SOURCES), st.none()),
     st.tuples(st.just("fix_graph"), st.none(), st.none()),
+    st.tuples(st.just("legacy"), st.sampled_from(SOURCES), st.none()),
+    st.tuples(st.just("delete_during_embedder"), st.sampled_from(SOURCES), st.none()),
 )
 
 
@@ -205,6 +210,8 @@ async def restart(lizard, cheshire_cat, expected):
 @example(operations=[("ingest", "alice.txt", "parse"), ("dismiss", "alice.txt", None)])
 @example(operations=[("ingest", "alice.txt", "plugin_error"), ("retry", "alice.txt", None)])
 @example(operations=[("ingest", "alice.txt", "plugin_error"), ("ingest", "bob.txt", "parse"), ("fix_graph", None, None)])
+@example(operations=[("legacy", "bob.txt", None), ("delete_during_embedder", "bob.txt", None)])
+@example(operations=[("legacy", "bob.txt", None), ("embedder", None, None)])
 @given(operations=st.lists(operation, min_size=1, max_size=6))
 async def test_the_lifecycle_of_the_sources(lizard, cheshire_cat, monkeypatch, operations, secure_client, secure_client_headers):
     world = World()
@@ -223,6 +230,13 @@ async def test_the_lifecycle_of_the_sources(lizard, cheshire_cat, monkeypatch, o
         return await secure_client.request(
             method, path, params={"source": name}, headers=secure_client_headers | {"X-Agent-ID": agent},
         )
+
+    async def old_source(name):
+        from langchain_core.documents import Document
+
+        cheshire_cat.file_manager.write_file(TEXT, name, agent)
+        rabbit_hole = await prepared(cheshire_cat)
+        await rabbit_hole.store_documents([Document(page_content="old knowledge")], name, metadata={"author": "alice"})
 
     async def dismiss(name):
         return await call("DELETE", "/ingestion/status", name)
@@ -271,13 +285,47 @@ async def test_the_lifecycle_of_the_sources(lizard, cheshire_cat, monkeypatch, o
             uploaded = SOURCES[0]
             world.faults[uploaded] = None
             parsed_before = len(world.parsed)
+            legacy = set(world.legacy)
             await asyncio.gather(lizard.embed_all_in_cheshire_cats(), upload(uploaded))
             restarted(expected)
             expected[uploaded] = "completed"
-            assert world.parsed[parsed_before:] == [uploaded]  # the others reuse their chunks
+            expected.update({source: "completed" for source in legacy})  # the old sources got their state
+            world.legacy.clear()
+            parsed = world.parsed[parsed_before:]
+            assert set(parsed) <= {uploaded} | legacy  # the sources with a state reuse their chunks
+            assert all(parsed.count(source) == 1 for source in legacy - {uploaded})
+        elif kind == "legacy":
+            # a source ingested before the states existed
+            if name in expected or name in world.legacy:
+                continue
+            world.faults[name] = None
+            world.not_ready_left[name] = 0
+            await old_source(name)
+            world.legacy.add(name)
+        elif kind == "delete_during_embedder":
+            # an old source deleted while the embedder changes: it stays deleted
+            if name not in world.legacy:
+                continue
+            world.embedder = "embedder-2" if world.embedder == "embedder-1" else "embedder-1"
+            legacy = set(world.legacy) - {name}
+
+            handler_class = type(cheshire_cat.vector_memory_handler)
+            recreate = handler_class.initialize
+
+            async def deleted_meanwhile(self, *args):
+                # the source is deleted while the collections are recreated: after its adoption, before its re-run
+                await cheshire_cat.rabbit_hole.delete_source(cheshire_cat, name)
+                return await recreate(self, *args)
+
+            with patch.object(handler_class, "initialize", deleted_meanwhile):
+                await lizard.embed_all_in_cheshire_cats()
+            restarted(expected)
+            expected.update({source: "completed" for source in legacy})
+            world.legacy.clear()
         elif kind == "delete":
             await cheshire_cat.rabbit_hole.delete_source(cheshire_cat, name)
             expected.pop(name, None)
+            world.legacy.discard(name)
         elif kind == "delete_fails":
             if name not in expected:
                 continue
@@ -322,6 +370,10 @@ async def test_the_lifecycle_of_the_sources(lizard, cheshire_cat, monkeypatch, o
             if expected[name] == "error":
                 assert response.status_code == 200
                 expected.pop(name)
+                if await cheshire_cat.vector_memory_handler.get_all_tenant_points(
+                    str(VectorMemoryType.DECLARATIVE), limit=1, metadata={"source": name}, with_vectors=False,
+                ) != ([], None):
+                    world.legacy.add(name)  # its memory stays: a source without a state
             else:
                 assert response.status_code == 409
         elif kind == "retry":
@@ -374,6 +426,7 @@ async def test_the_lifecycle_of_the_sources(lizard, cheshire_cat, monkeypatch, o
             assert [row["status"] for row in rows] == ["completed"] * len(SOURCES)
             expected.update({source: "completed" for source in SOURCES})
 
+        world.legacy -= set(expected)  # a source with a row has its own state again
         await check_rules(cheshire_cat, world, expected)
 
 
@@ -412,7 +465,7 @@ async def check_rules(cheshire_cat, world, expected):
             assert row["status"] == "deleting"
         else:
             assert row["status"] == "processing"
-    for name in set(SOURCES) - set(expected):
+    for name in set(SOURCES) - set(expected) - world.legacy:
         assert name not in by_source
         assert not os.path.exists(os.path.join(
             cheshire_cat.file_manager._root_dir, agent, chunks.FOLDER, chunks.source_id(name) + ".json",

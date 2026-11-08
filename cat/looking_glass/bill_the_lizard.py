@@ -1,6 +1,6 @@
 import asyncio
 import contextlib
-from typing import List, Dict
+from typing import Dict, List, Tuple
 from fastapi import FastAPI
 
 from cat.services.factory.embedder import embedding_size
@@ -22,6 +22,7 @@ from cat.looking_glass.mad_hatter.registry import PluginRegistry
 from cat.mixins import NonCopyableMixin, OrchestratorMixin
 from cat.rabbit_hole import RabbitHole
 from cat.rabbit_hole.phases import PHASE_EMBEDDING
+from cat.services.memory.models import VectorMemoryType
 from cat.rabbit_hole import recovery as ingestion_recovery
 from cat.services.factory.auth_handler import CoreAuthHandler
 from cat.services.websocket_manager import WebSocketManager
@@ -253,24 +254,19 @@ class BillTheLizard(OrchestratorMixin, NonCopyableMixin):
     async def embed_all_in_cheshire_cats(self) -> None:
         """Re-embeds the sources and the procedures of every Cheshire Cat with the current embedder.
 
-        Changing the embedder recreates the collections (``initialize``), shared by every agent: what each agent holds
-        is read first, then every database is initialized (serialized), then the re-embeds run under the concurrency
-        cap. A source without an ingestion state (ingested before the states existed) is ingested again from its file;
-        a source with a state runs its embedding again (the stored chunks are reused), whatever its diary says: the
-        collections were recreated. Meanwhile every agent is in maintenance, so the automatic resume leaves it alone.
+        Changing the embedder recreates the collections (``initialize``), shared by every agent. First, every source
+        without an ingestion state (ingested before the states existed) is adopted (it gets its state, holding its
+        lock): from then on a deletion removes it as any other source. Then every database is initialized (serialized),
+        then the re-embeds run under the concurrency cap: every source runs its embedding again (the stored chunks are
+        reused; an adopted source runs every phase, from its file), whatever its diary says: the collections were
+        recreated. Meanwhile every agent is in maintenance, so the automatic resume leaves it alone.
         """
 
         async def embed_with_limit(entry_):
             async with semaphore:
                 ccat = entry_["ccat"]
-                # first the sources without a state: embed_stored_sources clears the collection before ingesting them
-                tasks = [
-                    ccat.embed_stored_sources(collection_name, sources)
-                    for collection_name, sources in entry_["legacy_sources"].items()
-                    if sources
-                ] + [ccat.embed_procedures()]
-                await asyncio.gather(*tasks)
-                # then the sources with a state: their embedding again (and the phases depending on it)
+                await ccat.embed_procedures()
+                # every source: its embedding again (and the phases depending on it)
                 for row in entry_["rows"]:
                     await self.rabbit_hole.rerun_source(ccat, row["source"], row["chat_id"], invalidate=[PHASE_EMBEDDING])
                 await crud_ingestions.clear_maintenance(ccat.agent_key)
@@ -287,23 +283,15 @@ class BillTheLizard(OrchestratorMixin, NonCopyableMixin):
             for ccat_id in ccat_ids:
                 await crud_ingestions.set_maintenance(ccat_id, ttl=EMBED_ALL_MAINTENANCE_SECONDS)
             stored_files_by_ccat: List[Dict] = []
-            # first, what each Cheshire Cat holds, read before the collections are recreated: the sources without an
-            # ingestion state (only in the vector memory and in the files) are ingested again from their files
+            # first, before the collections are recreated, the sources without an ingestion state (only in the vector
+            # memory, and in the files) get their state
             for ccat_id in ccat_ids:
                 if (ccat := await self.get_cheshire_cat(ccat_id)) is None:
                     continue
 
-                with_state = {(row["source"], row["chat_id"]) for row in await crud_ingestions.list_statuses(ccat_id)}
-                stored_files_by_ccat.append({
-                    "ccat": ccat,
-                    "legacy_sources": {
-                        collection: [
-                            source for source in sources
-                            if (source.name, source.metadata.get("chat_id")) not in with_state
-                        ]
-                        for collection, sources in (await ccat.get_stored_sources_with_metadata()).items()
-                    },
-                })
+                for name, chat_id in await self._sources_without_state(ccat):
+                    await self.rabbit_hole.adopt_source(ccat, name, chat_id)
+                stored_files_by_ccat.append({"ccat": ccat})
 
             # re-initialize all the vector databases in a serialized way, outside threads to avoid
             # race conditions
@@ -329,6 +317,20 @@ class BillTheLizard(OrchestratorMixin, NonCopyableMixin):
         await self.plugin_manager.execute_hook(
             "after_all_cheshire_cats_embedded", success, caller=self,
         )
+
+    @staticmethod
+    async def _sources_without_state(ccat: CheshireCat) -> List[Tuple[str, str | None]]:
+        """The sources in the memory of the agent (from the metadata of its points) without an ingestion state."""
+        with_state = {(row["source"], row["chat_id"]) for row in await crud_ingestions.list_statuses(ccat.agent_key)}
+        found = set()
+        for collection in (VectorMemoryType.DECLARATIVE, VectorMemoryType.EPISODIC):
+            points, _ = await ccat.vector_memory_handler.get_all_tenant_points(str(collection), with_vectors=False)
+            for point in points:
+                metadata = (point.payload or {}).get("metadata") or {}
+                if source := metadata.get("source"):
+                    chat_id = metadata.get("chat_id") if collection == VectorMemoryType.EPISODIC else None
+                    found.add((source, chat_id))
+        return sorted(found - with_state, key=lambda k: (k[1] or "", k[0]))
 
     def is_custom_endpoint(self, path: str, methods: List[str] | None = None, method: str | None = None):
         """

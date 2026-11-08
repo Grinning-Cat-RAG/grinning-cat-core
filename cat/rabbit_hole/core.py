@@ -26,7 +26,7 @@ from cat.env import get_env_int
 from cat.log import log
 from cat.services.factory.chunker import BaseChunker
 from cat.services.memory.models import PointStruct, VectorMemoryType
-from cat.utils import is_url as fnc_is_url
+from cat.utils import guess_file_type, is_url as fnc_is_url
 
 # Process-wide semaphore bounding the parsing and embedding phases running at the same time.
 # Created lazily on first use; the size is read at runtime from
@@ -106,6 +106,11 @@ async def run_in_ingestion_executor(func, *args, **kwargs):
 
 #: Seconds an HTTP deletion waits for an ingestion of the same source to end, before answering 409 (retry later)
 DELETE_WAIT_SECONDS = 5
+
+
+#: The metadata of a chunk set by the phases themselves (not the custom metadata of the upload)
+_PHASE_METADATA = ("source", "when", "hash", "chat_id")
+_MISSING = object()
 
 
 class SourceBusy(Exception):
@@ -465,7 +470,7 @@ class RabbitHole:
                     await engine.delete_source(rabbit_hole, ccat, source)
                     return None
                 if row is None:
-                    await crud_ingestions.create_status(ccat.agent_key, chat_id, name, type_=source.type)
+                    await rabbit_hole._adopt(source, require_points=False)
                 else:
                     phases = await engine.collect_phases(rabbit_hole, ccat)
                     recorded = set(row.get("completed_phases") or {}) | {phase.id for phase in phases}
@@ -473,6 +478,49 @@ class RabbitHole:
                 return await engine.run_phases(rabbit_hole, ccat, source)
         except (engine.IngestionCanceled, engine.LockLost):
             return None
+
+    async def adopt_source(self, cat: "CheshireCat", name: str, chat_id: str | None = None) -> bool:  # type: ignore[name-defined]
+        """Give a state to a source ingested before the states existed (its points, and its file for a file, but no
+        row), holding its lock: from then on it follows the lifecycle of any source (a deletion removes it, the resume
+        and the reruns process it). Nothing is done for a source with a state, or deleted meanwhile. The change of the
+        embedder uses it, before the collections are recreated. Returns whether the source was adopted."""
+        rabbit_hole = copy.copy(self)
+        await rabbit_hole.setup(cat)
+        source = IngestionSource(rabbit_hole.cat.agent_key, chat_id, name, "url" if fnc_is_url(name) else "file")
+        async with engine.source_lock(source):
+            return await rabbit_hole._adopt(source, require_points=True)
+
+    async def _adopt(self, source: IngestionSource, require_points: bool) -> bool:
+        """The lock of the source held: create the row (``uploaded``) of a source without one. Its metadata are the custom
+        metadata of its upload, set the same on every chunk: the ones its points share (not the ones of a chunk, e.g. a
+        page, nor the ones the phases set again). Its content type comes from its kept bytes, or from its name when the
+        bytes only say text (CSV, JSON, Markdown, code). Not adopted: a source with a row, a file not kept, a source
+        without points when ``require_points`` (deleted meanwhile)."""
+        ccat = self.cat
+        if await crud_ingestions.get_status(source.agent_id, source.chat_id, source.name) is not None:
+            return False
+        kept = await asyncio.to_thread(
+            chunks.read_source_bytes, ccat.file_manager, source.agent_id, source.chat_id, source.name,
+        )
+        if kept is None and source.type == "file":
+            return False
+        points, _ = await ccat.vector_memory_handler.get_all_tenant_points(
+            self._collection(source.chat_id), metadata=self._source_filter(source), with_vectors=False,
+        )
+        if not points and require_points:
+            return False
+        shared: Dict = {}
+        for index, point in enumerate(points):
+            metadata = (point.payload or {}).get("metadata") or {}
+            shared = dict(metadata) if index == 0 else {k: v for k, v in shared.items() if metadata.get(k, _MISSING) == v}
+        content_type = guess_file_type(BytesIO(kept))[0] if kept is not None else None
+        if content_type in (None, "text/plain"):
+            content_type = mimetypes.guess_type(source.name)[0] or content_type
+        await crud_ingestions.create_status(
+            source.agent_id, source.chat_id, source.name, type_=source.type,
+            metadata={k: v for k, v in shared.items() if k not in _PHASE_METADATA}, content_type=content_type,
+        )
+        return True
 
     async def rerun_agent(self, cat: "CheshireCat", retry_errors: bool = False) -> Dict[str, int]:  # type: ignore[name-defined]
         """Bring every source of the agent (its knowledge base and its chats) up to date (see ``rerun_source``); with

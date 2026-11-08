@@ -213,7 +213,9 @@ recorded in its **ingestion state**:
 
 A source goes through `uploaded` (`downloading` and `downloaded` for a URL), `processing`, then `completed` or `error`.
 A phase runs again only when needed: a change of the **embedder** re-embeds the kept chunks without parsing the files
-again; a change of the **chunker** (or of the settings of a phase) runs the source again from the parsing.
+again; a change of the **chunker** (or of the settings of a phase) runs the source again from the parsing. A source
+without a state (ingested before the ingestion states existed, or dismissed) gets its state at a change of the embedder
+and is processed again from its file.
 An ingestion interrupted by a crash or a restart is **resumed automatically** by any instance of the Cat, every
 `CAT_INGESTION_RESUME_INTERVAL_SECONDS`; a source is processed by one instance at a time.
 
@@ -221,7 +223,7 @@ An ingestion interrupted by a crash or a restart is **resumed automatically** by
 | --- | --- |
 | `GET /ingestion/status` | the ingestion states of the sources of the knowledge base, or of the conversation of the `X-Chat-ID` header |
 | `GET /ingestion/phases` | the phases of the agent, in execution order, and the states a source goes through |
-| `DELETE /ingestion/status?source=` | dismisses a failed ingestion (`409` for any other state: a source is removed by deleting its file) |
+| `DELETE /ingestion/status?source=` | dismisses a failed ingestion: its state goes, its file and its memory stay (a change of the embedder processes it again from its file); `409` for any other state: a source is removed by deleting its file |
 | `POST /ingestion/retry?source=` | retries a failed ingestion in background (the source turns `uploaded` at once): its failed phases run again, with the ones depending on them (`409` for any other state, a retry going on included, or when it failed before its phases: upload it again) |
 
 Deleting a file (or the points of a whole source) removes everything its phases produced; it answers `409` while the

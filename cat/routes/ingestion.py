@@ -137,8 +137,9 @@ async def dismiss_ingestion_status(
     info: AuthorizedInfo = check_permissions(AuthResource.MEMORY, AuthPermission.DELETE),
 ) -> DismissedResponse:
     """Dismiss a failed ingestion: its state and the files kept to process it go; the uploaded file and the memory
-    stay. Only a failed source can be dismissed (409 otherwise, also while it is being ingested): a source is removed
-    by deleting its file."""
+    stay (at a change of the embedder, such a source gets its state again and is processed again from its file). Only
+    a failed source can be dismissed (409 otherwise, also while it is being ingested): a source is removed by deleting
+    its file."""
     ccat = info.cheshire_cat
     chat_id = _chat_id(info)
     async with _failed_source(info, source, "dismissed: delete the file to remove it"):
