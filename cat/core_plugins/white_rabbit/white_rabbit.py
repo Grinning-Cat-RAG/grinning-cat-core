@@ -60,7 +60,9 @@ class WhiteRabbit:
             "processpool": ProcessPoolExecutor(5),
         }
 
-        job_defaults = {"coalesce": False, "max_instances": 10}
+        # the runs missed while no node was up (a crash, a restart) are merged into one: a single late run (within the
+        # grace time, otherwise skipped and logged once), not one per missed run
+        job_defaults = {"coalesce": True, "max_instances": 10}
 
         self.scheduler = AsyncIOScheduler(
             jobstores=jobstores,
@@ -149,9 +151,9 @@ class WhiteRabbit:
         log.debug(f"WhiteRabbit: Lock released for '{event}' event.")  # type: ignore[attr-defined]
 
     def shutdown(self):
-        for job_id in self.jobs.copy():
-            self.remove_job(job_id)
-
+        """Stop the scheduler of this node. The jobs stay in the store, shared by every node: they belong to the
+        instance, not to the node that scheduled them (another node, or this one at the restart, runs them). A job goes
+        only when removed on purpose (``remove_job``)."""
         if self._is_running:
             log.info("WhiteRabbit: Scheduler stopped")
             self.scheduler.shutdown(wait=True)
@@ -278,7 +280,9 @@ class WhiteRabbit:
         **kwargs,
     ) -> str:
         """
-        Schedule a one-shot job.
+        Schedule a one-shot job. It stays in the store shared by every node until it runs or is removed, also when the
+        node that scheduled it stops: a fixed ``job_id`` already pending (e.g. scheduled again at every startup) raises
+        ``ConflictingIdError``, so check it with ``get_job`` first.
 
         Args:
             job (function): The function to be called.
@@ -441,6 +445,7 @@ class WhiteRabbit:
             minute=minute,
             second=second,
             kwargs=kwargs,
+            replace_existing=True,  # idempotent across nodes and restarts: the store is shared and outlives them
         )
         self.jobs.append(job_id)
 

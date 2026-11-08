@@ -47,6 +47,8 @@ async def after_lizard_bootstrap(lizard: BillTheLizard):
         interval_job_days = None
 
     if not interval_job_days:
+        # turned off: the job of a previous run stays in the shared store, so it goes (no-op when absent)
+        lizard.white_rabbit.remove_job(scheduled_job_id)
         return
 
     # schedule_interval_job uses replace_existing=True, so re-scheduling the same
