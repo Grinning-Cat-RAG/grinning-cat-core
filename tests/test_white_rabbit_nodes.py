@@ -1,5 +1,9 @@
 """The White Rabbit on more nodes sharing the same job store: a node going away leaves the jobs of the instance."""
 import asyncio
+import itertools
+import threading
+import time
+from unittest.mock import patch
 
 from apscheduler.events import EVENT_JOB_EXECUTED, EVENT_JOB_MISSED
 from hypothesis import HealthCheck, example, given, settings, strategies as st
@@ -13,14 +17,39 @@ async def periodic_work():
 
 
 def a_node() -> WhiteRabbit:
-    """A node of the Cat: its own scheduler on the shared store (the class, not the process singleton)."""
-    return WhiteRabbit.__wrapped__()
+    """A node of the Cat: its own scheduler and Redis client on the shared store (the class, not the process
+    singleton)."""
+    from redis import Redis
+
+    from cat.core_plugins.white_rabbit import white_rabbit
+
+    with patch.object(white_rabbit, "get_sync_db", lambda: Redis(**get_sync_db().get_connection_kwargs())):
+        return WhiteRabbit.__wrapped__()
 
 
 def crash(node: WhiteRabbit):
     """The process of the node dies: its scheduler stops, nothing else runs."""
     node.scheduler.shutdown(wait=False)
     node._is_running = False
+
+
+NODE_NUMBERS = itertools.count()
+
+
+def with_latency(node: WhiteRabbit):
+    """The round trips to Redis of a node in production, its own on every node: the nodes waking at the same due time
+    all read the due jobs before any of them writes, then write one after the other."""
+    latency = 0.05 + 0.05 * (next(NODE_NUMBERS) % 6)
+    store = node.scheduler._jobstores["default"]
+    read = store.get_due_jobs
+
+    def get_due_jobs(now):
+        due = read(now)
+        if due:
+            time.sleep(latency)
+        return due
+
+    store.get_due_jobs = get_due_jobs
 
 
 def stored_jobs() -> set:
@@ -167,3 +196,141 @@ async def test_turning_the_re_embedding_off_removes_its_job_at_the_restart(monke
 
     assert stored_jobs() == set()
     lizard.white_rabbit.shutdown()
+
+
+# --- one run per scheduled time, whatever the nodes ------------------------------------------------------------------
+
+class ThreadNode:
+    """A node in its own thread and event loop: nodes are processes in production, they read the store in parallel."""
+
+    def __init__(self, runs: list):
+        self.loop = asyncio.new_event_loop()
+        ready = threading.Event()
+
+        async def create():  # the scheduler starts inside its running loop
+            self.node = a_node()
+            with_latency(self.node)
+            self.node.scheduler.add_listener(
+                lambda e: runs.append((e.job_id, e.scheduled_run_time)), EVENT_JOB_EXECUTED,
+            )
+
+        def serve():
+            asyncio.set_event_loop(self.loop)
+            self.loop.run_until_complete(create())
+            ready.set()
+            self.loop.run_forever()
+
+        self.thread = threading.Thread(target=serve, daemon=True)
+        self.thread.start()
+        ready.wait(5)
+
+    def call(self, fn, *args, **kwargs):
+        async def run():
+            return fn(*args, **kwargs)
+
+        return asyncio.run_coroutine_threadsafe(run(), self.loop).result(10)
+
+    def stop(self, crashed=False):
+        if not crashed:
+            self.call(lambda node: node.shutdown(), self.node)
+        self.loop.call_soon_threadsafe(self.loop.stop)  # a crash: the process dies, nothing runs anymore
+        self.thread.join(5)
+
+    def dies_after_booking(self):
+        """The node dies right after booking its next run, before running it."""
+        executor = self.node.scheduler._executors["default"]
+
+        def die(job, run_times):
+            self.loop.stop()
+
+        self.call(setattr, executor, "_do_submit_job", die)
+
+
+async def test_two_nodes_run_each_scheduled_time_once():
+    clear_store()
+    runs = []
+    one, other = ThreadNode(runs), ThreadNode(runs)
+    one.call(one.node.schedule_interval_job, periodic_work, job_id="every-second", seconds=1)
+    other.call(other.node.scheduler.wakeup)
+
+    await asyncio.sleep(3.5)
+
+    assert len(runs) >= 3
+    assert len(runs) == len(set(runs))  # no scheduled time run twice
+    assert other.call(other.node.get_job, "every-second").status == "scheduled"  # nobody left it "running"
+    one.stop()
+    other.stop()
+    clear_store()
+
+
+NODE_OPERATIONS = st.one_of(
+    st.just(("start", None)),
+    st.tuples(st.just("stop"), st.integers(0, 3)),
+    st.tuples(st.just("crash"), st.integers(0, 3)),
+    st.tuples(st.just("wait"), st.sampled_from((0.4, 1.1))),
+    st.tuples(st.just("dies_after_booking"), st.integers(0, 3)),
+    st.just(("reminder", None)),  # a one-shot job, due after the other nodes woke up at least once
+)
+
+
+@settings(max_examples=10, deadline=None, suppress_health_check=list(HealthCheck))
+@example(operations=[("start", None), ("start", None), ("wait", 1.1), ("wait", 1.1)])
+@example(operations=[("start", None), ("reminder", None), ("wait", 1.1)])
+@example(operations=[("start", None), ("dies_after_booking", 1), ("wait", 1.1)])
+@given(operations=st.lists(NODE_OPERATIONS, max_size=6))
+def test_each_scheduled_time_runs_once_while_nodes_come_and_go(operations):
+    asyncio.run(_each_scheduled_time_runs_once(operations))
+
+
+async def _each_scheduled_time_runs_once(operations):
+    clear_store()
+    runs = []
+    first = ThreadNode(runs)
+    first.call(first.node.schedule_interval_job, periodic_work, job_id="every-second", seconds=1)
+    nodes = [first]
+    try:
+        reminders = 0
+        for kind, arg in operations:
+            if kind == "start":
+                nodes.append(ThreadNode(runs))
+            elif kind in ("stop", "crash", "dies_after_booking") and len(nodes) > 1:  # one node stays: the instance is up
+                node = nodes.pop(arg % len(nodes))
+                if kind == "dies_after_booking":
+                    node.dies_after_booking()
+                    await asyncio.sleep(1.1)  # its next run: booked, never run
+                    node.stop(crashed=True)
+                else:
+                    node.stop(crashed=kind == "crash")
+            elif kind == "reminder":
+                reminders += 1
+                nodes[0].call(nodes[0].node.schedule_job, periodic_work, job_id=f"reminder-{reminders}", seconds=2.5)
+            elif kind == "wait":
+                await asyncio.sleep(arg)
+            assert len(runs) == len(set(runs))  # the rule: no scheduled time runs twice
+        await asyncio.sleep(1.1)
+        before = len([r for r in runs if r[0] == "every-second"])
+        await asyncio.sleep(2.2)
+        # every live node keeps running the jobs (none stopped by a one-shot job removed by another node)
+        assert len([r for r in runs if r[0] == "every-second"]) > before
+        assert len(runs) == len(set(runs))
+        assert {r[0] for r in runs if r[0].startswith("reminder")} == {f"reminder-{i}" for i in range(1, reminders + 1)}
+        for node in nodes:  # no live node lost its timer (it would never run a job again)
+            assert node.call(lambda scheduler: scheduler._timeout is not None, node.node.scheduler)
+    finally:
+        for node in nodes:
+            node.stop()
+        clear_store()
+
+
+async def test_a_scheduler_that_cannot_start_leaves_a_stopped_node(monkeypatch):
+    from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+    def unreachable(self, *args, **kwargs):
+        raise ConnectionError("the job store is unreachable")
+
+    monkeypatch.setattr(AsyncIOScheduler, "start", unreachable)
+
+    node = a_node()
+
+    assert node._is_running is False
+    node.shutdown()  # nothing to stop
