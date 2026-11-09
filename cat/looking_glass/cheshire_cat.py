@@ -429,7 +429,8 @@ class CheshireCat(BotMixin, NonCopyableMixin):
         await self.plugin_manager.execute_hook("after_file_manager_transfer_on_agent", success, caller=self)
 
     async def transfer_vector_points_from(self, previous_vector_memory_handler: BaseVectorDatabaseHandler):
-        """Copies the points of the previous vector database into the current one, collection by collection, then runs
+        """Copies the points of the previous vector database into the current one (``_copy_vector_points_from``: what
+        the current database kept of the agent, e.g. from a previous use, goes first), then runs
         ``after_vector_memory_transfer_on_agent`` (the plugins rebuild what they derive from the points).
 
         Meanwhile the agent is in maintenance: the automatic resume would run the phases of the new database, or the
@@ -495,16 +496,34 @@ class CheshireCat(BotMixin, NonCopyableMixin):
             await heartbeat
 
     async def _copy_vector_points_from(self, previous_vector_memory_handler: BaseVectorDatabaseHandler) -> bool:
+        """The new database becomes a copy of the previous one, for the agent. First, what it kept of the agent from a
+        previous use (sources deleted since, old points of sources embedded again) goes, from every collection: whatever
+        the outcome then, it holds the copy, or what the failure path rebuilds from the sources, never stale points.
+        Then the collections of the previous database are copied (one missing in the new database is created when the
+        agent has points there; the previous database may list collections of other agents too). The procedures are
+        not copied: they come from the plugins, and are embedded again."""
         try:
             embedder = await self.embedder()
-            await self.vector_memory_handler.initialize(embedder.name, await embedding_size(embedder))
+            embedder_size = await embedding_size(embedder)
+            handler = self.vector_memory_handler
+            await handler.initialize(embedder.name, embedder_size)
+            existing = set(await handler.get_collection_names())
+            for collection_name in existing:
+                await handler.delete_tenant_points(collection_name)
             for collection_name in await previous_vector_memory_handler.get_collection_names():
+                if collection_name == str(VectorMemoryType.PROCEDURAL):
+                    continue
                 points, _ = await previous_vector_memory_handler.get_all_tenant_points(collection_name, with_vectors=True)
-                if points:
-                    await self.vector_memory_handler.add_points_to_tenant(
-                        collection_name=collection_name,
-                        points=[PointStruct(**p.model_dump(exclude={"shard_key", "order_value"})) for p in points],
-                    )
+                if not points:
+                    continue
+                if collection_name not in existing:
+                    await handler.create_collection(embedder.name, embedder_size, collection_name)
+                    existing.add(collection_name)
+                await handler.add_points_to_tenant(
+                    collection_name=collection_name,
+                    points=[PointStruct(**p.model_dump(exclude={"shard_key", "order_value"})) for p in points],
+                )
+            await self.embed_procedures()
             return True
         except Exception as e:
             log.error(f"Error while transferring vector points from previous vector memory handler: {e}")

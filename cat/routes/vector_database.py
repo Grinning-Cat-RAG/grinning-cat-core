@@ -58,7 +58,7 @@ async def upsert_vector_database_setting(
     """Upsert the Vector Database setting.
 
     Switching to another vector database copies the points of the agent, in background, from the previous database to
-    the new one (``CheshireCat.transfer_vector_points_from``): meanwhile the agent is in maintenance, so the automatic
+    the new one, replacing what the new one kept of the agent (``CheshireCat.transfer_vector_points_from``): meanwhile the agent is in maintenance, so the automatic
     resume of the ingestions leaves it alone, until ``after_vector_memory_transfer_on_agent`` has run; a failed or
     interrupted copy leaves every source to be embedded again. Changing only the settings of the same database runs
     ``after_vector_database_settings_update``.

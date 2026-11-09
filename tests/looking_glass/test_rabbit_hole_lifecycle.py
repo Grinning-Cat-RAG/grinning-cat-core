@@ -27,6 +27,7 @@ import asyncio
 import contextlib
 import copy
 import os
+import uuid
 from io import BytesIO
 
 from unittest.mock import patch
@@ -39,7 +40,8 @@ from cat.core_plugins.base_plugin.file_managers.custom import LocalFileManager
 from cat.db.cruds import ingestions as crud_ingestions
 from cat.rabbit_hole import RabbitHole, SourceNotKept, chunks, engine, recovery
 from cat.rabbit_hole.phases import IngestionPhase, PhaseResult, compute_tags
-from cat.services.memory.models import VectorMemoryType
+from cat.services.factory.embedder import embedding_size
+from cat.services.memory.models import PointStruct, VectorMemoryType
 
 hypothesis = pytest.importorskip("hypothesis")
 from hypothesis import HealthCheck, example, given, settings, strategies as st  # noqa: E402
@@ -273,13 +275,14 @@ async def test_the_lifecycle_of_the_sources(lizard, cheshire_cat, monkeypatch, o
         assert row["status"] == "processing" and row["owner"] is not None
 
     async def change_vector_database(fault):
-        """The vector database changes: its new phases change the tags, the resume passes during the copy. The copy
-        succeeds, fails halfway (the old database goes down), cannot start (the new database is unreachable) or is
-        interrupted (the pod stops). Then the resume passes again (after the lock timeout when the pod stopped)."""
+        """The vector database changes: its new phases change the tags, the resume passes during the copy. The new
+        database was used by the agent before (its initialize keeps the collections, with what they kept). The copy
+        succeeds, fails halfway (the new database fails while written), cannot start (the new database is unreachable)
+        or is interrupted (the pod stops). Then the resume passes again (after the lock timeout when the pod stopped)."""
         gate = asyncio.Event()
         reads = []
         collection = str(VectorMemoryType.DECLARATIVE)
-        # the old database keeps its points: the new one starts empty (its initialize empties the collection)
+        # the old database keeps its points
         old_points, _ = await cheshire_cat.vector_memory_handler.get_all_tenant_points(collection, with_vectors=True)
         embedded = {  # the sources with their points: they keep them, in error too
             row["source"] for row in await crud_ingestions.list_statuses(agent)
@@ -289,27 +292,37 @@ async def test_the_lifecycle_of_the_sources(lizard, cheshire_cat, monkeypatch, o
 
         class Previous:
             async def get_collection_names(self):
-                return [collection]
+                return [collection, "someone_elses_notes"]  # Qdrant lists every collection of the instance
 
             async def get_all_tenant_points(self, collection_name, with_vectors=True):
                 reads.append(collection_name)
                 await gate.wait()
-                if fault == "copy_fails":
-                    raise ConnectionError("old vector db down")
-                return list(old_points), None
+                return (list(old_points) if collection_name == collection else []), None
 
         handler_class = type(cheshire_cat.vector_memory_handler)
-        recreate = handler_class.initialize
+        write = handler_class.add_points_to_tenant
 
         async def initialize(self, *args):
             if fault == "unreachable":
                 reads.append("initialize")
                 await gate.wait()
                 raise ConnectionError("new vector db down")
-            return await recreate(self, *args)
 
+        async def add_points_to_tenant(self, collection_name, points):
+            if fault == "copy_fails" and collection_name == collection:
+                raise ConnectionError("new vector db down while written")
+            return await write(self, collection_name=collection_name, points=points)
+
+        if fault != "unreachable":  # (an unreachable new database is left as it is)
+            # the new database was used by the agent before: it kept a source deleted since
+            size = await embedding_size(await cheshire_cat.embedder())
+            await cheshire_cat.vector_memory_handler.add_points_to_tenant(collection, [PointStruct(
+                id=uuid.uuid4().hex, vector=[0.1] * size,
+                payload={"page_content": "stale", "metadata": {"source": "deleted-meanwhile.txt"}},
+            )])
         transfers_before = len(world.transfer_hook)
-        with patch.object(handler_class, "initialize", initialize):
+        with patch.object(handler_class, "initialize", initialize), \
+                patch.object(handler_class, "add_points_to_tenant", add_points_to_tenant):
             transfer = asyncio.create_task(cheshire_cat.transfer_vector_points_from(Previous()))
             try:
                 for _ in range(500):
@@ -327,6 +340,11 @@ async def test_the_lifecycle_of_the_sources(lizard, cheshire_cat, monkeypatch, o
                 gate.set()
                 with contextlib.suppress(asyncio.CancelledError):
                     await asyncio.wait_for(transfer, 10)
+        if fault != "unreachable":  # whatever the outcome, what the new database kept of the agent is gone
+            left, _ = await cheshire_cat.vector_memory_handler.get_all_tenant_points(
+                collection, metadata={"source": "deleted-meanwhile.txt"}, with_vectors=False,
+            )
+            assert left == [], fault
         if fault == "pod_stops":
             assert world.transfer_hook[transfers_before:] == []
             await asyncio.sleep(engine.lock_timeout_seconds() + 0.2)  # the marker and the heartbeat expire

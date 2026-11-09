@@ -2,6 +2,8 @@
 re-embedding on a change of the embedder (``BillTheLizard.embed_all_in_cheshire_cats``), and the maintenance of an agent
 while its vector database changes (``CheshireCat.transfer_vector_points_from``)."""
 import asyncio
+import copy
+import uuid
 from io import BytesIO
 
 import pytest
@@ -14,7 +16,7 @@ from cat.db.cruds import users as crud_users
 from cat.looking_glass import CheshireCat
 from cat.rabbit_hole import RabbitHole, chunks, engine, recovery
 from cat.rabbit_hole.phases import IngestionSource
-from cat.services.memory.models import VectorMemoryType
+from cat.services.memory.models import PointStruct, VectorMemoryType
 
 TEXT = ("Curiouser and curiouser! cried Alice, she was so much surprised. " * 30).encode()
 
@@ -809,7 +811,7 @@ async def test_a_memory_without_a_source_is_not_taken_for_an_old_source(lizard, 
 
 # --- the change of the vector database ---------------------------------------------------------------------------
 
-COLLECTIONS = (str(VectorMemoryType.DECLARATIVE), str(VectorMemoryType.EPISODIC))
+COLLECTIONS = (str(VectorMemoryType.DECLARATIVE), str(VectorMemoryType.EPISODIC), str(VectorMemoryType.PROCEDURAL))
 
 
 class PreviousVectorDatabase:
@@ -827,10 +829,13 @@ class PreviousVectorDatabase:
         return cls(points, **kwargs)
 
     async def get_collection_names(self):
-        return list(COLLECTIONS)
+        # every collection of the instance (Qdrant lists them all): also one of another agent, without points of this one
+        return list(self.points) + ["someone_elses_notes"]
 
     async def get_all_tenant_points(self, collection_name, with_vectors=True):
         self.reads.append(collection_name)
+        if collection_name not in self.points:
+            return [], None
         if self.gate is not None:
             await self.gate.wait()
         if collection_name == self.failing:
@@ -847,6 +852,19 @@ def new_database_starts_empty(monkeypatch, cheshire_cat):
             await self.delete_tenant_points(collection)
 
     monkeypatch.setattr(type(cheshire_cat.vector_memory_handler), "initialize", initialize)
+
+
+async def a_point(cat, source):
+    """A point of the agent, with a vector of the size of its embedder."""
+    from cat.services.factory.embedder import embedding_size
+
+    size = await embedding_size(await cat.embedder())
+    return PointStruct(id=uuid.uuid4().hex, vector=[0.1] * size, payload={"page_content": source, "metadata": {"source": source}})
+
+
+async def plant_stale_point(cat, source="deleted-meanwhile.txt"):
+    """The new database was used by the agent before: it kept a point of a source deleted since."""
+    await cat.vector_memory_handler.add_points_to_tenant(str(VectorMemoryType.DECLARATIVE), [await a_point(cat, source)])
 
 
 def record_transfer_hook(monkeypatch, cheshire_cat):
@@ -931,6 +949,7 @@ async def test_the_resume_leaves_the_agent_alone_while_its_vector_database_chang
     # the source of the dead worker (in flight) is completed into the new database; the others keep the copied points
     assert reruns == [("crashed.txt", ["embedding"])]
     assert await is_up_to_date_in_the_new_database(cheshire_cat, "crashed.txt")
+    assert "someone_elses_notes" not in await cheshire_cat.vector_memory_handler.get_collection_names()
     assert len(await points_of(cheshire_cat, "story.txt")) == len(
         [p for p in previous.points[str(VectorMemoryType.DECLARATIVE)] if p.payload["metadata"]["source"] == "story.txt"]
     ) > 0
@@ -1305,3 +1324,84 @@ async def test_a_failed_heartbeat_is_retried_at_the_next_one(cheshire_cat, monke
         previous.gate.set()
         await asyncio.wait_for(transfer, 10)
     assert await crud_ingestions.get_vector_transfer(cheshire_cat.agent_key) is None
+
+
+async def test_a_database_used_before_becomes_a_copy_of_the_current_one(cheshire_cat, files):
+    """Back to a database the agent used before: what it kept of the agent (a source deleted meanwhile, the old points of
+    a source embedded again) goes; the points of the other agents stay."""
+    await ingest(cheshire_cat)
+    await ingest(cheshire_cat, "deleted.txt")
+    handler = cheshire_cat.vector_memory_handler
+    other = copy.copy(handler)
+    other.agent_id = "another_agent"
+    declarative = str(VectorMemoryType.DECLARATIVE)
+    mine, _ = await handler.get_all_tenant_points(declarative, with_vectors=True)
+    await other.add_points_to_tenant(declarative, [
+        PointStruct(**{**p.model_dump(exclude={"shard_key", "order_value"}), "id": uuid.uuid4().hex}) for p in mine[:1]
+    ])
+    try:
+        # the current database: "deleted.txt" was deleted, "story.txt" embedded again (new ids)
+        previous = await PreviousVectorDatabase.of(handler)
+        current = [p for p in previous.points[declarative] if p.payload["metadata"]["source"] == "story.txt"]
+        previous.points[declarative] = [
+            PointStruct(**{**p.model_dump(exclude={"shard_key", "order_value"}), "id": uuid.uuid4().hex})
+            for p in current
+        ]
+
+        await cheshire_cat.transfer_vector_points_from(previous)
+
+        points, _ = await handler.get_all_tenant_points(declarative, with_vectors=False)
+        assert sorted(str(p.id) for p in points) == sorted(str(p.id) for p in previous.points[declarative])
+        others, _ = await other.get_all_tenant_points(declarative, with_vectors=False)
+        assert len(others) == 1
+    finally:
+        await other.delete_tenant_points(declarative)
+
+
+async def test_a_failed_copy_to_a_database_used_before_leaves_no_stale_point(lizard, cheshire_cat, files, monkeypatch):
+    await ingest(cheshire_cat)
+    # the old database fails at its first collection: the copy reaches none
+    previous = await PreviousVectorDatabase.of(cheshire_cat.vector_memory_handler, failing=str(VectorMemoryType.DECLARATIVE))
+    await plant_stale_point(cheshire_cat)
+
+    await cheshire_cat.transfer_vector_points_from(previous)
+    await recovery.resume_agent(lizard, cheshire_cat.agent_key)
+
+    assert await points_of(cheshire_cat, "deleted-meanwhile.txt") == []
+    assert await is_up_to_date_in_the_new_database(cheshire_cat, "story.txt")
+
+
+async def test_a_collection_of_the_agent_missing_in_the_new_database_is_created(cheshire_cat, files):
+    handler = cheshire_cat.vector_memory_handler
+    previous = await PreviousVectorDatabase.of(handler)
+    previous.points["my_notes"] = [await a_point(cheshire_cat, "a note")]  # a collection created by a client
+    try:
+        await cheshire_cat.transfer_vector_points_from(previous)
+
+        points, _ = await handler.get_all_tenant_points("my_notes", with_vectors=False)
+        assert [str(p.id) for p in points] == [str(p.id) for p in previous.points["my_notes"]]
+    finally:
+        if await handler.check_collection_existence("my_notes"):
+            await handler.delete_collection("my_notes")
+
+
+async def test_the_procedures_are_embedded_again_not_copied(cheshire_cat, monkeypatch):
+    handler = cheshire_cat.vector_memory_handler
+    procedural = str(VectorMemoryType.PROCEDURAL)
+    previous = await PreviousVectorDatabase.of(handler)
+    previous.points[procedural] = [await a_point(cheshire_cat, "an old procedure")]  # of plugins changed since
+    old_ids = {str(p.id) for p in previous.points[procedural]}
+    calls = []
+    real = CheshireCat.embed_procedures
+
+    async def embed_procedures(self, pt=None):
+        calls.append(pt)
+        return await real(self, pt)
+
+    monkeypatch.setattr(CheshireCat, "embed_procedures", embed_procedures)
+
+    await cheshire_cat.transfer_vector_points_from(previous)
+
+    assert calls == [None]
+    points, _ = await handler.get_all_tenant_points(procedural, with_vectors=False)
+    assert not old_ids & {str(p.id) for p in points}

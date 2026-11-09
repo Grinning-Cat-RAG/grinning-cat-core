@@ -219,7 +219,8 @@ and is processed again from its file.
 An ingestion interrupted by a crash or a restart is **resumed automatically** by any instance of the Cat, every
 `CAT_INGESTION_RESUME_INTERVAL_SECONDS`; a source is processed by one instance at a time.
 While the embedder changes, or while the **vector database** of an agent changes (its points are copied, in background,
-from the previous database to the new one), the agent is in maintenance: the automatic resume leaves it alone (a pass
+from the previous database to the new one, after removing what the new one kept of the agent from a previous use; the
+procedures are embedded again), the agent is in maintenance: the automatic resume leaves it alone (a pass
 already running stops before its next source) until the copy ends and the `after_vector_memory_transfer_on_agent` hook
 (where plugins rebuild what they derive from the points) has run, whatever the outcome. Before the hook:
 
