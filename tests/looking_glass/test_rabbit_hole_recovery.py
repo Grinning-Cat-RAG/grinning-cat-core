@@ -1,11 +1,13 @@
 """Bringing the sources up to date: ``RabbitHole.rerun_source``, the automatic resume (``cat.rabbit_hole.recovery``) and the
-re-embedding on a change of the embedder (``BillTheLizard.embed_all_in_cheshire_cats``)."""
+re-embedding on a change of the embedder (``BillTheLizard.embed_all_in_cheshire_cats``), and the maintenance of an agent
+while its vector database changes (``CheshireCat.transfer_vector_points_from``)."""
 import asyncio
 from io import BytesIO
 
 import pytest
 
 from cat.core_plugins.base_plugin.file_managers.custom import LocalFileManager
+from cat.db import crud
 from cat.db.cruds import conversations as crud_conversations
 from cat.db.cruds import ingestions as crud_ingestions
 from cat.db.cruds import users as crud_users
@@ -803,3 +805,503 @@ async def test_a_memory_without_a_source_is_not_taken_for_an_old_source(lizard, 
     )
 
     assert await type(lizard)._sources_without_state(cheshire_cat) == [("legacy.txt", None)]
+
+
+# --- the change of the vector database ---------------------------------------------------------------------------
+
+COLLECTIONS = (str(VectorMemoryType.DECLARATIVE), str(VectorMemoryType.EPISODIC))
+
+
+class PreviousVectorDatabase:
+    """The vector database being left: it keeps the points it had when the switch started (``of``), read by the transfer
+    collection by collection. ``gate`` holds every read until set (a long copy); ``failing`` is a collection whose read
+    fails (the old database goes down halfway)."""
+
+    def __init__(self, points: dict, gate: asyncio.Event | None = None, failing: str | None = None):
+        self.points, self.gate, self.failing = points, gate, failing
+        self.reads: list = []
+
+    @classmethod
+    async def of(cls, handler, **kwargs):
+        points = {c: (await handler.get_all_tenant_points(c, with_vectors=True))[0] for c in COLLECTIONS}
+        return cls(points, **kwargs)
+
+    async def get_collection_names(self):
+        return list(COLLECTIONS)
+
+    async def get_all_tenant_points(self, collection_name, with_vectors=True):
+        self.reads.append(collection_name)
+        if self.gate is not None:
+            await self.gate.wait()
+        if collection_name == self.failing:
+            raise ConnectionError("old vector db down")
+        return list(self.points[collection_name]), None
+
+
+def new_database_starts_empty(monkeypatch, cheshire_cat):
+    """The new vector database has none of the points: its ``initialize`` finds the collections empty (the tests run on
+    one database, so the points of the agent are removed there)."""
+
+    async def initialize(self, embedder_name_, embedder_size):
+        for collection in COLLECTIONS:
+            await self.delete_tenant_points(collection)
+
+    monkeypatch.setattr(type(cheshire_cat.vector_memory_handler), "initialize", initialize)
+
+
+def record_transfer_hook(monkeypatch, cheshire_cat):
+    """The outcomes of ``after_vector_memory_transfer_on_agent``, each with whether the agent was in maintenance."""
+    outcomes = []
+    manager_class = type(cheshire_cat.plugin_manager)
+    original = manager_class.execute_hook
+
+    async def execute_hook(self, name, *args, caller):
+        if name == "after_vector_memory_transfer_on_agent":
+            outcomes.append((args[0], await crud_ingestions.is_in_maintenance(caller.agent_key)))
+        return await original(self, name, *args, caller=caller)
+
+    monkeypatch.setattr(manager_class, "execute_hook", execute_hook)
+    return outcomes
+
+
+def record_reruns(monkeypatch):
+    """The sources the transfer (or the resume) runs again, with the phases invalidated."""
+    calls = []
+    real = RabbitHole.rerun_source
+
+    async def rerun_source(self, cat, name, chat_id=None, blocking=True, invalidate=None):
+        calls.append((name, list(invalidate or [])))
+        return await real(self, cat, name, chat_id, blocking, invalidate)
+
+    monkeypatch.setattr(RabbitHole, "rerun_source", rerun_source)
+    return calls
+
+
+async def wait_until(predicate, seconds=5.0):
+    async def poll():
+        while not await predicate():
+            await asyncio.sleep(0.01)
+
+    await asyncio.wait_for(poll(), seconds)
+
+
+async def make_stale(agent_id):
+    """The heartbeat of the transfer stopped longer than a lock timeout ago (its pod died)."""
+    record = await crud_ingestions.get_vector_transfer(agent_id)
+    stale = record["beat"] - engine.lock_timeout_seconds() - 1
+    await crud.store(crud_ingestions.vector_transfer_key(agent_id), {**record, "beat": stale})
+
+
+async def is_up_to_date_in_the_new_database(cat, name):
+    row = await crud_ingestions.get_status(cat.agent_key, None, name)
+    embedding = row["completed_phases"].get("embedding")
+    return row["status"] == "completed" and embedding is not None and (
+        len(await points_of(cat, name)) == embedding["processed"] > 0
+    )
+
+
+async def test_the_resume_leaves_the_agent_alone_while_its_vector_database_changes(
+    lizard, cheshire_cat, files, monkeypatch,
+):
+    await ingest(cheshire_cat)
+    await ingest(cheshire_cat, "crashed.txt")
+    await crash(cheshire_cat, "crashed.txt")
+    plug_settings_phase(monkeypatch, cheshire_cat)  # the new database brings a phase: every tag changes
+    outcomes = record_transfer_hook(monkeypatch, cheshire_cat)
+    reruns = record_reruns(monkeypatch)
+    previous = await PreviousVectorDatabase.of(cheshire_cat.vector_memory_handler, gate=asyncio.Event())
+    new_database_starts_empty(monkeypatch, cheshire_cat)
+    rows_before = await crud_ingestions.list_statuses(cheshire_cat.agent_key)
+    transfer = asyncio.create_task(cheshire_cat.transfer_vector_points_from(previous))
+    try:
+        await wait_until(lambda: asyncio.sleep(0, bool(previous.reads)))  # the copy is running
+        assert await crud_ingestions.is_in_maintenance(cheshire_cat.agent_key)
+
+        await recovery.resume_agent(lizard, cheshire_cat.agent_key)
+
+        assert await crud_ingestions.list_statuses(cheshire_cat.agent_key) == rows_before  # nothing written
+        assert SettingsPhase.runs == 0 and outcomes == []
+    finally:
+        previous.gate.set()
+        await asyncio.wait_for(transfer, 10)
+
+    assert outcomes == [(True, True)]  # the plugins rebuild still in maintenance
+    assert not await crud_ingestions.is_in_maintenance(cheshire_cat.agent_key)
+    assert await crud_ingestions.get_vector_transfer(cheshire_cat.agent_key) is None
+    # the source of the dead worker (in flight) is completed into the new database; the others keep the copied points
+    assert reruns == [("crashed.txt", ["embedding"])]
+    assert await is_up_to_date_in_the_new_database(cheshire_cat, "crashed.txt")
+    assert len(await points_of(cheshire_cat, "story.txt")) == len(
+        [p for p in previous.points[str(VectorMemoryType.DECLARATIVE)] if p.payload["metadata"]["source"] == "story.txt"]
+    ) > 0
+
+
+async def test_a_resume_pass_running_stops_at_the_next_source_when_the_vector_database_changes(
+    lizard, cheshire_cat, files, monkeypatch,
+):
+    for name in ("first.txt", "second.txt"):
+        await ingest(cheshire_cat, name)
+        await crash(cheshire_cat, name)
+    previous = await PreviousVectorDatabase.of(cheshire_cat.vector_memory_handler, gate=asyncio.Event())
+    transfers = []
+    real = RabbitHole.rerun_source
+
+    async def rerun_then_transfer(self, cat, name, chat_id=None, blocking=True, invalidate=None):
+        row = await real(self, cat, name, chat_id, blocking, invalidate)
+        if not transfers:  # the vector database changes while the pass is on its first source
+            transfers.append(asyncio.create_task(cat.transfer_vector_points_from(previous)))
+            await wait_until(lambda: crud_ingestions.is_in_maintenance(cat.agent_key))
+        return row
+
+    monkeypatch.setattr(RabbitHole, "rerun_source", rerun_then_transfer)
+    try:
+        await recovery.resume_agent(lizard, cheshire_cat.agent_key)
+
+        statuses = sorted(r["status"] for r in await crud_ingestions.list_statuses(cheshire_cat.agent_key))
+        assert statuses == ["completed", "processing"]
+    finally:
+        previous.gate.set()
+        await asyncio.wait_for(asyncio.gather(*transfers), 10)
+    assert not await crud_ingestions.is_in_maintenance(cheshire_cat.agent_key)
+
+
+async def test_a_source_ingested_during_the_copy_is_embedded_again_in_the_new_database(
+    cheshire_cat, files, monkeypatch,
+):
+    """An upload started before the switch writes into the old database: once its worker ends, the transfer embeds it
+    again in the new one. The sources not touched during the copy are not."""
+    await ingest(cheshire_cat, "untouched.txt")
+    await ingest(cheshire_cat, "uploading.txt")
+    reruns = record_reruns(monkeypatch)
+    previous = await PreviousVectorDatabase.of(cheshire_cat.vector_memory_handler)
+    worker_done, worker_ready = asyncio.Event(), asyncio.Event()
+
+    async def live_worker():
+        # the worker of the upload holds its source beyond the copy, in the middle of its embedding: its heartbeat
+        # (every 30 seconds) last touched the row before the switch
+        async with engine.source_lock(IngestionSource(cheshire_cat.agent_key, None, "uploading.txt")):
+            await crud_ingestions.update_status(
+                cheshire_cat.agent_key, None, "uploading.txt", status="processing", owner=engine.OWNER,
+            )
+            await crud_ingestions.reset_phase_entries(cheshire_cat.agent_key, None, "uploading.txt", ["embedding"])
+            worker_ready.set()
+            await asyncio.wait_for(worker_done.wait(), 10)
+
+    worker = asyncio.create_task(live_worker())
+    transfer = None
+    try:
+        await asyncio.wait_for(worker_ready.wait(), 5)
+        await asyncio.sleep(0.05)  # the switch comes later than the last write of the worker
+        new_database_starts_empty(monkeypatch, cheshire_cat)
+        transfer = asyncio.create_task(cheshire_cat.transfer_vector_points_from(previous))
+        await asyncio.sleep(0.5)
+        assert not transfer.done()  # it waits for the worker of the upload
+        assert await crud_ingestions.is_in_maintenance(cheshire_cat.agent_key)
+    finally:
+        worker_done.set()
+        await asyncio.wait_for(worker, 10)
+        if transfer is not None:
+            await asyncio.wait_for(transfer, 10)
+
+    assert reruns == [("uploading.txt", ["embedding"])]
+    assert await is_up_to_date_in_the_new_database(cheshire_cat, "uploading.txt")
+    assert await is_up_to_date_in_the_new_database(cheshire_cat, "untouched.txt")  # copied
+
+
+async def test_a_source_that_cannot_be_embedded_again_after_the_copy_is_left_to_the_resume(
+    lizard, cheshire_cat, files, monkeypatch,
+):
+    await ingest(cheshire_cat)
+    previous = await PreviousVectorDatabase.of(cheshire_cat.vector_memory_handler)
+    real = RabbitHole.rerun_source
+    failures = {"left": 1}
+
+    async def rerun_source(self, cat, name, chat_id=None, blocking=True, invalidate=None):
+        if failures["left"]:
+            failures["left"] -= 1
+            raise ConnectionError("redis down for a moment")
+        return await real(self, cat, name, chat_id, blocking, invalidate)
+
+    monkeypatch.setattr(RabbitHole, "rerun_source", rerun_source)
+    outcomes = record_transfer_hook(monkeypatch, cheshire_cat)
+    real_start = crud_ingestions.start_vector_transfer
+
+    async def start_then_touch(agent_id):
+        since = await real_start(agent_id)
+        await asyncio.sleep(0.01)
+        await crud_ingestions.touch_status(agent_id, None, "story.txt")  # an upload ends during the copy
+        return since
+
+    monkeypatch.setattr(crud_ingestions, "start_vector_transfer", start_then_touch)
+    new_database_starts_empty(monkeypatch, cheshire_cat)
+
+    await cheshire_cat.transfer_vector_points_from(previous)
+
+    assert outcomes == [(True, True)]
+    row = await crud_ingestions.get_status(cheshire_cat.agent_key, None, "story.txt")
+    assert "embedding" not in row["completed_phases"]  # left to the resume
+    await recovery.resume_agent(lizard, cheshire_cat.agent_key)
+    assert await is_up_to_date_in_the_new_database(cheshire_cat, "story.txt")
+
+
+@pytest.mark.parametrize("failure", ["initialize", "halfway", "embedder"])
+async def test_a_failed_transfer_leaves_every_source_to_be_embedded_again_by_the_resume(
+    lizard, cheshire_cat, files, monkeypatch, failure,
+):
+    await ingest(cheshire_cat)
+    plug_settings_phase(monkeypatch, cheshire_cat)
+    await cheshire_cat.rabbit_hole.rerun_source(cheshire_cat, "story.txt")  # the plugin phase is up to date
+    runs_before = SettingsPhase.runs
+    outcomes = record_transfer_hook(monkeypatch, cheshire_cat)
+    previous = await PreviousVectorDatabase.of(
+        cheshire_cat.vector_memory_handler, failing=str(VectorMemoryType.EPISODIC) if failure == "halfway" else None,
+    )
+    new_database_starts_empty(monkeypatch, cheshire_cat)
+    if failure == "initialize":
+        async def initialize(self, embedder_name_, embedder_size):
+            raise ConnectionError("new vector db down")
+
+        monkeypatch.setattr(type(cheshire_cat.vector_memory_handler), "initialize", initialize)
+    elif failure == "embedder":
+        real_embedder = CheshireCat.embedder
+        calls = {"n": 0}
+
+        async def embedder(self):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise ConnectionError("settings unreadable")
+            return await real_embedder(self)
+
+        monkeypatch.setattr(CheshireCat, "embedder", embedder)
+    procedures = []
+    real_procedures = CheshireCat.embed_procedures
+
+    async def embed_procedures(self, pt=None):
+        procedures.append(self.agent_key)
+        return await real_procedures(self, pt)
+
+    monkeypatch.setattr(CheshireCat, "embed_procedures", embed_procedures)
+
+    await cheshire_cat.transfer_vector_points_from(previous)
+
+    assert outcomes == [(False, True)]
+    assert not await crud_ingestions.is_in_maintenance(cheshire_cat.agent_key)
+    assert await crud_ingestions.get_vector_transfer(cheshire_cat.agent_key) is None
+    assert procedures == [cheshire_cat.agent_key]
+    phases = (await crud_ingestions.get_status(cheshire_cat.agent_key, None, "story.txt"))["completed_phases"]
+    assert "embedding" not in phases and "graph" not in phases  # the dependents too
+
+    if failure == "initialize":
+        new_database_starts_empty(monkeypatch, cheshire_cat)  # the new database is back
+    await recovery.resume_agent(lizard, cheshire_cat.agent_key)
+    assert await is_up_to_date_in_the_new_database(cheshire_cat, "story.txt")
+    assert SettingsPhase.runs == runs_before + 1
+
+
+async def test_a_transfer_stopped_with_the_pod_is_taken_over_by_the_resume(lizard, cheshire_cat, files, monkeypatch):
+    await ingest(cheshire_cat)
+    outcomes = record_transfer_hook(monkeypatch, cheshire_cat)
+    previous = await PreviousVectorDatabase.of(cheshire_cat.vector_memory_handler, gate=asyncio.Event())
+    new_database_starts_empty(monkeypatch, cheshire_cat)
+    transfer = asyncio.create_task(cheshire_cat.transfer_vector_points_from(previous))
+    try:
+        await wait_until(lambda: asyncio.sleep(0, bool(previous.reads)))
+    finally:
+        transfer.cancel()  # the pod stops: as if the process died
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(transfer, 10)
+
+    assert outcomes == []
+    from cat.db.database import get_async_db
+
+    ttl = await get_async_db().ttl(crud_ingestions.maintenance_key(cheshire_cat.agent_key))
+    assert 0 < ttl <= engine.lock_timeout_seconds()  # it expires by itself, soon
+    transfer_record = await crud_ingestions.get_vector_transfer(cheshire_cat.agent_key)
+    assert transfer_record is not None
+
+    await crud_ingestions.clear_maintenance(cheshire_cat.agent_key)  # the marker expired
+    await recovery.resume_agent(lizard, cheshire_cat.agent_key)  # the transfer may be alive on another pod: no
+    assert not await is_up_to_date_in_the_new_database(cheshire_cat, "story.txt")
+
+    # the heartbeat stopped: past the lock timeout the transfer is dead, and the resume takes it over
+    await make_stale(cheshire_cat.agent_key)
+    await recovery.resume_agent(lizard, cheshire_cat.agent_key)
+
+    assert await is_up_to_date_in_the_new_database(cheshire_cat, "story.txt")
+    assert await crud_ingestions.get_vector_transfer(cheshire_cat.agent_key) is None
+    assert outcomes == [(False, False)]  # the plugins know it failed
+
+
+async def test_a_dead_transfer_of_an_agent_without_sources_is_closed_by_the_resume(lizard, cheshire_cat, monkeypatch):
+    procedures = []
+
+    async def embed_procedures(self, pt=None):
+        procedures.append(self.agent_key)
+
+    monkeypatch.setattr(CheshireCat, "embed_procedures", embed_procedures)
+    outcomes = record_transfer_hook(monkeypatch, cheshire_cat)
+    await crud.store(crud_ingestions.vector_transfer_key(cheshire_cat.agent_key), {"since": 1.0, "beat": 1.0})
+
+    await recovery.resume_agent(lizard, cheshire_cat.agent_key)
+
+    assert procedures == [cheshire_cat.agent_key]
+    assert outcomes == [(False, False)]
+    assert await crud_ingestions.get_vector_transfer(cheshire_cat.agent_key) is None
+
+
+async def test_a_long_copy_keeps_the_agent_in_maintenance(cheshire_cat, monkeypatch):
+    """The marker lives a lock timeout, renewed by the heartbeat of the transfer, also when cleared by another actor
+    (e.g. the end of a change of the embedder) while the copy runs."""
+    monkeypatch.setenv("CAT_INGESTION_HEARTBEAT_SECONDS", "1")
+    monkeypatch.setenv("CAT_INGESTION_LOCK_TIMEOUT_SECONDS", "2")
+    previous = await PreviousVectorDatabase.of(cheshire_cat.vector_memory_handler, gate=asyncio.Event())
+    transfer = asyncio.create_task(cheshire_cat.transfer_vector_points_from(previous))
+    try:
+        await wait_until(lambda: asyncio.sleep(0, bool(previous.reads)))
+        beat = (await crud_ingestions.get_vector_transfer(cheshire_cat.agent_key))["beat"]
+        await crud_ingestions.clear_maintenance(cheshire_cat.agent_key)
+        await asyncio.sleep(3)  # longer than the TTL of the marker
+        assert await crud_ingestions.is_in_maintenance(cheshire_cat.agent_key)
+        assert (await crud_ingestions.get_vector_transfer(cheshire_cat.agent_key))["beat"] > beat
+    finally:
+        previous.gate.set()
+        await asyncio.wait_for(transfer, 10)
+    assert not await crud_ingestions.is_in_maintenance(cheshire_cat.agent_key)
+    assert await crud_ingestions.get_vector_transfer(cheshire_cat.agent_key) is None
+
+
+async def test_a_failed_source_embedded_before_the_failed_copy_gets_its_points_again(
+    lizard, cheshire_cat, files, monkeypatch,
+):
+    """A source failed in a phase after the embedding (e.g. its graph): a failed copy leaves its embedding to do, and the
+    resume runs it once, with its dependents, though the source is in error."""
+    plug_settings_phase(monkeypatch, cheshire_cat)
+    SettingsPhase.outcomes = ["error"]
+    await ingest(cheshire_cat)
+    assert (await crud_ingestions.get_status(cheshire_cat.agent_key, None, "story.txt"))["status"] == "error"
+    previous = await PreviousVectorDatabase.of(cheshire_cat.vector_memory_handler, failing=str(VectorMemoryType.EPISODIC))
+    new_database_starts_empty(monkeypatch, cheshire_cat)
+
+    await cheshire_cat.transfer_vector_points_from(previous)
+    SettingsPhase.outcomes, runs = ["error"], SettingsPhase.runs
+    await recovery.resume_agent(lizard, cheshire_cat.agent_key)
+
+    row = await crud_ingestions.get_status(cheshire_cat.agent_key, None, "story.txt")
+    assert row["status"] == "error" and SettingsPhase.runs == runs + 1  # its graph ran once more, and failed
+    assert len(await points_of(cheshire_cat, "story.txt")) == row["completed_phases"]["embedding"]["processed"] > 0
+    await recovery.resume_agent(lizard, cheshire_cat.agent_key)
+    assert SettingsPhase.runs == runs + 1  # not again: the failure is recorded with the current tag
+
+
+async def test_a_new_phase_runs_once_on_a_source_failed_elsewhere(lizard, cheshire_cat, files, monkeypatch):
+    """A phase never tried, whose dependencies completed, is work to do also on a source in error."""
+    plug_settings_phase(monkeypatch, cheshire_cat)
+    SettingsPhase.outcomes = ["error"]
+    await ingest(cheshire_cat)
+    await crud_ingestions.reset_phase_entries(cheshire_cat.agent_key, None, "story.txt", ["graph"])  # never tried
+    runs = SettingsPhase.runs
+
+    await recovery.resume_agent(lizard, cheshire_cat.agent_key)
+    await recovery.resume_agent(lizard, cheshire_cat.agent_key)
+
+    assert SettingsPhase.runs == runs + 1
+
+
+async def test_procedures_that_cannot_be_embedded_keep_the_transfer_for_the_resume(
+    lizard, cheshire_cat, files, monkeypatch,
+):
+    await ingest(cheshire_cat)
+    outcomes = record_transfer_hook(monkeypatch, cheshire_cat)
+    previous = await PreviousVectorDatabase.of(cheshire_cat.vector_memory_handler, failing=str(VectorMemoryType.EPISODIC))
+    new_database_starts_empty(monkeypatch, cheshire_cat)
+    procedures = {"fail": 2, "done": 0}
+    real_procedures = CheshireCat.embed_procedures
+
+    async def embed_procedures(self, pt=None):
+        if procedures["fail"]:
+            procedures["fail"] -= 1
+            raise ConnectionError("new vector db down")
+        procedures["done"] += 1
+        return await real_procedures(self, pt)
+
+    monkeypatch.setattr(CheshireCat, "embed_procedures", embed_procedures)
+
+    await cheshire_cat.transfer_vector_points_from(previous)
+
+    assert outcomes == [(False, True)]
+    assert not await crud_ingestions.is_in_maintenance(cheshire_cat.agent_key)
+    assert await crud_ingestions.get_vector_transfer(cheshire_cat.agent_key) is not None  # left to the resume
+
+    await recovery.resume_agent(lizard, cheshire_cat.agent_key)  # its heartbeat is fresh: alive for the resume
+    assert outcomes == [(False, True)]
+    await make_stale(cheshire_cat.agent_key)
+    await recovery.resume_agent(lizard, cheshire_cat.agent_key)  # taken over: the procedures fail again
+    assert outcomes == [(False, True), (False, False)]
+    assert await crud_ingestions.get_vector_transfer(cheshire_cat.agent_key) is not None
+    assert await is_up_to_date_in_the_new_database(cheshire_cat, "story.txt")  # the sources went on meanwhile
+
+    await make_stale(cheshire_cat.agent_key)
+    await recovery.resume_agent(lizard, cheshire_cat.agent_key)
+    assert procedures["done"] == 1
+    assert await crud_ingestions.get_vector_transfer(cheshire_cat.agent_key) is None
+
+
+async def test_a_take_over_claims_the_transfer_for_its_whole_duration(lizard, cheshire_cat, files, monkeypatch):
+    """While a pod takes a dead transfer over (it may wait for a live worker), its heartbeat keeps the record alive: a
+    second pod, whose resume lock was freed meanwhile, leaves the agent alone."""
+    monkeypatch.setenv("CAT_INGESTION_HEARTBEAT_SECONDS", "1")
+    monkeypatch.setenv("CAT_INGESTION_LOCK_TIMEOUT_SECONDS", "2")
+    await ingest(cheshire_cat)
+    await crud.store(crud_ingestions.vector_transfer_key(cheshire_cat.agent_key), {"since": 1.0, "beat": 1.0})
+    held, release = asyncio.Event(), asyncio.Event()
+    takeovers = []
+    real_invalidate = RabbitHole.invalidate_source
+
+    async def slow_invalidate(self, cat, name, chat_id=None, phase_ids=("embedding",)):
+        takeovers.append(name)
+        held.set()
+        await asyncio.wait_for(release.wait(), 10)  # a live worker holds the source
+        return await real_invalidate(self, cat, name, chat_id, phase_ids)
+
+    monkeypatch.setattr(RabbitHole, "invalidate_source", slow_invalidate)
+    first = asyncio.create_task(recovery.resume_agent(lizard, cheshire_cat.agent_key))
+    try:
+        await asyncio.wait_for(held.wait(), 5)
+        await asyncio.sleep(3)  # longer than the lock timeout: the resume lock of the first pod expired
+        from cat.db.database import get_async_db
+
+        locks = [k async for k in get_async_db().scan_iter("lock:ingestion-resume*")]
+        if locks:
+            await get_async_db().delete(*locks)
+        assert not locks or await get_async_db().exists(*locks) == 0
+        await recovery.resume_agent(lizard, cheshire_cat.agent_key)  # a second pod
+        assert takeovers == ["story.txt"]
+    finally:
+        release.set()
+        await asyncio.wait_for(first, 10)
+    assert await crud_ingestions.get_vector_transfer(cheshire_cat.agent_key) is None
+
+
+async def test_a_failed_heartbeat_is_retried_at_the_next_one(cheshire_cat, monkeypatch):
+    monkeypatch.setenv("CAT_INGESTION_HEARTBEAT_SECONDS", "1")
+    monkeypatch.setenv("CAT_INGESTION_LOCK_TIMEOUT_SECONDS", "2")
+    beats = {"failed": 0, "done": 0}
+    real_beat = crud_ingestions.beat_vector_transfer
+
+    async def flaky_beat(agent_id, since):
+        if not beats["failed"]:
+            beats["failed"] += 1
+            raise ConnectionError("redis down for a moment")
+        beats["done"] += 1
+        return await real_beat(agent_id, since)
+
+    monkeypatch.setattr(crud_ingestions, "beat_vector_transfer", flaky_beat)
+    previous = await PreviousVectorDatabase.of(cheshire_cat.vector_memory_handler, gate=asyncio.Event())
+    transfer = asyncio.create_task(cheshire_cat.transfer_vector_points_from(previous))
+    try:
+        await wait_until(lambda: asyncio.sleep(0, beats["done"] > 0), seconds=5)
+        assert beats["failed"] == 1
+    finally:
+        previous.gate.set()
+        await asyncio.wait_for(transfer, 10)
+    assert await crud_ingestions.get_vector_transfer(cheshire_cat.agent_key) is None

@@ -231,6 +231,7 @@ async def test_destroying_an_agent_removes_its_whole_namespace_only():
     await _create(source="a.pdf")
     await _create(chat_id="c1", source="b.pdf")
     await crud_ingestions.set_maintenance("a1", ttl=60)
+    await crud_ingestions.start_vector_transfer("a1")
     await get_async_db().set("agents:a1:ingestion:delete", "left by an older version")
     await _create(agent="a2", source="other.pdf")
     await crud_plugins.set_setting("a1", "cat_multimodal_ingestion", {"k": 1})
@@ -577,3 +578,21 @@ def test_registry_state_machine():
     finally:
         LOOP.close()
         LOOP = None
+
+
+async def test_the_record_of_a_vector_transfer_lives_until_it_is_ended():
+    assert await crud_ingestions.get_vector_transfer("a1") is None
+
+    since = await crud_ingestions.start_vector_transfer("a1")
+    assert await crud_ingestions.get_vector_transfer("a1") == {"since": since, "beat": since}
+    assert await get_async_db().ttl(crud_ingestions.vector_transfer_key("a1")) == -1  # no TTL: it outlives a crash
+    assert await crud_ingestions.list_statuses("a1") == []  # not a row
+
+    await crud_ingestions.beat_vector_transfer("a1", since)
+    record = await crud_ingestions.get_vector_transfer("a1")
+    assert record["since"] == since and record["beat"] >= since
+
+    await crud_ingestions.end_vector_transfer("a1")
+    assert await crud_ingestions.get_vector_transfer("a1") is None
+    await crud_ingestions.beat_vector_transfer("a1", since)  # a late heartbeat does not bring it back
+    assert await crud_ingestions.get_vector_transfer("a1") is None

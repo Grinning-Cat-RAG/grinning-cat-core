@@ -218,6 +218,23 @@ without a state (ingested before the ingestion states existed, or dismissed) get
 and is processed again from its file.
 An ingestion interrupted by a crash or a restart is **resumed automatically** by any instance of the Cat, every
 `CAT_INGESTION_RESUME_INTERVAL_SECONDS`; a source is processed by one instance at a time.
+While the embedder changes, or while the **vector database** of an agent changes (its points are copied, in background,
+from the previous database to the new one), the agent is in maintenance: the automatic resume leaves it alone (a pass
+already running stops before its next source) until the copy ends and the `after_vector_memory_transfer_on_agent` hook
+(where plugins rebuild what they derive from the points) has run, whatever the outcome. Before the hook:
+
+- if the copy succeeded, the sources being ingested or updated during the copy (e.g. an upload started before the
+  switch, which wrote into the old database) are embedded again into the new one, once their ingestion ends;
+- if the copy failed, every source, failed ones included, is embedded again by the automatic resume, from its stored
+  chunks (the phases depending on the embedding run again too, once), and the procedures are embedded again. The
+  conversation memories not copied are lost.
+
+If the instance stops during the copy, the maintenance expires within `CAT_INGESTION_LOCK_TIMEOUT_SECONDS`, and the
+automatic resume handles the interrupted copy as a failed one, `after_vector_memory_transfer_on_agent` included (with
+`success` false). A failed source with a phase never tried, whose dependencies completed (e.g. a phase added later by a
+plugin), runs that phase once. The maintenance is one per agent, without owner: whoever
+ends first (a change of the embedder, a maintenance script) ends it for the others too; a copy still running sets it
+again at its next heartbeat.
 
 | Endpoint | Description |
 | --- | --- |

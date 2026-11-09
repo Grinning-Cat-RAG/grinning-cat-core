@@ -18,9 +18,13 @@ deletions, with faults injected in the phases. The rules are checked after every
   meanwhile: then it stays deleted;
 - fixing the settings of a failed phase lets the resume run again the sources that failed there, and only those;
 - a reingest runs the source again from scratch; only a failed ingestion can be dismissed or retried (409 otherwise),
-  a retry runs once even when asked twice at once.
+  a retry runs once even when asked twice at once;
+- while the vector database of the agent changes (its points copied, the tags of the phases changed by the new
+  database), the resume writes no state; whatever the outcome of the copy, its hook runs once, with the agent still in
+  maintenance, and the maintenance is over after it.
 """
 import asyncio
+import contextlib
 import copy
 import os
 from io import BytesIO
@@ -83,6 +87,7 @@ class World:
         self.legacy = set()  # sources ingested before the states existed: points and file, no row
         self.parsed = []
         self.embedder = "embedder-1"
+        self.transfer_hook = []  # (success, in maintenance) of every after_vector_memory_transfer_on_agent
 
 
 CURRENT = {}  # the world of the running example: the hypothesis examples share the monkeypatch of the test
@@ -101,6 +106,9 @@ def install(world: World, cheshire_cat, monkeypatch):
             return list(args[0]) + [GraphPhase]
         if name == "after_rabbithole_stored_documents":
             CURRENT["world"].stored_hook.append((args[0], len(args[1])))
+        if name == "after_vector_memory_transfer_on_agent":
+            in_maintenance = await crud_ingestions.is_in_maintenance(caller.agent_key)
+            CURRENT["world"].transfer_hook.append((args[0], in_maintenance))
         return await original_hook(self, name, *args, caller=caller)
 
     real_parse = RabbitHole._parse_to_docs
@@ -165,6 +173,7 @@ operation = st.one_of(
     st.tuples(st.just("fix_graph"), st.none(), st.none()),
     st.tuples(st.just("legacy"), st.sampled_from(SOURCES), st.none()),
     st.tuples(st.just("delete_during_embedder"), st.sampled_from(SOURCES), st.none()),
+    st.tuples(st.just("vector_db"), st.none(), st.sampled_from((None, "copy_fails", "unreachable", "pod_stops"))),
 )
 
 
@@ -212,6 +221,12 @@ async def restart(lizard, cheshire_cat, expected):
 @example(operations=[("ingest", "alice.txt", "plugin_error"), ("ingest", "bob.txt", "parse"), ("fix_graph", None, None)])
 @example(operations=[("legacy", "bob.txt", None), ("delete_during_embedder", "bob.txt", None)])
 @example(operations=[("legacy", "bob.txt", None), ("embedder", None, None)])
+@example(operations=[("ingest", "alice.txt", None), ("crash", "bob.txt", None), ("vector_db", None, None),
+                     ("resume", None, None)])
+@example(operations=[("ingest", "alice.txt", "plugin_error"), ("vector_db", None, "unreachable")])
+@example(operations=[("ingest", "alice.txt", None), ("ingest", "bob.txt", "plugin_error"),
+                     ("vector_db", None, "copy_fails")])
+@example(operations=[("ingest", "alice.txt", None), ("vector_db", None, "pod_stops")])
 @given(operations=st.lists(operation, min_size=1, max_size=6))
 async def test_the_lifecycle_of_the_sources(lizard, cheshire_cat, monkeypatch, operations, secure_client, secure_client_headers):
     world = World()
@@ -256,6 +271,79 @@ async def test_the_lifecycle_of_the_sources(lizard, cheshire_cat, monkeypatch, o
                 await task
         row = await crud_ingestions.get_status(agent, None, name)
         assert row["status"] == "processing" and row["owner"] is not None
+
+    async def change_vector_database(fault):
+        """The vector database changes: its new phases change the tags, the resume passes during the copy. The copy
+        succeeds, fails halfway (the old database goes down), cannot start (the new database is unreachable) or is
+        interrupted (the pod stops). Then the resume passes again (after the lock timeout when the pod stopped)."""
+        gate = asyncio.Event()
+        reads = []
+        collection = str(VectorMemoryType.DECLARATIVE)
+        # the old database keeps its points: the new one starts empty (its initialize empties the collection)
+        old_points, _ = await cheshire_cat.vector_memory_handler.get_all_tenant_points(collection, with_vectors=True)
+        embedded = {  # the sources with their points: they keep them, in error too
+            row["source"] for row in await crud_ingestions.list_statuses(agent)
+            if (row["completed_phases"].get("embedding") or {}).get("state") == engine.STATE_COMPLETE
+            and row["completed_phases"]["embedding"].get("processed")
+        }
+
+        class Previous:
+            async def get_collection_names(self):
+                return [collection]
+
+            async def get_all_tenant_points(self, collection_name, with_vectors=True):
+                reads.append(collection_name)
+                await gate.wait()
+                if fault == "copy_fails":
+                    raise ConnectionError("old vector db down")
+                return list(old_points), None
+
+        handler_class = type(cheshire_cat.vector_memory_handler)
+        recreate = handler_class.initialize
+
+        async def initialize(self, *args):
+            if fault == "unreachable":
+                reads.append("initialize")
+                await gate.wait()
+                raise ConnectionError("new vector db down")
+            return await recreate(self, *args)
+
+        transfers_before = len(world.transfer_hook)
+        with patch.object(handler_class, "initialize", initialize):
+            transfer = asyncio.create_task(cheshire_cat.transfer_vector_points_from(Previous()))
+            try:
+                for _ in range(500):
+                    if reads:
+                        break
+                    await asyncio.sleep(0.01)
+                assert reads and await crud_ingestions.is_in_maintenance(agent)
+                world.graph_settings += 1
+                rows_before = await crud_ingestions.list_statuses(agent)
+                await restart(lizard, cheshire_cat, expected)
+                assert await crud_ingestions.list_statuses(agent) == rows_before  # the resume wrote nothing
+            finally:
+                if fault == "pod_stops":
+                    transfer.cancel()
+                gate.set()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await asyncio.wait_for(transfer, 10)
+        if fault == "pod_stops":
+            assert world.transfer_hook[transfers_before:] == []
+            await asyncio.sleep(engine.lock_timeout_seconds() + 0.2)  # the marker and the heartbeat expire
+        else:
+            assert world.transfer_hook[transfers_before:] == [(fault is None, True)]
+        assert not await crud_ingestions.is_in_maintenance(agent)
+        # the next pass of the resume brings the sources up to date (embedded again after a failed copy)
+        await restart(lizard, cheshire_cat, expected)
+        assert await crud_ingestions.get_vector_transfer(agent) is None
+        for source in embedded:  # in error too: no source lost its points
+            row = await crud_ingestions.get_status(agent, None, source)
+            embedding = row["completed_phases"].get("embedding") or {}
+            assert embedding.get("state") == engine.STATE_COMPLETE, (fault, row)
+            points, _ = await cheshire_cat.vector_memory_handler.get_all_tenant_points(
+                collection, metadata={"source": source}, with_vectors=False,
+            )
+            assert len(points) == embedding["processed"], (fault, row)
 
     for kind, name, fault in operations:
         hooks_before = len(world.stored_hook)
@@ -322,6 +410,9 @@ async def test_the_lifecycle_of_the_sources(lizard, cheshire_cat, monkeypatch, o
             restarted(expected)
             expected.update({source: "completed" for source in legacy})
             world.legacy.clear()
+        elif kind == "vector_db":
+            await change_vector_database(fault)
+            restarted(expected)
         elif kind == "delete":
             await cheshire_cat.rabbit_hole.delete_source(cheshire_cat, name)
             expected.pop(name, None)

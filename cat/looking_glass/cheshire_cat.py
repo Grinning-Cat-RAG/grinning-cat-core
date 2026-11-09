@@ -1,3 +1,5 @@
+import asyncio
+import contextlib
 import mimetypes
 import os
 import tempfile
@@ -20,7 +22,8 @@ from cat.looking_glass.mad_hatter.procedures import CatProcedureType
 from cat.looking_glass.models import StoredSourceWithMetadata
 from cat.looking_glass.stray_cat import StrayCat
 from cat.mixins import BotMixin, NonCopyableMixin
-from cat.rabbit_hole import run_in_ingestion_executor
+from cat.rabbit_hole import engine, recovery, run_in_ingestion_executor
+from cat.rabbit_hole.phases import PHASE_EMBEDDING
 from cat.services.factory.file_manager import BaseFileManager
 from cat.services.factory.vector_db import BaseVectorDatabaseHandler
 from cat.services.memory.models import PointStruct, VectorMemoryType
@@ -426,8 +429,74 @@ class CheshireCat(BotMixin, NonCopyableMixin):
         await self.plugin_manager.execute_hook("after_file_manager_transfer_on_agent", success, caller=self)
 
     async def transfer_vector_points_from(self, previous_vector_memory_handler: BaseVectorDatabaseHandler):
-        embedder = await self.embedder()
+        """Copies the points of the previous vector database into the current one, collection by collection, then runs
+        ``after_vector_memory_transfer_on_agent`` (the plugins rebuild what they derive from the points).
+
+        Meanwhile the agent is in maintenance: the automatic resume would run the phases of the new database, or the
+        embeddings of the sources in flight, on a database copied halfway. A heartbeat renews the marker (it lives a
+        lock timeout, so a dead transfer releases it soon) and the record of the transfer
+        (``crud_ingestions.start_vector_transfer``). Then, before the hook:
+
+        - the copy succeeded: every source in flight or updated since the start (e.g. an upload that started before the
+          switch, and wrote into the old database) has its embedding run again, once its worker ends;
+        - the copy failed: every source is left to be embedded again by the automatic resume (from its stored chunks,
+          with the phases depending on the embedding), and the procedures are embedded again. The episodic memories
+          not copied are lost.
+
+        The marker is cleared after the hook, whatever the outcome of the copy. If the task is cancelled (the pod
+        stops), the heartbeat stops: the marker expires, and the automatic resume takes the dead transfer over as a
+        failed one (``take_over_dead_vector_transfer``, which runs the hook). The marker has no owner: whoever clears it first (e.g. the end of a change of the embedder, or a
+        maintenance script) clears it for everybody; the heartbeat sets it again while the copy runs.
+        """
+        since = await crud_ingestions.start_vector_transfer(self.agent_key)
+        await crud_ingestions.set_maintenance(self.agent_key, ttl=engine.lock_timeout_seconds())
+        cancelled = False
         try:
+            async with self._vector_transfer_heartbeat(since, maintenance=True):
+                success = await self._copy_vector_points_from(previous_vector_memory_handler)
+                complete = True
+                if success:
+                    await self._embed_again_sources_touched_since(since)
+                else:
+                    complete = await self._embed_again_everything()
+                await self.plugin_manager.execute_hook("after_vector_memory_transfer_on_agent", success, caller=self)
+            if complete:  # else the record stays: the automatic resume takes it over once its heartbeat is stale
+                await crud_ingestions.end_vector_transfer(self.agent_key)
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
+        finally:
+            if not cancelled:
+                await crud_ingestions.clear_maintenance(self.agent_key)
+
+    @contextlib.asynccontextmanager
+    async def _vector_transfer_heartbeat(self, since: float, maintenance: bool):
+        """Keep the record of the vector transfer alive (and the agent in maintenance, if asked) while the body runs."""
+        stop = asyncio.Event()
+
+        async def beat():
+            while True:
+                with contextlib.suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(stop.wait(), timeout=engine.heartbeat_seconds())
+                if stop.is_set():
+                    return
+                try:
+                    await crud_ingestions.beat_vector_transfer(self.agent_key, since)
+                    if maintenance:
+                        await crud_ingestions.set_maintenance(self.agent_key, ttl=engine.lock_timeout_seconds())
+                except Exception as e:  # noqa: BLE001 - a missed beat is retried at the next one
+                    log.warning(f"Agent id: {self.agent_key}. Heartbeat of the vector transfer failed: {e}")
+
+        heartbeat = asyncio.create_task(beat())
+        try:
+            yield
+        finally:
+            stop.set()
+            await heartbeat
+
+    async def _copy_vector_points_from(self, previous_vector_memory_handler: BaseVectorDatabaseHandler) -> bool:
+        try:
+            embedder = await self.embedder()
             await self.vector_memory_handler.initialize(embedder.name, await embedding_size(embedder))
             for collection_name in await previous_vector_memory_handler.get_collection_names():
                 points, _ = await previous_vector_memory_handler.get_all_tenant_points(collection_name, with_vectors=True)
@@ -436,12 +505,47 @@ class CheshireCat(BotMixin, NonCopyableMixin):
                         collection_name=collection_name,
                         points=[PointStruct(**p.model_dump(exclude={"shard_key", "order_value"})) for p in points],
                     )
-            success = True
+            return True
         except Exception as e:
             log.error(f"Error while transferring vector points from previous vector memory handler: {e}")
-            success = False
+            return False
 
-        await self.plugin_manager.execute_hook("after_vector_memory_transfer_on_agent", success, caller=self)
+    async def _embed_again_sources_touched_since(self, since: float) -> None:
+        """The sources whose points may have missed the copy: in flight (a live worker may write into the old database;
+        its last heartbeat may come before the start) or updated since the start. Their embedding runs again, once their
+        worker ends; a source that cannot be run now is left to the automatic resume."""
+        for row in await crud_ingestions.list_statuses(self.agent_key):
+            if row.get("status") not in recovery.IN_FLIGHT and (row.get("updated_at") or 0) < since:
+                continue
+            try:
+                await self.rabbit_hole.rerun_source(self, row["source"], row["chat_id"], invalidate=[PHASE_EMBEDDING])
+            except Exception as e:  # noqa: BLE001 - the resume embeds it again
+                log.error(f"Agent id: {self.agent_key}. Embedding {row['source']} again failed: {e}")
+                await self.rabbit_hole.invalidate_source(self, row["source"], row["chat_id"])
+
+    async def take_over_dead_vector_transfer(self, since: float) -> None:
+        """The automatic resume, on a vector transfer whose heartbeat stopped (its pod died): it is handled as a failed
+        copy (``after_vector_memory_transfer_on_agent`` runs with ``success=False``), under a heartbeat of its own (the
+        transfer is claimed: the resume of another pod leaves it alone), and its record ends once done."""
+        await crud_ingestions.beat_vector_transfer(self.agent_key, since)
+        async with self._vector_transfer_heartbeat(since, maintenance=False):
+            complete = await self._embed_again_everything()
+            await self.plugin_manager.execute_hook("after_vector_memory_transfer_on_agent", False, caller=self)
+        if complete:
+            await crud_ingestions.end_vector_transfer(self.agent_key)
+
+    async def _embed_again_everything(self) -> bool:
+        """After a failed (or dead) copy: every source is left to the automatic resume, which embeds it again from its
+        stored chunks, and the procedures are embedded again now. False if the procedures could not be embedded (e.g.
+        the new database is down): the automatic resume retries."""
+        for row in await crud_ingestions.list_statuses(self.agent_key):
+            await self.rabbit_hole.invalidate_source(self, row["source"], row["chat_id"])
+        try:
+            await self.embed_procedures()
+            return True
+        except Exception as e:  # noqa: BLE001 - the automatic resume retries
+            log.error(f"Agent id: {self.agent_key}. Embedding the procedures again failed: {e}")
+            return False
 
     @property
     def agent_key(self) -> str:

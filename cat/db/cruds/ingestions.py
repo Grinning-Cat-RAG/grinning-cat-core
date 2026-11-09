@@ -13,8 +13,11 @@ means the knowledge base in every function). The row is a JSON document:
 
 The writes of a row are not guarded against a concurrent re-creation of the same row: the RabbitHole writes a row only
 while holding the lock of its source. The maintenance marker (``agents:<agent_id>:ingestion_maintenance``) suspends the
-automatic resume of an agent while a maintenance script works on it. Public API: maintenance scripts read and reset
-the states through this module.
+automatic resume of an agent while a maintenance script works on it, while the embedder changes and while the vector
+database of the agent changes. It has no owner: whoever clears it first clears it for everybody. The record of a vector
+transfer (``agents:<agent_id>:ingestion_vector_transfer``: ``since``, ``beat``) lives from the start of the copy to its
+end, with no TTL: the automatic resume takes over a transfer whose heartbeat stopped. Public API: maintenance scripts
+read and reset the states through this module.
 """
 import hashlib
 import re
@@ -87,6 +90,10 @@ def format_key(agent_id: str, chat_id: str | None, source: str) -> str:
 
 def maintenance_key(agent_id: str) -> str:
     return f"{DEFAULT_AGENTS_KEY}:{agent_id}:{DEFAULT_INGESTION_KEY}_maintenance"
+
+
+def vector_transfer_key(agent_id: str) -> str:
+    return f"{DEFAULT_AGENTS_KEY}:{agent_id}:{DEFAULT_INGESTION_KEY}_vector_transfer"
 
 
 def _glob_escaped(text: str) -> str:
@@ -256,9 +263,11 @@ async def destroy_chat(agent_id: str, chat_id: str) -> int:
 
 
 async def destroy_all(agent_id: str) -> None:
-    """Remove everything of the agent under the ingestion namespace (rows or not) and its maintenance marker."""
+    """Remove everything of the agent under the ingestion namespace (rows or not), its maintenance marker and the record
+    of its vector transfer."""
     await _delete_keys([k async for k in get_async_db().scan_iter(f"{_glob_escaped(_prefix(agent_id))}*")])
     await clear_maintenance(agent_id)
+    await end_vector_transfer(agent_id)
 
 
 async def set_maintenance(agent_id: str, ttl: int) -> None:
@@ -274,3 +283,30 @@ async def clear_maintenance(agent_id: str) -> None:
 
 async def is_in_maintenance(agent_id: str) -> bool:
     return bool(await get_async_db().exists(maintenance_key(agent_id)))
+
+
+async def start_vector_transfer(agent_id: str) -> float:
+    """Record that the points of the agent are being copied to a new vector database; returns the start (``since``).
+
+    The record has no TTL: if the transfer dies, its heartbeat (``beat``) stops, and the automatic resume takes it over.
+    """
+    since = _now()
+    await crud.store(vector_transfer_key(agent_id), {"since": since, "beat": since})
+    return since
+
+
+async def beat_vector_transfer(agent_id: str, since: float) -> None:
+    """The heartbeat of a running transfer (nothing if its record is gone)."""
+    await crud.store(vector_transfer_key(agent_id), {"since": since, "beat": _now()}, xx=True)
+
+
+async def get_vector_transfer(agent_id: str) -> Dict | None:
+    """The record of the vector transfer of the agent (``since``, ``beat``), or None."""
+    value = await crud.read(vector_transfer_key(agent_id))
+    if isinstance(value, list):
+        value = value[0] if value else None
+    return value or None
+
+
+async def end_vector_transfer(agent_id: str) -> None:
+    await get_async_db().delete(vector_transfer_key(agent_id))

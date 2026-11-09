@@ -448,6 +448,26 @@ class RabbitHole:
         except (engine.LockError, engine.IngestionCanceled, engine.LockLost):
             return None
 
+    async def invalidate_source(
+        self,
+        cat: "CheshireCat",  # type: ignore[name-defined]
+        name: str,
+        chat_id: str | None = None,
+        phase_ids: Iterable[str] = (PHASE_EMBEDDING,),
+    ) -> bool:
+        """Leave phases of a source (and every phase depending on them) to run again, without running them: their diary
+        entries are removed, so the automatic resume runs them (also on a source in error). It waits for a worker
+        holding the source (its result would be taken for up to date). Returns False when the source has no row. Public
+        API, e.g. for the end of a failed change of the vector database."""
+        rabbit_hole = copy.copy(self)
+        await rabbit_hole.setup(cat)
+        ccat = rabbit_hole.cat
+        source = IngestionSource(ccat.agent_key, chat_id, name, "url" if fnc_is_url(name) else "file")
+        async with engine.source_lock(source):
+            return await crud_ingestions.reset_phase_entries(
+                source.agent_id, chat_id, name, await self._with_dependents(rabbit_hole, ccat, phase_ids),
+            )
+
     @staticmethod
     async def _with_dependents(rabbit_hole, ccat, phase_ids: Iterable[str]) -> List[str]:
         """The phases and every phase depending on them, directly or not. The dependents of a phase that ran run again

@@ -2,9 +2,9 @@
 
 Every pod runs a pass at the start and then every ``CAT_INGESTION_RESUME_INTERVAL_SECONDS`` (``<= 0`` disables the
 resume: a single pass at the start could not take over the sources of the previous boot, whose locks are still alive).
-For every agent not in maintenance (e.g. a change of the embedder running), holding the lock of the agent (contended:
-another pod is passing, the agent is left to it), a source is brought up to date (``RabbitHole.rerun_source``, without
-waiting for a live worker) when:
+For every agent not in maintenance (e.g. a change of the embedder, or of its vector database, running), holding the lock
+of the agent (contended: another pod is passing, the agent is left to it), a source is brought up to date
+(``RabbitHole.rerun_source``, without waiting for a live worker) when:
 
 - it is in flight (uploaded, downloading, downloaded, processing) or being deleted: the lock of its source is free, so its
   worker is dead (a live worker holds it);
@@ -12,13 +12,22 @@ waiting for a live worker) when:
   changed, or a phase was added;
 - it failed in a phase whose tag is not the current one anymore: the settings of that phase, or of a phase it depends on
   (a tag includes the tags of the phases it depends on), changed since, e.g. to fix the failure. The failed phase runs
-  again, with the ones depending on it.
+  again, with the ones depending on it;
+- it failed, but a phase was never tried while the phases it depends on completed (it was left to do by a failed change
+  of the vector database, or added later): it runs once.
+
+A change of the vector database whose pod died (the heartbeat of its record, ``crud_ingestions.get_vector_transfer``,
+older than a lock timeout) is taken over as a failed copy, under a heartbeat of its own: every source is left to be
+embedded again (and is, in the same pass), the procedures are embedded again, and
+``after_vector_memory_transfer_on_agent`` runs with ``success=False``. While the heartbeat is alive the agent is left
+alone.
 
 Any other source in error is left alone (no endless retries of a permanent failure, e.g. paid LLM calls): POST
 /ingestion/retry, a new upload, or the maintenance, runs it again.
 """
 import asyncio
 import copy
+import time
 from typing import Dict
 
 from cat.db import crud
@@ -52,7 +61,15 @@ def _needs_attention(row: dict, tags: Dict[str, str], depends_on: Dict[str, tupl
                 for dep in depends_on.get(phase_id, ())
             )
 
-        return any(
+        # a phase never tried (e.g. left to do by a failed change of the vector database, or added later) whose
+        # dependencies completed: work to do, not a failure to leave alone
+        def to_do(phase_id: str) -> bool:
+            deps = depends_on.get(phase_id, ())
+            return phase_id not in diary and bool(deps) and all(
+                (diary.get(dep) or {}).get("state") == engine.STATE_COMPLETE for dep in deps
+            )
+
+        return any(to_do(phase_id) for phase_id in tags) or any(
             entry.get("state") == engine.STATE_ERROR and phase_id in tags and entry.get("tag") != tags[phase_id]
             and failed_itself(phase_id)
             for phase_id, entry in diary.items()
@@ -70,8 +87,14 @@ async def resume_agent(lizard, agent_id: str) -> None:
             f"ingestion-resume:{agent_id}", timeout=engine.lock_timeout_seconds(), blocking_timeout=0.1,
         ):
             rows = await crud_ingestions.list_statuses(agent_id)
-            if not rows or (ccat := await lizard.get_cheshire_cat(agent_id)) is None:
+            transfer = await crud_ingestions.get_vector_transfer(agent_id)
+            if (not rows and transfer is None) or (ccat := await lizard.get_cheshire_cat(agent_id)) is None:
                 return
+            if transfer is not None:
+                if time.time() - transfer["beat"] <= engine.lock_timeout_seconds():
+                    return  # the vector database is being changed (on any pod), even if its marker was cleared
+                await ccat.take_over_dead_vector_transfer(transfer["since"])
+                rows = await crud_ingestions.list_statuses(agent_id)
             rabbit_hole = copy.copy(lizard.rabbit_hole)
             await rabbit_hole.setup(ccat)
             phases = await engine.collect_phases(rabbit_hole, ccat)
