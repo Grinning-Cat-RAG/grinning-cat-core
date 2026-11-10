@@ -58,15 +58,24 @@ class _Source:
         self.name = name
 
 
-class _FakeVectorMemoryHandler:
+class _FakeRabbitHole:
+    """Records every ``delete_source`` call; the folder is removed afterwards."""
+
     def __init__(self, log):
         self.log = log
         self.calls = []
 
-    async def delete_tenant_points(self, collection_name, metadata=None):
-        source = metadata.get("source") if metadata else None
-        self.calls.append((collection_name, metadata))
-        self.log.append(f"delete_tenant_points:{source}")
+    async def delete_source(self, ccat, name, chat_id=None, wait=None, before=None):
+        self.calls.append((name, chat_id))
+        self.log.append(f"delete_source:{name}")
+        if before is not None:
+            return await before()
+        return None
+
+
+class _FakeLizard:
+    def __init__(self, log):
+        self.rabbit_hole = _FakeRabbitHole(log)
 
 
 class _FakePluginManager:
@@ -88,7 +97,7 @@ class _FakeCat:
         self.agent_key = agent_id
         self.log = []
         self.file_manager = _FakeFileManager(sources or [], self.log)
-        self.vector_memory_handler = _FakeVectorMemoryHandler(self.log)
+        self.lizard = _FakeLizard(self.log)
         self.plugin_manager = _FakePluginManager(self.log)
         self.shutdown_calls = 0
 
@@ -365,7 +374,7 @@ async def test_teardown_cascades_each_source_before_wipe(unique_agent_id, monkey
 
         for source in sources:
             before = log.index(f"hook:before_file_manager_file_delete:{source}")
-            delete = log.index(f"delete_tenant_points:{source}")
+            delete = log.index(f"delete_source:{source}")
             after = log.index(f"hook:after_file_manager_file_deleted:{source}")
 
             # Per source, in order, and strictly before the namespace wipe.
@@ -373,7 +382,7 @@ async def test_teardown_cascades_each_source_before_wipe(unique_agent_id, monkey
 
         hook_index = log.index("hook:after_cheshire_cat_destroy:" + unique_agent_id)
         assert fake.file_manager.removed == [unique_agent_id]
-        assert len(fake.vector_memory_handler.calls) == len(sources)
+        assert fake.lizard.rabbit_hole.calls == [(source, None) for source in sources]
 
         # Full order around the wipe: cascade < wipe < destroy hook < clear.
         assert log.index("destroy_memory") < wipe_index
@@ -383,6 +392,36 @@ async def test_teardown_cascades_each_source_before_wipe(unique_agent_id, monkey
 
         # The marker is cleared LAST: after the cascade, the wipe and the hook.
         assert log[-1] == "clear_marker"
+        assert await has_delete_marker(unique_agent_id) is False
+    finally:
+        await crud.delete(_delete_marker_key(unique_agent_id))
+
+
+async def test_teardown_isolates_a_failing_source(unique_agent_id, monkeypatch):
+    """A source whose ``delete_source`` fails must not abort the others."""
+    sources = ["broken.txt", "healthy.pdf"]
+    fake = _FakeCat(unique_agent_id, sources=sources)
+    original_delete = fake.lizard.rabbit_hole.delete_source
+
+    async def flaky_delete(ccat, name, chat_id=None, wait=None, before=None):
+        if name == "broken.txt":
+            fake.log.append(f"delete_source:{name}")
+            raise RuntimeError("boom")
+        return await original_delete(ccat, name, chat_id, wait=wait, before=before)
+
+    monkeypatch.setattr(fake.lizard.rabbit_hole, "delete_source", flaky_delete)
+
+    try:
+        await set_delete_marker(unique_agent_id)
+
+        await complete_agent_teardown(unique_agent_id, ccat=fake)
+
+        log = fake.log
+        assert "hook:before_file_manager_file_delete:broken.txt" in log
+        assert "hook:after_file_manager_file_deleted:broken.txt" not in log
+        assert log.index("delete_source:healthy.pdf") > log.index("delete_source:broken.txt")
+        assert "hook:after_file_manager_file_deleted:healthy.pdf" in log
+        # The teardown still completed despite the failing source.
         assert await has_delete_marker(unique_agent_id) is False
     finally:
         await crud.delete(_delete_marker_key(unique_agent_id))

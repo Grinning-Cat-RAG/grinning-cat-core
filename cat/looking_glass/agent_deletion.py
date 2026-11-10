@@ -44,7 +44,6 @@ network/Redis/filesystem work at import time.
 """
 import asyncio
 import contextvars
-import os
 import time
 
 from cat.db import crud
@@ -245,11 +244,17 @@ async def _teardown_memory_and_files(ccat, sources) -> None:
 
     For each source the order is: ``before_file_manager_file_delete`` (the
     point metadata is still present, so plugins can e.g. drop extracted images
-    tied to the source) -> ``delete_tenant_points`` for that source ->
-    ``after_file_manager_file_deleted``. Only afterwards is ``destroy_memory``
-    run as the catch-all purge for everything not covered by a source; the
-    ``before`` hook must fire while the points still exist for the cascade to
-    have any effect.
+    tied to the source) -> ``RabbitHole.delete_source`` for that source ->
+    ``after_file_manager_file_deleted``. This is the SAME deletion contract the
+    file-manager route uses, so file deletion and agent deletion cannot diverge:
+    ``delete_source`` removes what every ingestion phase produced for the source
+    (its points among them), the files the RabbitHole kept for it, and its status
+    row, holding the source lock. No ``before`` callback is passed: the route
+    uses it to remove the uploaded file, while the agent teardown drops the whole
+    folder afterwards (``remove_folder``), so there is nothing to remove per
+    source. Only afterwards is ``destroy_memory`` run as the catch-all purge for
+    everything not covered by a source; the ``before`` hook must fire while the
+    points still exist for the deletion to have any effect.
 
     This whole function runs BEFORE the namespace wipe: a crash here leaves the
     marker plus the namespace, so recovery boots a cat and retries the cascade.
@@ -258,33 +263,21 @@ async def _teardown_memory_and_files(ccat, sources) -> None:
     caller fires it after the wipe so a plugin that deletes and re-stores the
     marker cannot leave a half-deleted agent.
     """
-    # Lazy imports keep the startup import graph small and avoid cycles.
-    from cat.routes.routes_utils import sanitize_source_name
-    from cat.services.memory.models import VectorMemoryType
-
-    path = ccat.agent_key
-
     for source in sources:
         # Per-source isolation: one broken source must not stop the rest of the
         # cascade. The blanket ``destroy_memory`` below remains the catch-all.
-        # NOTE: task 6 of the upstream-ingestion migration replaces this interim
-        # cascade with ``RabbitHole.delete_source`` on the phase engine.
         try:
-            sanitized_source = sanitize_source_name(source, path=path)
-            ccat.file_manager.remove_file(os.path.join(path, sanitized_source))
             await ccat.plugin_manager.execute_hook(
                 "before_file_manager_file_delete",
-                sanitized_source,
-                "agent",
+                source,
+                _AGENT_FILE_SCOPE,
                 caller=ccat,
             )
-            await ccat.vector_memory_handler.delete_tenant_points(
-                str(VectorMemoryType.DECLARATIVE), {"source": source}
-            )
+            await ccat.lizard.rabbit_hole.delete_source(ccat, source)
             await ccat.plugin_manager.execute_hook(
                 "after_file_manager_file_deleted",
-                sanitized_source,
-                "agent",
+                source,
+                _AGENT_FILE_SCOPE,
                 caller=ccat,
             )
         except Exception as e:  # noqa: BLE001 - continue with the other sources
