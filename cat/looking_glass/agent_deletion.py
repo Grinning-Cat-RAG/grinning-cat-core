@@ -44,6 +44,7 @@ network/Redis/filesystem work at import time.
 """
 import asyncio
 import contextvars
+import os
 import time
 
 from cat.db import crud
@@ -258,17 +259,34 @@ async def _teardown_memory_and_files(ccat, sources) -> None:
     marker cannot leave a half-deleted agent.
     """
     # Lazy imports keep the startup import graph small and avoid cycles.
-    from cat.services.factory.ingestion import resolve_ingestion_profile
+    from cat.routes.routes_utils import sanitize_source_name
+    from cat.services.memory.models import VectorMemoryType
 
-    # Resolve the system-level profile once: every source goes through the same
-    # deletion operation as the file-manager route.
-    profile = await resolve_ingestion_profile(ccat)
+    path = ccat.agent_key
 
     for source in sources:
         # Per-source isolation: one broken source must not stop the rest of the
         # cascade. The blanket ``destroy_memory`` below remains the catch-all.
+        # NOTE: task 6 of the upstream-ingestion migration replaces this interim
+        # cascade with ``RabbitHole.delete_source`` on the phase engine.
         try:
-            await profile.pipeline.delete(source, ccat, _AGENT_FILE_SCOPE)
+            sanitized_source = sanitize_source_name(source, path=path)
+            ccat.file_manager.remove_file(os.path.join(path, sanitized_source))
+            await ccat.plugin_manager.execute_hook(
+                "before_file_manager_file_delete",
+                sanitized_source,
+                "agent",
+                caller=ccat,
+            )
+            await ccat.vector_memory_handler.delete_tenant_points(
+                str(VectorMemoryType.DECLARATIVE), {"source": source}
+            )
+            await ccat.plugin_manager.execute_hook(
+                "after_file_manager_file_deleted",
+                sanitized_source,
+                "agent",
+                caller=ccat,
+            )
         except Exception as e:  # noqa: BLE001 - continue with the other sources
             log.error(f"Failed to delete artifacts for source '{source}' of agent {ccat.agent_key}: {e}")
 

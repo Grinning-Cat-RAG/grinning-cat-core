@@ -1,10 +1,9 @@
 """Tests for the ``is_multimodal_embedder`` detection predicate.
 
 Reembed-multimodal-images plan: pin the predicate that decides
-whether a *resolved embedder instance* can embed images. The chunk-reuse re-embed
-path (``CheshireCat.embed_stored_sources``) has to know this without a
-``RabbitHole`` (so ``_is_multimodal_embedder`` is unusable) and without settings
-(an instance, not settings, is resolved). The predicate locks on the instance
+whether a *resolved embedder instance* can embed images. The re-embed of the
+stored chunks (the ``embedding`` phase, run again when the embedder changes) has
+to know this without settings (an instance, not settings, is resolved). The predicate locks on the instance
 itself: it is a ``MultimodalEmbeddings`` subclass OR it exposes ``embed_images``.
 
 These tests deliberately do NOT import the PLUS modal embedders: the point is to

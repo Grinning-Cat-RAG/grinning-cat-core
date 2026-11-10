@@ -1,5 +1,6 @@
 import os
 import tempfile
+from pathlib import Path
 from abc import ABC, abstractmethod
 from typing import Type, List
 from pydantic import ConfigDict, BaseModel
@@ -23,7 +24,8 @@ class BaseFileManager(ABC):
     to upload files and folders to a storage service.
     """
     def __init__(self):
-        self._excluded_dirs = ["__pycache__"]
+        # ".rabbithole": the files kept by the RabbitHole for the sources (chunks, images, bytes of the URLs)
+        self._excluded_dirs = ["__pycache__", ".rabbithole"]
         self._excluded_files = [".gitignore", ".DS_Store", ".gitkeep", ".git", ".dockerignore"]
         self._root_dir = utils.get_file_manager_root_storage_path()
 
@@ -192,10 +194,11 @@ class BaseFileManager(ABC):
 
         files = self._list_files(remote_root_dir)
 
-        excluded_paths = self._excluded_dirs + self._excluded_files
-        file_names = [file.name for file in files]
+        def excluded(file: FileResponse) -> bool:
+            parts = set(Path(file.path).parts[:-1]) | {file.name}
+            return file.name in self._excluded_files or bool(parts & set(self._excluded_dirs))
 
-        return [file for file in files if not any([ex in file_names for ex in excluded_paths])]
+        return [file for file in files if not excluded(file)]
 
     @abstractmethod
     def _list_files(self, remote_root_dir: str) -> List[FileResponse]:
@@ -238,8 +241,9 @@ class BaseFileManager(ABC):
         """
         local_dir = os.path.join(self._root_dir, local_dir)
 
+        # the subfolders keep their place (e.g. the chats of an agent, the files kept by the RabbitHole)
         return [  # type: ignore[return-value]
-            self.upload_file(os.path.join(root, file), remote_root_dir)
+            self.upload_file(os.path.join(root, file), remote_root_dir, os.path.relpath(os.path.join(root, file), local_dir))
             for root, _, files in os.walk(local_dir)
             for file in files
         ]
@@ -257,18 +261,25 @@ class BaseFileManager(ABC):
             List of the paths of the files locally
         """
         local_dir = os.path.join(self._root_dir, local_dir)
+        remote_dir = os.path.join(self._root_dir, remote_root_dir) if remote_root_dir else self._root_dir
 
         result = []
-        # Downloads files from storage, skipping excluded files
-        for file in self.list_files(remote_root_dir):
-            local_path = os.path.join(local_dir, os.path.basename(file.path))
-            if any([ex_file in local_path for ex_file in self._excluded_files]):
+        # Downloads every file from storage, subfolders included (the chats of an agent, the files kept by the
+        # RabbitHole), keeping its place under the folder; skipping excluded files
+        for file in self._walk_files(remote_dir):
+            relative = os.path.relpath(file.path, remote_dir) if file.path.startswith(remote_dir + os.sep) else file.name
+            if file.name in self._excluded_files or "__pycache__" in Path(relative).parts:
                 continue
-
-            os.makedirs(local_dir, exist_ok=True)
+            local_path = os.path.join(local_dir, relative)
+            os.makedirs(os.path.dirname(local_path), exist_ok=True)
             result.append(self._download_file_to_local(file.path, local_path))
-        
+
         return result
+
+    def _walk_files(self, remote_root_dir: str) -> List[FileResponse]:
+        """Every file under ``remote_root_dir``, subfolders included. Default: the listing, recursive on the object
+        stores listing by prefix; a storage listing one folder only overrides it."""
+        return self._list_files(remote_root_dir)
 
     @abstractmethod
     def _download_file_to_local(self, file_path: str, local_path: str) -> str:
@@ -309,6 +320,10 @@ class BaseFileManager(ABC):
         """
         if remote_root_dir is None:
             remote_root_dir = os.path.dirname(filename)
+            filename = os.path.basename(filename)
+        elif os.path.dirname(filename):
+            # a file in a subfolder of remote_root_dir: listed in that subfolder
+            remote_root_dir = os.path.join(remote_root_dir, os.path.dirname(filename))
             filename = os.path.basename(filename)
 
         if self._root_dir not in remote_root_dir:

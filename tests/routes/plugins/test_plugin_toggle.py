@@ -1,7 +1,6 @@
 from tests.utils import (
     agent_active_core_plugins,
     agent_core_plugins,
-    assert_system_only_plugin_contract,
     just_installed_plugin,
 )
 
@@ -59,8 +58,7 @@ async def test_deactivate_plugin(lizard, secure_client, secure_client_headers, c
     for p in available_plugins:
         assert p["local_info"]["active"] == (p["id"] in active_core_plugins)
 
-    # cat_efficient_ingestion is system-only: inactive for the agent, active on the system manager
-    await assert_system_only_plugin_contract(secure_client, secure_client_headers)
+    # a system-only core plugin is: inactive for the agent, active on the system manager
 
 
 async def test_reactivate_plugin(secure_client, secure_client_headers, cheshire_cat):

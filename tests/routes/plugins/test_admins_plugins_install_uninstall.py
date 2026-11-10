@@ -9,7 +9,6 @@ from tests.utils import (
     agent_core_plugins,
     api_key,
     agent_id,
-    assert_system_only_plugin_contract,
     just_installed_plugin,
 )
 
@@ -54,8 +53,7 @@ async def test_plugin_install_from_zip(lizard, secure_client, secure_client_head
     for p in installed_plugins:
         assert isinstance(p["local_info"]["active"], bool)
         assert p["local_info"]["active"] == (p["id"] in active_core_plugins)
-    # cat_efficient_ingestion is system-only: inactive for the agent, active on the system manager
-    await assert_system_only_plugin_contract(secure_client, agent_headers)
+    # a system-only core plugin is: inactive for the agent, active on the system manager
 
     # plugin has been actually extracted in (mock) plugins folder
     assert os.path.exists(mock_plugin_final_folder)
@@ -92,8 +90,7 @@ async def test_plugin_install_after_cheshire_cat_creation(lizard, secure_client,
     for p in installed_plugins:
         assert isinstance(p["local_info"]["active"], bool)
         assert p["local_info"]["active"] == (p["id"] in active_core_plugins)
-    # cat_efficient_ingestion is system-only: inactive for the agent, active on the system manager
-    await assert_system_only_plugin_contract(secure_client, ccat_headers)
+    # a system-only core plugin is: inactive for the agent, active on the system manager
 
 
 async def test_create_cheshire_cat_after_plugin_install(lizard, secure_client, secure_client_headers, cheshire_cat):
@@ -116,8 +113,7 @@ async def test_create_cheshire_cat_after_plugin_install(lizard, secure_client, s
     for p in installed_plugins:
         assert isinstance(p["local_info"]["active"], bool)
         assert p["local_info"]["active"] == (p["id"] in active_core_plugins)
-    # cat_efficient_ingestion is system-only: inactive for the agent, active on the system manager
-    await assert_system_only_plugin_contract(secure_client, ccat_headers)
+    # a system-only core plugin is: inactive for the agent, active on the system manager
 
 
 async def test_plugin_uninstall(secure_client, secure_client_headers, cheshire_cat):
@@ -174,8 +170,7 @@ async def test_plugin_recurrent_installs(lizard, secure_client, secure_client_he
         assert isinstance(p["local_info"]["active"], bool)
         assert p["local_info"]["active"] == (p["id"] in active_core_plugins + ["mock_plugin"])
 
-    # cat_efficient_ingestion is system-only: inactive for the agent, active on the system manager
-    await assert_system_only_plugin_contract(secure_client, ccat_headers)
+    # a system-only core plugin is: inactive for the agent, active on the system manager
 
     await just_installed_plugin(secure_client, secure_client_headers, plugin_id="mock_plugin")
 

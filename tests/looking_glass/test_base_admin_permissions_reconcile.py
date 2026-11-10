@@ -2,7 +2,7 @@
 
 The base admin is created once, on a fresh install, with the full permission set
 of that moment. When a new ``AuthResource`` is introduced later (e.g.
-``INGESTION``), the pre-existing admin must gain it at boot; other users must
+``ANALYTICS``), the pre-existing admin must gain it at boot; other users must
 never be touched, and a fresh install must keep creating a full-permission admin.
 """
 from copy import deepcopy
@@ -51,18 +51,18 @@ def _admin(permissions):
     }
 
 
-async def test_existing_admin_gains_missing_ingestion(monkeypatch):
+async def test_existing_admin_gains_missing_analytics(monkeypatch):
     permissions = deepcopy(FULL)
-    permissions.pop("INGESTION")
+    permissions.pop("ANALYTICS")
     original = _admin(permissions)
     fake = _FakeUsers({DEFAULT_ADMIN_USERNAME: original})
     _patch_users(monkeypatch, fake)
 
     added = await btl._reconcile_base_admin_permissions()
 
-    assert "INGESTION" in added
+    assert "ANALYTICS" in added
     stored = fake.users[DEFAULT_ADMIN_USERNAME]
-    assert stored["permissions"]["INGESTION"] == FULL["INGESTION"]
+    assert stored["permissions"]["ANALYTICS"] == FULL["ANALYTICS"]
     assert stored["permissions"]["MEMORY"] == FULL["MEMORY"]
     assert stored["username"] == DEFAULT_ADMIN_USERNAME
     assert stored["password"] == original["password"]
@@ -140,16 +140,12 @@ async def test_fresh_install_creates_admin_with_full_permissions(monkeypatch):
         fake.users[new_user["username"]] = {**new_user, "id": "new-admin-id"}
         return new_user
 
-    async def noop_validate(*args, **kwargs):
-        return None
-
     monkeypatch.setattr(btl.crud_users, "get_users", fake_get_users)
     monkeypatch.setattr(btl.crud_users, "create_user", fake_create_user)
     _patch_users(monkeypatch, fake)
     monkeypatch.setattr(btl, "WebSocketManager", _FakeWebSocketManager)
     monkeypatch.setattr(btl, "RabbitHole", lambda: object())
     monkeypatch.setattr(btl, "CoreAuthHandler", lambda: object())
-    monkeypatch.setattr(btl, "_validate_efficient_ingestion_installation", noop_validate)
 
     lizard = object.__new__(BillTheLizard.__wrapped__)
     lizard.plugin_manager = _FakePluginManager()  # type: ignore[assignment]

@@ -511,17 +511,8 @@ class MadHatter:
         # lizard_notify_plugin_*, ...), so no agent carries them.
         # base_plugin is the one always-on plugin that is NOT system-only: it
         # holds the default hooks every agent runs.
-        #
-        # ``cat_efficient_ingestion`` is system-only too, even though it is not
-        # a non-toggleable core plugin: ``ingestion`` is a SYSTEM-level factory
-        # service (like ``embedder``) and its own phase hooks
-        # (ingestion_phase_pending/run/settings_marker) must be dispatched on
-        # the system manager. The phase PROVIDERS stay agent-level: EffING
-        # collects ``ingestion_phase_specs`` from BOTH managers, so MyGRAPH and
-        # CATALOG keep registering and running their phases per agent.
         return utils.deduplicate_list(
             [p for p in self.get_non_toggleable_plugin_ids if p != self.get_base_core_plugin_id]
-            + ["cat_efficient_ingestion"]
         )
 
     @property

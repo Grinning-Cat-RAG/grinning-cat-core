@@ -95,13 +95,16 @@ Everything can be done via the [Admin Panel](https://www.github.com/Grinning-Cat
 > - `Factories`: extending objects like LLMs, Embedders, File Managers, Chunkers;
 > - `Interactions`: add the interaction handler to the language model;
 > - `March Hare`: keeps the PODs aligned through a Redis Stream (installation, uninstallation and system-level toggle of the plugins);
+> - `Management Message`: stores a global management message and a global notice message, and gates access to the whole instance in management mode;
 > - `Memory`: interacting with Working Memory and adding a handler to trace the activities of the Embedder;
-> - `Multimodality`: a plugin that adds multimodal capabilities to the Grinning Cat framework, enabling the processing of images;
+> - `Webhooks`: lets the API consumers register webhooks to be notified when certain events occur (see [Webhooks](#webhooks));
 > - `White Rabbit`: cron and schedule tasks;
 > - `Why`: add the context and the reasoning behind the answers of the LLM.
 > - `Analytics`: recover the analytics data about the usage of the Grinning Cat, which depends on the `Interactions` and `Memory` plugins.
 >
-> You can disable one or more (e.g., `March Hare` if you don't need to autoscale over cloud PODs) by using the Admin Toggle endpoint.
+> You can disable one or more (e.g., `Why` if you don't need the reasoning behind the answers) by using the Admin Toggle
+> endpoint. `Factories`, `March Hare`, `Management Message` and `White Rabbit` exist for the whole instance and are
+> always on: they cannot be disabled.
 
 Enjoy the Grinning Cat!
 
@@ -216,7 +219,54 @@ the first user of the agent who uses its chat id, from any endpoint (a message, 
 other user of the agent is refused (`401`, as for credentials that are not valid) until the owner deletes the
 conversation, since its files, its episodic memories and its deletion are identified by the chat id alone. The system
 users (administrators of every agent) access every conversation, without owning it. Deleting a conversation removes its files, its
-episodic memories and its history; deleting a user removes all their conversations.
+episodic memories, its history and the ingestion states of its sources; deleting a user removes all their conversations.
+
+# Ingestion
+
+Every source (a file or a URL, in the knowledge base of an agent or in a conversation) is ingested through **phases**,
+recorded in its **ingestion state**:
+
+- `parsing_chunking` parses the source and splits it in chunks, kept in the agent storage (in a `.rabbithole` folder
+  next to the uploaded files, never listed by the file manager);
+- `embedding` computes the vectors of the chunks and replaces the points of the source in the vector memory;
+- plugins can add their own phases (the `rabbithole_ingestion_phases` hook), run after the phases they depend on.
+
+A source goes through `uploaded` (`downloading` and `downloaded` for a URL), `processing`, then `completed` or `error`.
+A phase runs again only when needed: a change of the **embedder** re-embeds the kept chunks without parsing the files
+again; a change of the **chunker** (or of the settings of a phase) runs the source again from the parsing. A source
+without a state (ingested before the ingestion states existed, or dismissed) gets its state at a change of the embedder
+and is processed again from its file.
+An ingestion interrupted by a crash or a restart is **resumed automatically** by any instance of the Cat, every
+`CAT_INGESTION_RESUME_INTERVAL_SECONDS`; a source is processed by one instance at a time.
+While the embedder changes, or while the **vector database** of an agent changes (its points are copied, in background,
+from the previous database to the new one, after removing what the new one kept of the agent from a previous use; the
+procedures are embedded again), the agent is in maintenance: the automatic resume leaves it alone (a pass
+already running stops before its next source) until the copy ends and the `after_vector_memory_transfer_on_agent` hook
+(where plugins rebuild what they derive from the points) has run, whatever the outcome. Before the hook:
+
+- if the copy succeeded, the sources being ingested or updated during the copy (e.g. an upload started before the
+  switch, which wrote into the old database) are embedded again into the new one, once their ingestion ends;
+- if the copy failed, every source, failed ones included, is embedded again by the automatic resume, from its stored
+  chunks (the phases depending on the embedding run again too, once), and the procedures are embedded again. The
+  conversation memories not copied are lost.
+
+If the instance stops during the copy, the maintenance expires within `CAT_INGESTION_LOCK_TIMEOUT_SECONDS`, and the
+automatic resume handles the interrupted copy as a failed one, `after_vector_memory_transfer_on_agent` included (with
+`success` false). A failed source with a phase never tried, whose dependencies completed (e.g. a phase added later by a
+plugin), runs that phase once. The maintenance is one per agent, without owner: whoever
+ends first (a change of the embedder, a maintenance script) ends it for the others too; a copy still running sets it
+again at its next heartbeat.
+
+| Endpoint | Description |
+| --- | --- |
+| `GET /ingestion/status` | the ingestion states of the sources of the knowledge base, or of the conversation of the `X-Chat-ID` header |
+| `GET /ingestion/phases` | the phases of the agent, in execution order, and the states a source goes through |
+| `DELETE /ingestion/status?source=` | dismisses a failed ingestion: its state goes, its file and its memory stay (a change of the embedder processes it again from its file); `409` for any other state: a source is removed by deleting its file |
+| `POST /ingestion/retry?source=` | retries a failed ingestion in background (the source turns `uploaded` at once): its failed phases run again, with the ones depending on them (`409` for any other state, a retry going on included, or when it failed before its phases: upload it again) |
+
+Deleting a file (or the points of a whole source) removes everything its phases produced; it answers `409` while the
+source is being ingested, so retry later. Deleting all the files of the knowledge base (or of a conversation) removes all
+its sources, URLs included, and reports the ones being ingested with a `409`.
 
 # Webhooks
 

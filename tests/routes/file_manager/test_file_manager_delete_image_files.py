@@ -15,11 +15,11 @@ async def test_delete_file_fires_image_cascade_hook(monkeypatch):
     deleted_points = []
     hook_calls = []
 
-    class FakeVectorMemoryHandler:
-        async def delete_tenant_points(self, collection_name, metadata):
-            deleted_points.append((collection_name, metadata))
-
-    handler = FakeVectorMemoryHandler()
+    class FakeRabbitHole:
+        async def delete_source(self, cat, name, chat_id=None, wait=None, before=None):
+            result = await before()  # holding the lock of the source
+            deleted_points.append((name, chat_id))
+            return result
 
     class FakeFileManager:
         def remove_file(self, file_path):
@@ -31,12 +31,13 @@ async def test_delete_file_fires_image_cascade_hook(monkeypatch):
             hook_calls.append((name, args))
 
     fake_cheshire_cat = types.SimpleNamespace(
-        agent_key="path",
-        vector_memory_handler=handler,
+        agent_key="agent",
         file_manager=FakeFileManager(),
         plugin_manager=FakePluginManager(),
     )
-    fake_info = types.SimpleNamespace(cheshire_cat=fake_cheshire_cat, stray_cat=None)
+    fake_info = types.SimpleNamespace(
+        cheshire_cat=fake_cheshire_cat, stray_cat=None, lizard=types.SimpleNamespace(rabbit_hole=FakeRabbitHole()),
+    )
 
     # fixed (path, collection_id, metadata) so no real storage/DB is touched
     monkeypatch.setattr(
@@ -55,5 +56,5 @@ async def test_delete_file_fires_image_cascade_hook(monkeypatch):
         ("before_file_manager_file_delete", ("test.txt", "agent")),
         ("after_file_manager_file_deleted", ("test.txt", "agent")),
     ]
-    # the points are deleted after the cascade hook
-    assert deleted_points == [("declarative", {"source": "test.txt"})]
+    # the source (its points among what its phases produced) is removed from the memory after the cascade hook
+    assert deleted_points == [("test.txt", None)]

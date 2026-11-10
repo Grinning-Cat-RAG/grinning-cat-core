@@ -5,8 +5,7 @@ Here is a collection of methods to hook into the RabbitHole execution pipeline.
 These hooks allow to intercept the uploaded documents at different places before they are saved into memory.
 
 """
-from typing import Any, Dict, List
-
+from typing import Dict, List
 from langchain_core.documents import Document
 
 from cat import PointStruct, hook
@@ -102,12 +101,9 @@ def before_rabbithole_stores_documents(docs: List[Document], cat) -> List[Docume
 def finalize_oversized_chunks(docs: List[Document], cat) -> List[Document]:
     """Hook to finalize the chunk list so no chunk exceeds the embedder's limit.
 
-    Fired by the core RabbitHole after chunking/splitting (and by the
-    efficient_ingestion machine): the ``efficient_ingestion`` plugin implements
-    it, resolving the active embedder and splitting any oversized chunk into
-    budget-compliant sub-chunks (token-budget split, formerly a MyCAT-only core
-    method). The no-op default returns the docs unchanged (upstream parity: no
-    token-budget split).
+    Fired by the RabbitHole right before embedding the chunks (it depends on the embedder): in the ``embedding``
+    phase, so again at every re-embedding of the stored chunks (e.g. a change of the embedder), and in
+    ``store_documents``. The no-op default returns the docs unchanged (upstream parity: no token-budget split).
     """
     return docs
 
@@ -120,9 +116,9 @@ def after_rabbithole_stored_documents(source, stored_points: List[PointStruct], 
 
     Args:
         source: str
-            Name of ingested file/url
+            Name of ingested file/url (the requested filename/url when the source could not be resolved).
         stored_points: List[PointStruct]
-            List of PointStruct just inserted into the db.
+            List of PointStruct just inserted into the db; empty when the ingestion failed.
         cat: CheshireCat
             Cheshire Cat instance.
     """
@@ -130,136 +126,30 @@ def after_rabbithole_stored_documents(source, stored_points: List[PointStruct], 
 
 
 @hook(priority=0)
-def rabbithole_ingestion_start(source, metadata, is_url, cat) -> None:
-    """Hook fired at the START of a RabbitHole ingestion, once the source is known.
+def rabbithole_ingestion_phases(phases: List, cat) -> List:
+    """Hook to add phases to the ingestion of the sources of the agent.
 
-    Allows plugins to observe that an ingestion is about to begin (e.g. to track
-    an ingestion-status lifecycle) before the document is parsed/split/stored.
-
-    Args:
-        source: str
-            Name of the ingested file/url (or filename for memory uploads).
-        metadata: Dict
-            Metadata to be stored with each chunk.
-        is_url: bool
-            Whether the source is a URL.
-        cat: CheshireCat or StrayCat
-            Cheshire Cat or Stray Cat instance.
-    """
-    pass
-
-
-@hook(priority=0)
-def rabbithole_ingestion_error(source, error: str, cat) -> None:
-    """Hook fired when a RabbitHole ingestion fails.
-
-    Allows plugins to observe ingestion failures (e.g. to record an error state in
-    an ingestion-status lifecycle). Fired alongside the existing log/notify.
+    Each registrant appends its ``cat.rabbit_hole.phases.IngestionPhase`` subclasses (e.g. a phase extracting a graph
+    from the stored chunks, depending on ``embedding``) and returns the extended list: classes, not instances (the
+    hooks deep-copy what they pass along). The RabbitHole instantiates them without arguments for every run, runs them
+    after the phases they depend on, records them in the diary of each source and runs them again when their settings
+    (or the ones of a phase they depend on) change. The built-in phases (``parsing_chunking``, ``embedding``) win on a
+    duplicate id; a class with an invalid id is left out. No-op default: no phases added.
 
     Args:
-        source: str
-            Name of the ingested file/url (or filename if the source was not resolved).
-        error: str
-            The exception message.
-        cat: CheshireCat or StrayCat
-            Cheshire Cat or Stray Cat instance.
+        phases: List of IngestionPhase subclasses
+        cat: CheshireCat
     """
-    pass
-
-
-@hook(priority=0)
-def rabbithole_url_downloading(url, filename, cat) -> None:
-    """Hook fired right before a URL is downloaded by the RabbitHole.
-
-    Allows plugins to observe the ``downloading`` sub-state of a URL ingestion.
-
-    Args:
-        url: str
-            The URL being downloaded.
-        filename: str
-            The filename (for URLs this is the URL string itself).
-        cat: CheshireCat or StrayCat
-            Cheshire Cat or Stray Cat instance.
-    """
-    pass
-
-
-@hook(priority=0)
-def rabbithole_url_download_completed(url, filename, cat) -> None:
-    """Hook fired right after a URL is downloaded successfully by the RabbitHole.
-
-    Allows plugins to observe the ``downloaded`` sub-state of a URL ingestion.
-
-    Args:
-        url: str
-            The URL that was downloaded.
-        filename: str
-            The filename (for URLs this is the URL string itself).
-        cat: CheshireCat or StrayCat
-            Cheshire Cat or Stray Cat instance.
-    """
-    pass
-
-
-@hook(priority=0)
-def rabbithole_ingestion_processing(source, cat) -> None:
-    """Hook fired right before the documents of an ingestion are embedded/stored.
-
-    Allows plugins to observe the ``processing`` state of an ingestion lifecycle.
-
-    Args:
-        source: str
-            Name of the ingested file/url.
-        cat: CheshireCat or StrayCat
-            Cheshire Cat or Stray Cat instance.
-    """
-    pass
-
-
-@hook(priority=0)
-def rabbithole_processing_heartbeat_start(source: str, scope: str, interval: float, cat) -> None:
-    """Hook to start a background heartbeat for a PROCESSING ingestion row.
-
-    Fired by RabbitHole when a source starts being processed; the
-    ``ingestion_status`` plugin uses it to spawn the task that keeps the row
-    fresh during long parses. No-op default.
-    """
-    pass
-
-
-@hook(priority=0)
-def rabbithole_processing_heartbeat_stop(source: str, scope: str, cat) -> None:
-    """Hook to stop the heartbeat started by ``..._heartbeat_start``.
-
-    Fired by RabbitHole when the processing ends (success or error); the
-    ``ingestion_status`` plugin cancels its heartbeat task here. No-op default.
-    """
-    pass
-
-
-@hook(priority=0)
-async def run_in_ingestion_executor(result: Any, func, cat) -> Any:
-    """Hook to run a heavy ingestion callable off the event loop on a dedicated lane.
-
-    Fired by the core (RabbitHole, CheshireCat) and by plugins that do heavy
-    ingestion work (chunking, embedding). The ``efficient_ingestion`` plugin
-    provides a dedicated low-concurrency, de-prioritized thread pool and runs
-    ``func`` on it. The no-op default returns None: no dedicated lane is active
-    and callers fall back to the default executor (upstream parity).
-    """
-    return None
+    return phases
 
 
 @hook(priority=0)
 def rabbithole_collects_document_images(images: List[Dict], docs: List[Document], cat) -> List[Dict]:
     """Hook to extract the images produced by multimodal parsers from the parsed docs.
 
-    Fired by RabbitHole ``_parse_to_docs`` BEFORE chunking (chunkers may drop
-    the ``image_base64`` metadata that carries the payload). The ``multimodal_ingestion``
-    plugin walks the parsed documents, returns one entry per extracted image
-    (``image_base64`` / ``image_bytes`` / ``image_mime_type``) and strips the
-    transient payload from the docs. First arg ``images`` is the chain carrier:
-    with no plugin the no-op returns it unchanged (upstream parity: no images).
+    Fired by RabbitHole ``_parse_to_docs`` BEFORE chunking (chunkers may drop the ``image_base64`` metadata that carries
+    the payload). First arg ``images`` is the chain carrier: with no plugin the no-op returns it unchanged (upstream
+    parity: no images).
     """
     return images
 
@@ -277,10 +167,9 @@ def rabbithole_stores_image_points(
 ) -> List[PointStruct]:
     """Hook to build the image points stored alongside a source's text chunks.
 
-    Fired by RabbitHole ``store_documents`` when the source produced images
-    (from the parse-time collection). The ``multimodal_ingestion`` plugin embeds
-    them via ``embed_images``, saves them as files (``save_file``) and returns
-    the ``PointStruct`` list; the core appends them to the same collection.
+    Fired by the RabbitHole when the source produced images (from the parse-time collection): in the ``embedding``
+    phase, with the images and the bytes of the source read back from the files kept for it (also at every
+    re-embedding), and in ``store_documents``.
     First arg ``image_points`` is the chain carrier: with no plugin the no-op
     returns it unchanged (upstream parity: no image points).
     """

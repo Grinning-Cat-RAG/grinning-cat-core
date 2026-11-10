@@ -16,8 +16,6 @@ def before_agentic_workflow(task: AgenticWorkflowTask, cat) -> AgenticWorkflowTa
     """Hook to enrich or modify the agentic workflow task before it runs.
 
     Fired by ``StrayCat.__call__`` right before ``self._agentic_workflow.run``.
-    The ``multimodal_ingestion`` plugin uses it to attach the recalled
-    multimodal images (``task.images``) so a vision-capable LLM can see them.
     No-op default: returns the task unchanged.
     """
     return task
@@ -320,7 +318,12 @@ def after_vector_memory_transfer_on_agent(success: bool, cat: CheshireCat) -> No
     """
     Hook triggered after the vector memory transfer process on an agent. This function allows for any post-processing or
     tasks that need to be carried out immediately after the vector memory transfer process has been completed on an agent,
-    involving interaction with the CheshireCat instance.
+    involving interaction with the CheshireCat instance (e.g. rebuilding what a plugin derives from the points). The
+    agent is still in maintenance while the hook runs (the automatic resume of the ingestions leaves it alone); the
+    maintenance ends when the hook returns. On success, the sources updated during the copy were already embedded
+    again; on failure, every source is left to the automatic resume, which embeds it again (and runs again the phases
+    depending on the embedding) after the hook. A transfer interrupted by a stopping pod runs the hook (with
+    ``success=False``, not in maintenance) when the automatic resume takes it over.
 
     Args:
         success: A boolean indicating whether the vector memory transfer process was successful.

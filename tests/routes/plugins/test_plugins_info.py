@@ -1,5 +1,5 @@
 from tests.routes.plugins.conftest import REGISTRY_CATALOGUE
-from tests.utils import agent_active_core_plugins, assert_system_only_plugin_contract
+from tests.utils import agent_active_core_plugins
 
 
 async def test_list_plugins(lizard, secure_client, secure_client_headers, cheshire_cat):
@@ -30,8 +30,7 @@ async def test_list_plugins(lizard, secure_client, secure_client_headers, cheshi
             json["installed"][idx]["id"] in active_core_plugins
         )
 
-    # cat_efficient_ingestion is system-only: inactive for the agent, active on the system manager
-    await assert_system_only_plugin_contract(secure_client, secure_client_headers)
+    # a system-only core plugin is: inactive for the agent, active on the system manager
 
     # registry (see more registry tests in `./test_plugins_registry.py`)
     assert isinstance(json["registry"], list)

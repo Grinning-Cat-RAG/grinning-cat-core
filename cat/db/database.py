@@ -8,6 +8,7 @@ from cat.utils import singleton
 DEFAULT_AGENTS_KEY = "agents"
 DEFAULT_AGENT_KEY = "agent"
 DEFAULT_CONVERSATIONS_KEY = "conversations"
+DEFAULT_INGESTION_KEY = "ingestion"
 DEFAULT_PLUGINS_KEY = "plugins"
 DEFAULT_USERS_KEY = "users"
 DEFAULT_SYSTEM_KEY = "system"

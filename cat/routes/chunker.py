@@ -4,6 +4,7 @@ from fastapi import APIRouter, BackgroundTasks, Body
 from cat.auth.connection import AuthorizedInfo
 from cat.auth.permissions import AuthPermission, AuthResource, check_permissions
 from cat.db.cruds import settings as crud_settings
+from cat.rabbit_hole import recovery as ingestion_recovery
 from cat.routes.routes_utils import (
     GetSettingsResponse,
     GetSettingResponse,
@@ -78,13 +79,12 @@ async def upsert_chunker_setting(
     current_chunker = await crud_settings.get_settings_by_category(ccat.agent_key, "chunker")  # type: ignore[union-attr]
 
     # a characterizing feature of the chunker has been updated: schedule the
-    # replaceable ingestion engine, exactly like the embedder route does, so a
-    # chunker change actually re-parses (marker slow-path in the phase machine)
+    # automatic resume, exactly like the embedder route does, so the sources
+    # whose chunking tag is now stale are re-parsed by the phase engine.
     if _chunker_signature(previous_chunker) != _chunker_signature(current_chunker):
-        engine = await info.lizard.ingestion()
         run_background_task(
             background_tasks,
-            engine.run,
+            ingestion_recovery.resume_all,
             info.lizard,
         )
 

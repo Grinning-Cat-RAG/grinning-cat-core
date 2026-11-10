@@ -1,6 +1,8 @@
 import asyncio
 import io
 
+from cat.rabbit_hole import RabbitHole
+from cat.rabbit_hole.phases import PhaseResult
 from cat.services.memory.models import VectorMemoryType
 
 from tests.utils import send_file, get_memory_contents
@@ -125,11 +127,11 @@ async def test_file_saved_before_processing_completes(
 ):
     """The uploaded file bytes must be on disk BEFORE processing completes.
 
-    `RabbitHole.ingest_file` saves the file right after parsing (before
-    `store_documents`), so a container restart can resume reading the bytes
-    from disk even if embedding is interrupted. This test stubs
-    `store_documents` to be slow and asserts the file is already present for
-    the agent while ingestion is still in progress.
+    `RabbitHole.ingest_file` saves the file before running the phases, so a
+    container restart can resume reading the bytes from disk even if the
+    embedding is interrupted. This test stubs the embedding phase to be slow and
+    asserts the file is already present for the agent while ingestion is still
+    in progress.
     """
     # set file_manager_name = "LocalFileManagerConfig"
     file_manager_name = "LocalFileManagerConfig"
@@ -148,14 +150,14 @@ async def test_file_saved_before_processing_completes(
     with open(file_path, "rb") as f:
         file_bytes = f.read()
 
-    # stub store_documents to be slow, so we can observe the file on disk
+    # stub the embedding phase to be slow, so we can observe the file on disk
     # while ingestion is still in progress (before processing completes)
-    async def slow_store_documents(*args, **kwargs):
+    async def slow_embedding(self, source, cat):
         await asyncio.sleep(1)
-        return []
+        return PhaseResult(status="done", processed=0)
 
     rabbit_hole = cheshire_cat.rabbit_hole
-    monkeypatch.setattr(rabbit_hole, "store_documents", slow_store_documents)
+    monkeypatch.setattr(RabbitHole, "run_embedding", slow_embedding)
 
     # start ingestion in the background
     task = asyncio.create_task(
@@ -168,8 +170,8 @@ async def test_file_saved_before_processing_completes(
         )
     )
 
-    # wait for the early save to happen (it runs right after _file_to_docs,
-    # before store_documents)
+    # wait for the early save to happen (it runs right after the source bytes are resolved,
+    # before the phases)
     for _ in range(50):
         files = cheshire_cat.file_manager.list_files(cheshire_cat.agent_key)
         if any(f.name == "sample.pdf" for f in files):
@@ -178,7 +180,7 @@ async def test_file_saved_before_processing_completes(
     else:
         raise AssertionError("sample.pdf was not saved to disk during processing")
 
-    # ingestion must still be in progress (store_documents is sleeping)
+    # ingestion must still be in progress (the embedding is sleeping)
     assert not task.done(), "ingestion should still be in progress"
 
     # the bytes on disk must match the uploaded file

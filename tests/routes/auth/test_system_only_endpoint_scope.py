@@ -11,22 +11,22 @@ from tests.utils import api_key, just_installed_plugin
 async def test_system_only_endpoint_reachable_with_agent(
     secure_client, secure_client_headers, cheshire_cat, lizard
 ):
-    # ``cat_efficient_ingestion`` is system-only: its endpoint lives on the system plugin manager only.
-    assert lizard.is_custom_endpoint("/ingestion/status", method="GET")
-    assert lizard.is_system_custom_endpoint("/ingestion/status", method="GET")
-    assert not cheshire_cat.has_custom_endpoint("/ingestion/status", method="GET")
+    # ``mgmt_message`` is system-only: its endpoint lives on the system plugin manager only.
+    assert lizard.is_custom_endpoint("/mgmt_message/settings", method="GET")
+    assert lizard.is_system_custom_endpoint("/mgmt_message/settings", method="GET")
+    assert not cheshire_cat.has_custom_endpoint("/mgmt_message/settings", method="GET")
 
-    response = await secure_client.get("/ingestion/status", headers=secure_client_headers)
+    response = await secure_client.get("/mgmt_message/settings", headers=secure_client_headers)
 
     assert response.status_code == 200
-    assert response.json() == []
+    assert response.json()["name"] == "mgmt_message"
 
 
 async def test_system_only_endpoint_reachable_in_system_scope(secure_client, cheshire_cat):
-    response = await secure_client.get("/ingestion/status", headers={"Authorization": f"Bearer {api_key}"})
+    response = await secure_client.get("/mgmt_message/settings", headers={"Authorization": f"Bearer {api_key}"})
 
     assert response.status_code == 200
-    assert response.json() == []
+    assert response.json()["name"] == "mgmt_message"
 
 
 async def test_agent_level_endpoint_inactive_for_agent_still_returns_404(

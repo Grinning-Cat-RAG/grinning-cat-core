@@ -66,11 +66,8 @@ async def _on_upload_single_file(
                     f"MIME type {content_type} not supported. Admitted types: {' - '.join(admitted_types)}"
                 )
 
-            # upload file to long-term memory through the configured ingestion
-            # engine (a plugin may replace the flow with its own phase machine;
-            # the default engine wraps the original rabbit_hole.ingest_file)
-            engine = await lizard.ingestion()
-            await engine.ingest_file(
+            # upload file to long-term memory
+            await lizard.rabbit_hole.ingest_file(
                 cat=cat,
                 file=file_bytes,
                 filename=filename,
@@ -183,13 +180,10 @@ async def upload_url(
 
             response.raise_for_status()
 
-            # resolve the configured ingestion engine and upload the URL in the
-            # background through it (a plugin may replace the flow; the default
-            # engine wraps the original rabbit_hole.ingest_file)
-            engine = await info.lizard.ingestion()
+            # upload file to long-term memory, in the background
             run_background_task(
                 background_tasks,
-                engine.ingest_file,
+                info.lizard.rabbit_hole.ingest_file,
                 cat=info.stray_cat or info.cheshire_cat,
                 file=upload_config.url,
                 metadata=upload_config.metadata,

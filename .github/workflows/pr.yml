@@ -39,7 +39,10 @@ jobs:
       - name: Create .env from secrets
         run: |
           echo "CAT_API_KEY=s32383ihg80dsio4kvkjkckqwa63" >> .env
+          echo "CAT_ADMIN_DEFAULT_PASSWORD=admin" >> .env
           echo "CAT_JWT_SECRET=re43gkrekjtekjrkejtkjrew49853rgnsdrgh3p49toengkstw43uothw34lgsedbczbr25uro3whksdbfjwheow3h4tkeldsbg4uht" >> .env
+          echo "CAT_CRYPTO_KEY=grinning_cat" >> .env
+          echo "CAT_CRYPTO_SALT=grinning_cat_salt" >> .env
       - name: Build and test
         run: |
           docker compose build --pull --no-cache

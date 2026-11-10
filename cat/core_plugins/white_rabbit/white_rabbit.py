@@ -1,11 +1,12 @@
+import pickle
 from datetime import datetime, timedelta, timezone
 from typing import List
-from apscheduler.events import EVENT_JOB_EXECUTED, EVENT_JOB_ERROR, EVENT_JOB_SUBMITTED
+from apscheduler.events import EVENT_JOB_EXECUTED, EVENT_JOB_ERROR
 from apscheduler.executors.asyncio import AsyncIOExecutor
 from apscheduler.executors.pool import ProcessPoolExecutor
-from apscheduler.jobstores.base import JobLookupError
 from apscheduler.jobstores.redis import RedisJobStore
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.util import datetime_to_utc_timestamp
 from pydantic import BaseModel, Field
 
 from cat import utils
@@ -28,6 +29,59 @@ class Job(BaseModel):
     status: JobStatus = Field(default=JobStatus.SCHEDULED)
 
 
+class _SharedRedisJobStore(RedisJobStore):
+    """The job store shared by every node. Every node processes the same due jobs, so the writes after a run are
+    idempotent: a job already removed (by the node that ran it, or on purpose) is not updated back to life, and
+    removing it again is not an error (otherwise the scheduler of the node stops, never to run a job again)."""
+
+    # update a job only while it exists, atomically: KEYS jobs, run_times; ARGV id, state, next run timestamp or ""
+    _UPDATE_IF_EXISTS = """
+    if redis.call('HEXISTS', KEYS[1], ARGV[1]) == 0 then return 0 end
+    redis.call('HSET', KEYS[1], ARGV[1], ARGV[2])
+    if ARGV[3] == '' then redis.call('ZREM', KEYS[2], ARGV[1]) else redis.call('ZADD', KEYS[2], ARGV[3], ARGV[1]) end
+    return 1
+    """
+
+    def update_job(self, job):
+        next_run = datetime_to_utc_timestamp(job.next_run_time) if job.next_run_time else ""
+        self.redis.eval(
+            self._UPDATE_IF_EXISTS, 2, self.jobs_key, self.run_times_key,
+            job.id, pickle.dumps(job.__getstate__(), self.pickle_protocol), next_run,
+        )
+
+    def remove_job(self, job_id):
+        with self.redis.pipeline() as pipe:
+            pipe.hdel(self.jobs_key, job_id)
+            pipe.zrem(self.run_times_key, job_id)
+            pipe.execute()
+
+
+class _OncePerRunExecutor(AsyncIOExecutor):
+    """Every node reads the due jobs from the shared store and submits them: a run goes to the node that books its
+    scheduled time first (a key per job and time, expiring by itself: nothing to release, a dead node blocks nothing).
+    The other nodes skip it silently."""
+
+    #: How long a booking lasts: well beyond the time a late node may still submit the same run
+    BOOKING_SECONDS = 3600
+
+    def __init__(self, client_db, on_submitted):
+        super().__init__()
+        self._client_db = client_db
+        self._on_submitted = on_submitted
+
+    def submit_job(self, job, run_times):
+        booked = [
+            run_time for run_time in run_times
+            if self._client_db.set(
+                f"white_rabbit:run:{job.id}:{run_time.timestamp()}", "booked", nx=True, ex=self.BOOKING_SECONDS,
+            )
+        ]
+        if not booked:
+            return  # another node runs them
+        super().submit_job(job, booked)
+        self._on_submitted(job.id)
+
+
 @singleton
 class WhiteRabbit:
     """
@@ -48,7 +102,7 @@ class WhiteRabbit:
         # exclusively for APScheduler's RedisJobStore, which stores pickled binary data and cannot use a UTF-8 decoding
         # client. This avoids any interference with the main client connection used by the rest of the system.
         jobstores = {
-            "default": RedisJobStore(
+            "default": _SharedRedisJobStore(
                 jobs_key="white_rabbit:jobs",
                 run_times_key="white_rabbit:run_times",
                 **(self._client_db.get_connection_kwargs() | {"decode_responses": False}),
@@ -56,11 +110,13 @@ class WhiteRabbit:
         }
 
         executors = {
-            "default": AsyncIOExecutor(),
+            "default": _OncePerRunExecutor(self._client_db, self._job_submitted),
             "processpool": ProcessPoolExecutor(5),
         }
 
-        job_defaults = {"coalesce": False, "max_instances": 10}
+        # the runs missed while no node was up (a crash, a restart) are merged into one: a single late run (within the
+        # grace time, otherwise skipped and logged once), not one per missed run
+        job_defaults = {"coalesce": True, "max_instances": 10}
 
         self.scheduler = AsyncIOScheduler(
             jobstores=jobstores,
@@ -69,8 +125,8 @@ class WhiteRabbit:
             timezone=timezone.utc,
         )
 
-        # Listen to submission, execution and error events to track status accurately
-        self.scheduler.add_listener(self._job_submitted_listener, EVENT_JOB_SUBMITTED)
+        # Listen to execution and error events to track status accurately (the submission is tracked by the executor:
+        # only the node running the job sets it running)
         self.scheduler.add_listener(self._job_ended_listener, EVENT_JOB_EXECUTED | EVENT_JOB_ERROR)
 
         self.jobs: List[str] = []
@@ -82,7 +138,7 @@ class WhiteRabbit:
             log.debug("WhiteRabbit: Scheduler started")
             self._is_running = True
         except Exception as e:
-            log.error("WhiteRabbit: Error during scheduler start: ", e)
+            log.error(f"WhiteRabbit: Error during scheduler start: {e}")
             self._is_running = False
 
     def __del__(self):
@@ -104,10 +160,10 @@ class WhiteRabbit:
             return JobStatus.SCHEDULED  # Default for jobs with no explicit status set yet
         return JobStatus(raw.decode() if isinstance(raw, bytes) else raw)
 
-    def _job_submitted_listener(self, event):
-        """Triggered when a job is submitted for execution."""
-        self._set_job_status(event.job_id, JobStatus.RUNNING)
-        log.debug(f"WhiteRabbit: job {event.job_id} is now running.")
+    def _job_submitted(self, job_id: str):
+        """Triggered when this node submits a job for execution."""
+        self._set_job_status(job_id, JobStatus.RUNNING)
+        log.debug(f"WhiteRabbit: job {job_id} is now running.")
 
     def _job_ended_listener(self, event):
         """Triggered when a job ends (success or error)."""
@@ -149,9 +205,9 @@ class WhiteRabbit:
         log.debug(f"WhiteRabbit: Lock released for '{event}' event.")  # type: ignore[attr-defined]
 
     def shutdown(self):
-        for job_id in self.jobs.copy():
-            self.remove_job(job_id)
-
+        """Stop the scheduler of this node. The jobs stay in the store, shared by every node: they belong to the
+        instance, not to the node that scheduled them (another node, or this one at the restart, runs them). A job goes
+        only when removed on purpose (``remove_job``)."""
         if self._is_running:
             log.info("WhiteRabbit: Scheduler stopped")
             self.scheduler.shutdown(wait=True)
@@ -252,15 +308,7 @@ class WhiteRabbit:
                 self.jobs.remove(job_id)
             self._set_job_status(job_id, JobStatus.REMOVED)
             log.info(f"WhiteRabbit: Removed job {job_id}")  # type: ignore[attr-defined]
-            return True
-        except JobLookupError:
-            # The job is already gone (removed by another worker/replica sharing the
-            # RedisJobStore, or never existed). Nothing to do — not an error.
-            if job_id in self.jobs:
-                self.jobs.remove(job_id)
-            self._set_job_status(job_id, JobStatus.REMOVED)
-            log.debug(f"WhiteRabbit: job {job_id} already removed (skipping)")
-            return True
+            return True  # also when already gone (removed by another node, or never existed): the store allows it
         except Exception as e:
             log.error(f"WhiteRabbit: error during job removal. {e}")  # type: ignore[attr-defined]
             return False
@@ -278,7 +326,9 @@ class WhiteRabbit:
         **kwargs,
     ) -> str:
         """
-        Schedule a one-shot job.
+        Schedule a one-shot job. It stays in the store shared by every node until it runs or is removed, also when the
+        node that scheduled it stops: a fixed ``job_id`` already pending (e.g. scheduled again at every startup) raises
+        ``ConflictingIdError``, so check it with ``get_job`` first.
 
         Args:
             job (function): The function to be called.
@@ -441,6 +491,7 @@ class WhiteRabbit:
             minute=minute,
             second=second,
             kwargs=kwargs,
+            replace_existing=True,  # idempotent across nodes and restarts: the store is shared and outlives them
         )
         self.jobs.append(job_id)
 

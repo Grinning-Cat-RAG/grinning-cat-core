@@ -3,6 +3,8 @@ import os
 # The app refuses to start without a strong CAT_JWT_SECRET: provide one BEFORE importing cat.startup
 # (which creates the app at import time). Must be set here, at the very top of the conftest.
 os.environ.setdefault("CAT_JWT_SECRET", "test_only_jwt_secret_0123456789_abcdefghij")
+# The automatic resume of the ingestions would run on the data of the tests: the tests of the resume call it directly.
+os.environ.setdefault("CAT_INGESTION_RESUME_INTERVAL_SECONDS", "0")
 
 import shutil
 import time
