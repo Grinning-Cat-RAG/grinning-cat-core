@@ -43,6 +43,9 @@ def get_supported_env_variables():
         "CAT_INGESTION_LOCK_TIMEOUT_SECONDS": "300",
         "CAT_INGESTION_NOT_READY_MAX_SECONDS": "3600",
         "CAT_INGESTION_RESUME_INTERVAL_SECONDS": "60",
+        # opt-in token-budget split of oversized chunks in the embedding phase
+        "CAT_INGESTION_SPLIT_OVERSIZED": "false",
+        "CAT_INGESTION_SPLIT_MAX_TOKENS": "512",
     }
 
 

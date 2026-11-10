@@ -20,9 +20,10 @@ from cat.db.cruds import ingestions as crud_ingestions
 from cat.db.cruds.ingestions import IngestionStatus
 from cat.rabbit_hole import chunks, engine
 from cat.rabbit_hole.phases import PHASE_EMBEDDING, IngestionSource, PhaseGraphError, PhaseResult
+from cat.rabbit_hole.split import embedder_token_budget, split_oversized
 from cat.services.factory.embedder import embedding_size
 from cat.core_plugins.base_plugin.parsers import MimeTypeBasedParser
-from cat.env import get_env_int
+from cat.env import get_env_bool, get_env_int
 from cat.log import log
 from cat.services.factory.chunker import BaseChunker
 from cat.services.memory.models import PointStruct, VectorMemoryType
@@ -877,6 +878,12 @@ class RabbitHole:
 
         log.info(f"Agent id: {self.cat.agent_key}. Preparing to memorize {len(docs)} vectors for {source}.")
         embedder = await self.cat.lizard.embedder()
+
+        # Opt-in token-budget split, after the plugin hook above and right before embedding: the tokenizer depends on
+        # the embedder. Idempotent, so a re-embedding (e.g. after a change of embedder) is harmless.
+        if get_env_bool("CAT_INGESTION_SPLIT_OVERSIZED"):
+            budget = embedder_token_budget()
+            docs = split_oversized(docs, budget, getattr(embedder, "_estimate_tokens", None))
 
         # embed the non-empty docs, 1:1 with the stored points
         valid_documents = list(filter(lambda doc_: doc_.page_content.strip(), docs))

@@ -116,6 +116,10 @@ def validate_env() -> EnvReport:
     _check_required(report, "CAT_CRYPTO_SALT")
     _check_required(report, "CAT_ADMIN_DEFAULT_PASSWORD")
 
+    # --- ingestion ------------------------------------------------------------------------------------------------
+    _check_bool(report, "CAT_INGESTION_SPLIT_OVERSIZED")
+    _check_number(report, "CAT_INGESTION_SPLIT_MAX_TOKENS", int, min_value=1)
+
     # --- plugins --------------------------------------------------------------------------------------------------
     _check_bool(report, "CAT_PLUGINS_REGISTRY_SEARCH_ENABLED")
 
