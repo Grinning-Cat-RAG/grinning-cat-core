@@ -174,3 +174,14 @@ def rabbithole_stores_image_points(
     returns it unchanged (upstream parity: no image points).
     """
     return image_points
+
+
+@hook
+async def run_in_ingestion_executor(executor, func, cat) -> None:
+    """No-op default for the dedicated ingestion executor lane.
+
+    Plugins that provide a dedicated pool (the efficient ingestion engine)
+    override this; the default returns None so callers fall back to
+    ``asyncio.to_thread``.
+    """
+    return None
