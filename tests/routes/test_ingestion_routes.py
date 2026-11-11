@@ -91,6 +91,19 @@ async def test_no_states(secure_client, secure_client_headers, cheshire_cat):
     assert (response.status_code, response.json()) == (200, [])
 
 
+async def test_the_reindexing_state_round_trips_through_the_status_api(
+    secure_client, secure_client_headers, cheshire_cat,
+):
+    await crud_ingestions.create_status(cheshire_cat.agent_key, None, "x.txt", type_="file")
+    await crud_ingestions.update_status(cheshire_cat.agent_key, None, "x.txt", status="reindexing")
+
+    response = await secure_client.get("/ingestion/status", headers=secure_client_headers)
+
+    assert response.status_code == 200
+    row = {r["source"]: r for r in response.json()}["x.txt"]
+    assert (row["status"], row["status_label"]) == ("reindexing", "Reindexing")
+
+
 # --- GET /ingestion/phases -------------------------------------------------------------------------------------
 
 async def test_the_phases_in_execution_order_and_the_states(secure_client, secure_client_headers, cheshire_cat, monkeypatch):
@@ -106,7 +119,7 @@ async def test_the_phases_in_execution_order_and_the_states(secure_client, secur
         {"id": "graph", "label": "Building the graph", "order": 3, "depends_on": ["embedding"]},
     ]
     assert [s["id"] for s in body["states"]] == [
-        "uploaded", "downloading", "downloaded", "processing", "completed", "error", "deleting",
+        "uploaded", "downloading", "downloaded", "processing", "completed", "error", "deleting", "reindexing",
     ]
 
 
@@ -350,6 +363,25 @@ async def test_reingesting_a_source_runs_every_phase_again(cheshire_cat, files, 
     row = await cheshire_cat.rabbit_hole.reingest_source(cheshire_cat, "story.txt")
 
     assert parsed == ["story.txt"] and row["status"] == "completed"
+
+
+async def test_reingesting_a_source_marks_it_reindexing_while_it_runs(cheshire_cat, files, monkeypatch):
+    seen = []
+    real = GraphPhase.process
+
+    async def process(self, source, cat):
+        row = await crud_ingestions.get_status(source.agent_id, source.chat_id, source.name)
+        seen.append(row["status"])
+        return await real(self, source, cat)
+
+    plug(monkeypatch, cheshire_cat, GraphPhase)
+    monkeypatch.setattr(GraphPhase, "process", process)
+    await ingest(cheshire_cat)
+    seen.clear()
+
+    row = await cheshire_cat.rabbit_hole.reingest_source(cheshire_cat, "story.txt")
+
+    assert seen == ["reindexing"] and row["status"] == "completed"
 
 
 async def test_reingesting_a_source_without_state_gives_it_one(cheshire_cat, files):
