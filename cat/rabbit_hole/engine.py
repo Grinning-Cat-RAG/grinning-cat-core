@@ -19,7 +19,6 @@ from cat.db import crud
 from cat.db.cruds import ingestions as crud_ingestions
 from cat.db.cruds import settings as crud_settings
 from cat.db.cruds.ingestions import PHASE_ID, IngestionStatus
-from cat.db.database import get_async_db
 from cat.env import get_env_int
 from cat.log import log
 from cat.rabbit_hole.phases import (
@@ -118,7 +117,7 @@ async def source_lock(source: IngestionSource, blocking: bool = True, wait: floa
 
 
 async def agent_exists(agent_id: str) -> bool:
-    return bool(await get_async_db().exists(crud_settings.format_key(agent_id)))
+    return await crud_settings.exists(agent_id)
 
 
 async def collect_phases(rabbit_hole, cat) -> List[IngestionPhase]:

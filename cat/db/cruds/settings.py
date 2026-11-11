@@ -24,6 +24,26 @@ def format_key(key_id: str) -> str:
     )
 
 
+async def exists(agent_id: str) -> bool:
+    """
+    Check whether an agent's settings key exists in Redis.
+
+    Args:
+        agent_id: Agent identifier.
+
+    Returns:
+        True if the settings key exists, False otherwise.
+
+    Raises:
+        RedisError: If Redis connection fails.
+    """
+    try:
+        return bool(await crud.read(format_key(agent_id)))
+    except RedisError as e:
+        log.error(f"Redis error checking settings for {agent_id}: {e}")
+        raise
+
+
 async def get_settings(key_id: str, search: str = "") -> List[Dict]:
     """
     Retrieve settings from Redis, optionally filtered by name.
