@@ -338,7 +338,12 @@ async def test_cloning_a_cheshire_cat_brings_its_finished_knowledge_base_rows(li
 
 # --- the agent and the chats take their rows with them ---------------------------------------------------------
 
-async def test_destroying_the_agent_removes_its_ingestion_state(cheshire_cat):
+async def test_destroying_the_agent_removes_its_ingestion_state(cheshire_cat, monkeypatch):
+    # The seeded rows are non-terminal ("uploaded"), so the teardown would wait
+    # the default 180s quiesce. Bound it (and the poll) to keep the test fast.
+    monkeypatch.setenv("CAT_INGESTION_DELETE_QUIESCE_SECONDS", "1")
+    monkeypatch.setenv("CAT_INGESTION_DELETE_POLL_SECONDS", "1")
+
     agent = cheshire_cat.agent_key
     await _create(agent=agent, source="a.pdf")
     await _create(agent=agent, chat_id="c1", source="b.pdf")
