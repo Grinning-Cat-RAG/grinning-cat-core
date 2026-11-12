@@ -9,6 +9,7 @@ from langchain_core.documents import Document
 from cat.core_plugins.base_plugin.parsers import MimeTypeBasedParser
 from cat.db.cruds import ingestions as crud_ingestions
 from cat.rabbit_hole import RabbitHole
+from cat.rabbit_hole.core import _strip_image_payload
 from cat.services.factory.embedder import MultimodalEmbeddings
 from cat.services.memory.models import PointStruct, VectorMemoryType
 from tests.utils import agent_id
@@ -273,6 +274,90 @@ async def test_text_points_do_not_carry_image_base64(cheshire_cat, monkeypatch):
     assert "image_base64" not in text_metadata
     # the rest of the metadata survives untouched
     assert text_metadata["other_metadata"] == "keep me"
+
+
+def _assert_no_image_base64(value):
+    """Assert ``image_base64`` is absent from a metadata tree, at any depth."""
+    if isinstance(value, dict):
+        assert "image_base64" not in value
+        for item in value.values():
+            _assert_no_image_base64(item)
+    elif isinstance(value, list):
+        for item in value:
+            _assert_no_image_base64(item)
+
+
+def test_strip_image_payload_removes_nested_payload_only():
+    """The recursive strip removes ``image_base64`` at any depth, keeping the rest."""
+    doc = Document(
+        page_content="x",
+        metadata={
+            "source": "x",
+            "source_chunks": [
+                {"metadata": {"image_base64": "<b64>", "coordinates": {"x": 1, "y": 2}}},
+            ],
+        },
+    )
+
+    _strip_image_payload([doc])
+
+    _assert_no_image_base64(doc.metadata)
+    assert doc.metadata["source"] == "x"
+    assert doc.metadata["source_chunks"][0]["metadata"]["coordinates"] == {"x": 1, "y": 2}
+
+
+async def test_parse_to_docs_strips_nested_image_payload_after_hook(cheshire_cat, monkeypatch):
+    """``_parse_to_docs`` strips nested ``image_base64`` from the core docs after the hook.
+
+    The hook dispatcher deep-copies its arguments, so the plugin's strip is a no-op
+    on the core documents: the core must strip its own docs before chunking. The
+    images collected by the hook are still returned.
+    """
+    collected_images = [_image_payload(b"\x89PNG\r\n\x1a\n")]
+    original_execute_hook = cheshire_cat.plugin_manager.execute_hook
+
+    def fake_parse(self, blob):
+        return [
+            Document(
+                page_content="parsed content",
+                metadata={
+                    "source": "test.txt",
+                    "source_chunks": [
+                        {"metadata": {"image_base64": "<b64>", "coordinates": {"x": 1, "y": 2}}},
+                    ],
+                },
+            )
+        ]
+
+    async def fake_run_in_ingestion_executor(func, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    async def fake_execute_hook(hook_name, *args, caller=None):
+        if hook_name == "rabbithole_collects_document_images":
+            return collected_images
+        return await original_execute_hook(hook_name, *args, caller=caller)
+
+    monkeypatch.setattr("cat.rabbit_hole.core.run_in_ingestion_executor", fake_run_in_ingestion_executor)
+    monkeypatch.setattr(MimeTypeBasedParser, "parse", fake_parse)
+    monkeypatch.setattr(cheshire_cat.plugin_manager, "execute_hook", fake_execute_hook)
+
+    async def fake_split(self, docs):
+        return docs
+
+    monkeypatch.setattr(RabbitHole, "_split_text", fake_split)
+
+    rabbit_hole = RabbitHole()
+    rabbit_hole.cat = cheshire_cat
+    rabbit_hole.stray = None
+
+    docs, images = await rabbit_hole._parse_to_docs(
+        source="test.txt", file_bytes=b"hello world", content_type="text/plain",
+    )
+
+    _assert_no_image_base64([d.metadata for d in docs])
+    assert docs[0].metadata["source_chunks"][0]["metadata"]["coordinates"] == {"x": 1, "y": 2}
+    assert images == collected_images
+
 
 
 def test_agent_id_is_test_agent(cheshire_cat):
