@@ -104,6 +104,21 @@ async def run_in_ingestion_executor(func, *args, **kwargs):
     )
 
 
+def _strip_image_payload(docs) -> None:
+    """Remove every ``image_base64`` key from each document metadata, at any depth."""
+    def walk(value) -> None:
+        if isinstance(value, dict):
+            value.pop("image_base64", None)
+            for item in value.values():
+                walk(item)
+        elif isinstance(value, list):
+            for item in value:
+                walk(item)
+    for doc in docs:
+        if isinstance(getattr(doc, "metadata", None), dict):
+            walk(doc.metadata)
+
+
 #: Seconds an HTTP deletion waits for an ingestion of the same source to end, before answering 409 (retry later)
 DELETE_WAIT_SECONDS = 5
 
@@ -823,6 +838,12 @@ class RabbitHole:
             "rabbithole_collects_document_images", [], super_docs, caller=self._resolve_caller(False),
         ) or []
 
+        # The hook dispatcher deep-copies its arguments, so a plugin stripping the transient
+        # image payload only mutates its own copy. Strip it from the core's own documents
+        # here (right after the hook, before chunking) so it never reaches the chunker, the
+        # vector DB metadata or the LLM context on recall. The collected images are kept.
+        _strip_image_payload(super_docs)
+
         # Split
         await self._send_notification_message("Parsing completed. Now let's go with reading process...")
         docs = await self._split_text(docs=super_docs)
@@ -840,7 +861,7 @@ class RabbitHole:
             # saved as files separately, so their content must never reach the vector
             # DB metadata (and from there the LLM context on recall). This also covers
             # direct callers that pass documents still carrying image_base64.
-            doc.metadata.pop("image_base64", None)
+            _strip_image_payload([doc])
             doc.metadata = (
                     doc.metadata
                     | metadata
