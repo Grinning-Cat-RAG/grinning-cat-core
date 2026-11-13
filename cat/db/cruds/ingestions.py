@@ -19,7 +19,9 @@ transfer (``agents:<agent_id>:ingestion_vector_transfer``: ``since``, ``beat``) 
 end, with no TTL: the automatic resume takes over a transfer whose heartbeat stopped. Public API: maintenance scripts
 read and reset the states through this module.
 """
+import asyncio
 import hashlib
+import os
 import re
 import time
 from enum import Enum
@@ -28,14 +30,20 @@ from typing import Any, Dict, Iterable, List
 from redis.exceptions import ResponseError
 
 from cat.db import crud
+from cat.db.cruds import conversations as crud_conversations
 from cat.db.database import DEFAULT_AGENTS_KEY, DEFAULT_INGESTION_KEY, get_async_db
+from cat.log import log
+from cat.services.memory.models import VectorMemoryType
 
 #: ``list_statuses(agent_id, chat_id=ALL_SCOPES)``: the rows of the knowledge base and of every chat.
 ALL_SCOPES = object()
 
 SOURCE_TYPES = ("file", "url")
 
-_UPDATABLE_FIELDS = {"status", "phase", "error", "owner", "deleted_phases", "content_type"}
+_UPDATABLE_FIELDS = {
+    "status", "phase", "error", "owner", "deleted_phases", "content_type", "embedder_name",
+    "chunker_name",
+}
 #: The ids of the phases: lowercase letters, digits and underscores, starting with a letter.
 PHASE_ID = re.compile(r"^[a-z][a-z0-9_]*$")
 _SOURCE_ID = re.compile(r"^[0-9a-f]{64}$")
@@ -144,8 +152,12 @@ async def create_status(
     type_: str,
     content_type: str | None = None,
     metadata: Dict | None = None,
+    embedder_name: str | None = None,
+    chunker_name: str | None = None,
 ) -> Dict:
-    """Start the lifecycle of a source: the row is written from scratch, ``uploaded``, with an empty diary."""
+    """Start the lifecycle of a source: the row is written from scratch, ``uploaded``, with an empty diary.
+
+    ``embedder_name``/``chunker_name`` are optional metadata of the services that produced the stored artifacts."""
     if type_ not in SOURCE_TYPES:
         raise ValueError(f"Invalid source type {type_!r}: one of {SOURCE_TYPES}")
     now = _now()
@@ -164,6 +176,10 @@ async def create_status(
         "created_at": now,
         "updated_at": now,
     }
+    if embedder_name is not None:
+        row["embedder_name"] = embedder_name
+    if chunker_name is not None:
+        row["chunker_name"] = chunker_name
     await crud.store(format_key(agent_id, chat_id, source), row)
     return row
 
@@ -226,6 +242,89 @@ async def list_statuses(agent_id: str, chat_id: Any = ALL_SCOPES) -> List[Dict]:
         return []
     values = await get_async_db().json().mget(keys, "$")
     return [row for row in (_unwrap(v) for v in values) if row]
+
+
+def _row_folder(agent_id: str, chat_id: str | None) -> str:
+    """The folder of a source of the agent's knowledge base (``chat_id=None``) or of a chat."""
+    return agent_id if chat_id is None else os.path.join(agent_id, chat_id)
+
+
+async def _source_is_kept(file_manager, agent_id: str, chat_id: str | None, source: str) -> bool:
+    """Whether the canonical bytes of a source are still there: the uploaded file or the copy kept by the RabbitHole."""
+    from cat.rabbit_hole.chunks import FOLDER
+
+    folder = _row_folder(agent_id, chat_id)
+    kept = os.path.join(FOLDER, f"{source_id(source)}.source")
+    for name in (source, kept):
+        if await asyncio.to_thread(file_manager.file_exists, name, folder):
+            return True
+    return False
+
+
+async def _canonical_urls(ccat, collection: str, chat_id: str | None) -> set | None:
+    """The URL sources still derivable from the web points of a scope (``None`` when the store cannot be read)."""
+    try:
+        points, _ = await ccat.vector_memory_handler.get_all_tenant_points_from_web(collection)
+    except Exception as e:  # noqa: BLE001 - a store failure must not purge anything
+        log.error(f"Ingestion reconcile: cannot read the web points of {collection}: {e}")
+        return None
+    sources = set()
+    for point in points:
+        metadata = (point.payload or {}).get("metadata") or {}
+        if metadata.get("chat_id") != chat_id:
+            continue
+        if metadata.get("source"):
+            sources.add(metadata["source"])
+    return sources
+
+
+async def reconcile_statuses(agent_id: str, ccat, chat_id: Any = ALL_SCOPES) -> List[Dict]:
+    """Purge the ``completed`` rows whose canonical source vanished: the file, the URL web points, the conversation.
+
+    In-flight rows, failed rows and any other non-terminal state are never touched: their source is legitimately not
+    in the canonical lists yet (or the failure is kept for the user to dismiss). Returns the purged rows.
+
+    A store failure (file manager, vector database) leaves the row in place: a transient error must not hide states.
+    """
+    purged: List[Dict] = []
+    url_cache: Dict[tuple, set | None] = {}
+    for row in await list_statuses(agent_id, chat_id):
+        if row.get("status") != IngestionStatus.COMPLETED.value:
+            continue
+        source, scope = row.get("source"), row.get("chat_id")
+        if not source:
+            continue
+
+        if scope is not None and not await crud_conversations.get_user_id_from_conversation_keys(agent_id, scope):
+            await delete_status(agent_id, scope, source)
+            purged.append(row)
+            continue
+
+        gone = False
+        type_ = row.get("type")
+        if type_ == "file":
+            try:
+                gone = not await _source_is_kept(ccat.file_manager, agent_id, scope, source)
+            except Exception as e:  # noqa: BLE001 - a store failure must not purge anything
+                log.error(f"Ingestion reconcile: cannot check the file {source}: {e}")
+                continue
+        elif type_ == "url":
+            collection = str(VectorMemoryType.DECLARATIVE if scope is None else VectorMemoryType.EPISODIC)
+            if scope not in url_cache:
+                url_cache[scope] = await _canonical_urls(ccat, collection, scope)
+            urls = url_cache[scope]
+            if urls is not None:
+                gone = source not in urls
+
+        if not gone:
+            continue
+        try:
+            await delete_status(agent_id, scope, source)
+        except Exception as e:  # noqa: BLE001 - the next pass retries
+            log.error(f"Ingestion reconcile: cannot purge {source}: {e}")
+            continue
+        purged.append(row)
+    return purged
 
 
 async def reset_phase_entries_for_agent(agent_id: str, phase_ids: Iterable[str]) -> int:

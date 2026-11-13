@@ -98,6 +98,13 @@ async def resume_agent(lizard, agent_id: str) -> None:
                     return  # the vector database is being changed (on any pod), even if its marker was cleared
                 await ccat.take_over_dead_vector_transfer(transfer["since"])
                 rows = await crud_ingestions.list_statuses(agent_id)
+            try:
+                purged = await crud_ingestions.reconcile_statuses(agent_id, ccat)
+            except Exception as e:  # noqa: BLE001 - a reconcile failure must not stop the resume
+                log.error(f"Agent id: {agent_id}. Reconcile of the ingestion states failed: {e}")
+                purged = []
+            if purged:
+                rows = await crud_ingestions.list_statuses(agent_id)
             rabbit_hole = copy.copy(lizard.rabbit_hole)
             await rabbit_hole.setup(ccat)
             phases = await engine.collect_phases(rabbit_hole, ccat)

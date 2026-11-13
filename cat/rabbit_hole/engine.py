@@ -23,6 +23,8 @@ from cat.db.database import get_async_db
 from cat.env import get_env_int
 from cat.log import log
 from cat.rabbit_hole.phases import (
+    PHASE_EMBEDDING,
+    PHASE_PARSING_CHUNKING,
     EmbeddingPhase,
     IngestionPhase,
     IngestionSource,
@@ -261,6 +263,21 @@ def _has_work(ordered: List[IngestionPhase], tags: Dict[str, str], diary: Dict[s
     return any(_decide(phase, tags, diary, set()) is not None for phase in ordered)
 
 
+async def _phase_metadata(phase: IngestionPhase, cat) -> Dict:
+    """The service name that produces the artifacts of a phase, recorded on the row at the start of the phase."""
+    if phase.id == PHASE_PARSING_CHUNKING:
+        name = getattr(getattr(cat, "chunker", None), "name", None)
+        return {"chunker_name": str(name)} if name else {}
+    if phase.id == PHASE_EMBEDDING:
+        try:
+            embedder = await cat.lizard.embedder()
+        except Exception:  # noqa: BLE001 - the metadata is optional, the phase decides about a real failure
+            return {}
+        name = getattr(embedder, "name", None) or embedder.__class__.__name__
+        return {"embedder_name": str(name)} if name else {}
+    return {}
+
+
 async def _run_ordered(ordered, tags, diary, ran, source, cat, write, record, *, reindexing: bool = False) -> None:
     """Run the stale phases in order, recording each one when it ends (``diary`` and ``ran`` are updated)."""
     await write(
@@ -278,7 +295,7 @@ async def _run_ordered(ordered, tags, diary, ran, source, cat, write, record, *,
             ran.add(phase.id)
             continue
 
-        await write(phase=phase.id)
+        await write(phase=phase.id, **await _phase_metadata(phase, cat))
         applies, reason = await phase.applies_to(source, cat)
         if not applies:
             result = PhaseResult(status="skipped", reason=reason)
