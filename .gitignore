@@ -50,3 +50,7 @@ compose*.yml*
 **/.pod_id
 **/.welcome
 .hypothesis/
+# local agent tooling
+.opencode
+.omo
+AGENTS.md
