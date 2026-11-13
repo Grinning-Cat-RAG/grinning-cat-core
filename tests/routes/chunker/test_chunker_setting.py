@@ -121,3 +121,52 @@ async def test_forbidden_access_wrong_permissions(secure_client, secure_client_h
     response = await client.get("/chunking/settings", headers={"Authorization": f"Bearer {received_token}", "X-Agent-ID": agent_id})
     assert response.status_code == 403
     assert response.json()["detail"] == "Forbidden"
+
+
+async def test_upsert_chunker_setting_material_change_schedules_resume(
+    secure_client, secure_client_headers, cheshire_cat, monkeypatch
+):
+    scheduled = []
+
+    def fake_run_background_task(background_tasks, func, *args, **kwargs):
+        scheduled.append((func, args, kwargs))
+
+    monkeypatch.setattr("cat.routes.chunker.run_background_task", fake_run_background_task)
+
+    response = await secure_client.put(
+        "/chunking/settings/RecursiveTextChunkerSettings",
+        json={"chunk_size": 128},
+        headers=secure_client_headers,
+    )
+
+    assert response.status_code == 200
+    assert len(scheduled) == 1
+    from cat.routes import chunker
+    func, args, kwargs = scheduled[0]
+    assert func is chunker.resume_agent
+    assert args[1] == cheshire_cat.agent_key
+
+
+async def test_upsert_chunker_setting_without_material_change_does_not_schedule_resume(
+    secure_client, secure_client_headers, cheshire_cat, monkeypatch
+):
+    scheduled = []
+
+    def fake_run_background_task(background_tasks, func, *args, **kwargs):
+        scheduled.append((func, args, kwargs))
+
+    monkeypatch.setattr("cat.routes.chunker.run_background_task", fake_run_background_task)
+
+    response = await secure_client.get("/chunking/settings", headers=secure_client_headers)
+    json = response.json()
+    chunker_name = json["selected_configuration"]
+    current_value = [s for s in json["settings"] if s["name"] == chunker_name][0]["value"]
+
+    response = await secure_client.put(
+        f"/chunking/settings/{chunker_name}",
+        json=current_value,
+        headers=secure_client_headers,
+    )
+
+    assert response.status_code == 200
+    assert scheduled == []
