@@ -275,6 +275,74 @@ async def test_text_points_do_not_carry_image_base64(cheshire_cat, monkeypatch):
     assert text_metadata["other_metadata"] == "keep me"
 
 
+async def test_parse_to_docs_strips_nested_image_payload_after_the_hook(cheshire_cat, monkeypatch):
+    """The transient image payload must be stripped at every depth, after the collection hook.
+
+    A multimodal parser can nest its per-image metadata under ``source_chunks``
+    (and deeper): the recursive walker removes every ``image_base64`` key while
+    leaving ``source_chunks`` and ``coordinates`` untouched, and the images the
+    hook collected are still returned to the embedding phase.
+    """
+    docs = [
+        Document(
+            page_content="chunk",
+            metadata={
+                "image_base64": "root",
+                "coordinates": {"page": 2},
+                "source_chunks": [
+                    {
+                        "text": "a",
+                        "metadata": {
+                            "image_base64": "nested",
+                            "coordinates": {"page": 1, "bbox": [1, 2, 3, 4]},
+                            "source_chunks": [{"metadata": {"image_base64": "deep"}}],
+                        },
+                    },
+                ],
+            },
+        )
+    ]
+    images = [{"image_base64": "AAA", "image_bytes": b"x", "image_mime_type": "image/png"}]
+
+    async def fake_run_in_ingestion_executor(func, *args, **kwargs):
+        return docs
+
+    def fake_parse(self, blob):
+        return docs
+
+    async def fake_split(self, docs):
+        return docs
+
+    original_execute_hook = cheshire_cat.plugin_manager.execute_hook
+
+    async def fake_execute_hook(hook_name, *args, caller=None):
+        if hook_name == "rabbithole_collects_document_images":
+            return list(images)
+        return await original_execute_hook(hook_name, *args, caller=caller)
+
+    monkeypatch.setattr("cat.rabbit_hole.core.run_in_ingestion_executor", fake_run_in_ingestion_executor)
+    monkeypatch.setattr(MimeTypeBasedParser, "parse", fake_parse)
+    monkeypatch.setattr(RabbitHole, "_split_text", fake_split)
+    monkeypatch.setattr(cheshire_cat.plugin_manager, "execute_hook", fake_execute_hook)
+
+    rabbit_hole = RabbitHole()
+    rabbit_hole.cat = cheshire_cat
+    rabbit_hole.stray = None
+
+    parsed, returned = await rabbit_hole._parse_to_docs(
+        source="test.txt", file_bytes=b"hello world", content_type="text/plain"
+    )
+
+    assert returned == images
+    metadata = parsed[0].metadata
+    assert "image_base64" not in metadata
+    assert metadata["coordinates"] == {"page": 2}
+    chunk = metadata["source_chunks"][0]["metadata"]
+    assert "image_base64" not in chunk
+    assert chunk["coordinates"] == {"page": 1, "bbox": [1, 2, 3, 4]}
+    assert "image_base64" not in chunk["source_chunks"][0]["metadata"]
+
+
 def test_agent_id_is_test_agent(cheshire_cat):
     # guard that tests run against the expected agent key
     assert cheshire_cat.agent_key == agent_id
