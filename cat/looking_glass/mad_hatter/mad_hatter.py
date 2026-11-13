@@ -71,15 +71,19 @@ class MadHatter:
         # stored list was customized without them
         active_plugins.extend(self.get_non_toggleable_plugin_ids)
 
-        # Remove duplicates while preserving insertion order
-        active_plugins = utils.deduplicate_list(active_plugins)
-
-        # ...except the ones BillTheLizard runs on its own behalf: an agent
-        # carries neither them nor their `agents:<id>:plugins:*` keys
-        if self.agent_key != DEFAULT_SYSTEM_KEY:
+        # System-only plugins are instance-level services (white_rabbit,
+        # march_hare, mgmt_message): they are loaded on the SYSTEM manager
+        # (BillTheLizard's own, which is what runs them), and never on a user
+        # agent. The system manager gets them even when the stored list predates
+        # them; user agents never carry them nor their `agents:<id>:plugins:*`
+        # keys.
+        if self.agent_key == DEFAULT_SYSTEM_KEY:
+            active_plugins.extend(self.get_system_only_plugin_ids)
+        else:
             active_plugins = [p for p in active_plugins if p not in self.get_system_only_plugin_ids]
 
-        return active_plugins
+        # Remove duplicates while preserving insertion order
+        return utils.deduplicate_list(active_plugins)
 
     async def install_plugin(self, package_plugin: str) -> str:
         """

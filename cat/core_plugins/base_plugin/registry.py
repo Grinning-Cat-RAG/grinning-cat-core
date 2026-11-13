@@ -3,9 +3,13 @@ from typing import List
 import httpx
 
 from cat import PluginRegistry
+from cat.env import get_env_bool
+from cat.exceptions import CustomValidationException
 from cat.log import log
 from cat.looking_glass.models import PluginManifest
 from cat.utils import write_temp_file
+
+_registry_search_disabled_logged = False
 
 
 class CheshireCatPluginRegistry(PluginRegistry):
@@ -14,6 +18,16 @@ class CheshireCatPluginRegistry(PluginRegistry):
         return "https://grinning-cat-plugins-backend-latest.onrender.com"
 
     async def search_plugins(self, query: str = None) -> List[PluginManifest]:
+        if not get_env_bool("CAT_PLUGINS_REGISTRY_SEARCH_ENABLED"):
+            global _registry_search_disabled_logged
+            if not _registry_search_disabled_logged:
+                log.info(
+                    "Remote plugins registry search is disabled "
+                    "(CAT_PLUGINS_REGISTRY_SEARCH_ENABLED=false); only local plugins will be listed"
+                )
+                _registry_search_disabled_logged = True
+            return []
+
         try:
             async with httpx.AsyncClient(timeout=10) as client:
                 # search plugins if a query is provided, list plugins (no search) otherwise
@@ -44,6 +58,12 @@ class CheshireCatPluginRegistry(PluginRegistry):
             return []
 
     async def download_plugin(self, url: str) -> str:
+        if not get_env_bool("CAT_PLUGINS_REGISTRY_SEARCH_ENABLED"):
+            raise CustomValidationException(
+                "The remote plugins registry is disabled "
+                "(CAT_PLUGINS_REGISTRY_SEARCH_ENABLED=false)"
+            )
+
         log.info(f"Downloading {url}")
 
         payload = {"url": url}
