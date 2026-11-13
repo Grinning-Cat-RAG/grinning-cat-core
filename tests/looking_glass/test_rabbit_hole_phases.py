@@ -966,3 +966,19 @@ async def test_the_embedding_reads_back_the_images_and_the_source_bytes(cheshire
 
     assert result.status == "done"
     assert seen["images"][0]["image_bytes"] == b"img" and seen["source_bytes"] == b"the source"
+
+
+async def test_a_fresh_source_without_stored_points_is_processed_again(cheshire_cat, local_files):
+    row = await ingest(cheshire_cat)
+    assert row["status"] == "completed"
+    assert await points_of(cheshire_cat, "story.txt")
+
+    await cheshire_cat.vector_memory_handler.delete_tenant_points(
+        str(VectorMemoryType.DECLARATIVE), {"source": "story.txt"},
+    )
+    assert await points_of(cheshire_cat, "story.txt") == []
+
+    row = await cheshire_cat.rabbit_hole.rerun_source(cheshire_cat, "story.txt")
+
+    assert row["status"] == "completed"
+    assert await points_of(cheshire_cat, "story.txt")

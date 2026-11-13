@@ -1483,3 +1483,15 @@ async def test_a_diary_naming_a_removed_phase_reingests_the_source(
     assert set(row["completed_phases"]) == {"parsing_chunking", "embedding"}  # every phase ran again
     assert parses == ["story.txt"]  # re-ingested from scratch
     assert any("removed_phase" in w and "no longer installed" in w for w in warnings)
+
+
+async def test_the_resume_purges_the_sources_of_a_destroyed_chat(lizard, cheshire_cat, files):
+    stray = await chat_of_a_user(cheshire_cat)
+    await ingest(stray, "kept.txt")
+    await crud_ingestions.create_status(cheshire_cat.agent_key, "gone-chat", "orphan.txt", type_="file")
+    await crud_ingestions.update_status(cheshire_cat.agent_key, "gone-chat", "orphan.txt", status="processing")
+
+    await recovery.resume_agent(lizard, cheshire_cat.agent_key)
+
+    assert await crud_ingestions.get_status(cheshire_cat.agent_key, "gone-chat", "orphan.txt") is None
+    assert await crud_ingestions.get_status(cheshire_cat.agent_key, "chat-1", "kept.txt") is not None
