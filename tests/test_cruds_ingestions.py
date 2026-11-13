@@ -690,3 +690,25 @@ async def test_reconcile_purges_a_chat_row_whose_conversation_is_gone():
 
     assert [row["source"] for row in purged] == ["chat.pdf"]
     assert await crud_ingestions.get_status("a1", "c1", "chat.pdf") is None
+
+
+def test_source_warnings_are_aggregated_and_normalized():
+    row = {
+        "completed_phases": {
+            "parsing_chunking": {"state": "complete", "warnings": [{"code": " MiXeD Code! ", "detail": "x"}]},
+            "graph": {
+                "state": "complete",
+                "warnings": [{"code": ""}, {"code": None}, {"detail": "no code"}, "Some Thing"],
+            },
+            "embedding": {"state": "complete"},
+        }
+    }
+
+    warnings = crud_ingestions.source_warnings(row)
+
+    assert [warning["code"] for warning in warnings] == [
+        "mixed_code", "unknown", "unknown", "unknown", "some_thing",
+    ]
+    assert warnings[0]["detail"] == "x"
+    assert crud_ingestions.normalize_warning_code("A--B") == "a_b"
+    assert crud_ingestions.normalize_warning_code(42) == crud_ingestions.WARNING_CODE_UNKNOWN

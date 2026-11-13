@@ -85,6 +85,33 @@ def source_id(source: str) -> str:
     return hashlib.sha256(source.encode("utf-8")).hexdigest()
 
 
+#: The code of a warning that carries none (or not a usable one).
+WARNING_CODE_UNKNOWN = "unknown"
+
+
+def normalize_warning_code(code: Any) -> str:
+    """The canonical code of a warning: lowercase, words joined by underscores; ``unknown`` when unusable."""
+    if not isinstance(code, str):
+        return WARNING_CODE_UNKNOWN
+    normalized = re.sub(r"[^a-z0-9]+", "_", code.strip().lower()).strip("_")
+    return normalized or WARNING_CODE_UNKNOWN
+
+
+def source_warnings(row: Dict) -> List[Dict]:
+    """The warnings of every phase in the diary of a row, with normalized codes, in execution order.
+
+    A warning is the dict a phase put in ``PhaseResult.warnings``; its ``code`` is normalized so clients can group the
+    warnings of a source without knowing the exact spelling used by each phase.
+    """
+    warnings: List[Dict] = []
+    for entry in (row.get("completed_phases") or {}).values():
+        for warning in (entry or {}).get("warnings") or []:
+            normalized = dict(warning) if isinstance(warning, dict) else {"code": warning}
+            normalized["code"] = normalize_warning_code(normalized.get("code"))
+            warnings.append(normalized)
+    return warnings
+
+
 def _prefix(agent_id: str) -> str:
     return f"{DEFAULT_AGENTS_KEY}:{agent_id}:{DEFAULT_INGESTION_KEY}:"
 
