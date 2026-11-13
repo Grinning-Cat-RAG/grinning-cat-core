@@ -352,3 +352,39 @@ async def test_a_user_deleted_meanwhile_is_not_found(secure_client, secure_clien
     monkeypatch.setattr(crud_users, "delete_user", already_deleted)
     response = await secure_client.delete(f"/users/{user_id}", headers=secure_client_headers)
     assert response.status_code == 404
+
+
+def test_user_response_still_validates_a_known_resource():
+    from cat.routes.users import UserResponse
+
+    user = UserResponse(
+        id="u1", username="Alice", created_at=1.0, updated_at=1.0,
+        permissions={str(AuthResource.MEMORY): [str(AuthPermission.READ)]},
+    )
+    assert user.permissions == {str(AuthResource.MEMORY): [str(AuthPermission.READ)]}
+
+
+async def test_get_users_tolerates_a_stored_unknown_permission_resource(
+    secure_client, secure_client_headers, cheshire_cat,
+):
+    from cat.db.cruds import users as crud_users
+
+    stored = await crud_users.create_user(
+        cheshire_cat.agent_key,
+        {
+            "username": "Ingrid",
+            "password": "password",
+            "permissions": {
+                "INGESTION": [str(AuthPermission.READ)],
+                str(AuthResource.MEMORY): [str(AuthPermission.READ)],
+            },
+        },
+    )
+    assert stored["permissions"]["INGESTION"] == [str(AuthPermission.READ)]
+
+    response = await secure_client.get("/users/", headers=secure_client_headers)
+
+    assert response.status_code == 200
+    users = {user["username"]: user for user in response.json()}
+    assert users["Ingrid"]["permissions"]["INGESTION"] == [str(AuthPermission.READ)]
+    assert users["Ingrid"]["permissions"][str(AuthResource.MEMORY)] == [str(AuthPermission.READ)]
