@@ -8,6 +8,7 @@ from cat.auth.permissions import AuthPermission, AuthResource, get_base_permissi
 from cat.db.cruds import conversations as crud_conversations
 from cat.db.cruds import users as crud_users
 from cat.exceptions import CustomNotFoundException, CustomValidationException
+from cat.log import log
 from cat.routes.routes_utils import validate_permissions as fnc_validate_permissions
 from cat.utils import sanitize_permissions
 
@@ -49,6 +50,24 @@ class UserResponse(UserBase):
     id: str
     created_at: float
     updated_at: float
+
+    @field_validator("permissions")
+    @classmethod
+    def validate_permissions(cls, v):
+        """Tolerate resources stored before they were removed from ``AuthResource``: a read must not 500 on them.
+
+        The known resources still validate normally; unknown ones are ignored (and logged), so a stale document
+        stays readable while the rest of its permissions are preserved as stored.
+        """
+        known = {}
+        for resource, permissions in v.items():
+            if resource not in AuthResource:
+                log.warning(f"Ignoring stored permission resource unknown to AuthResource: {resource}")
+                continue
+            known[resource] = permissions
+        if known:
+            fnc_validate_permissions(known, AuthResource)
+        return v
 
 
 @router.post("/", response_model=UserResponse)
