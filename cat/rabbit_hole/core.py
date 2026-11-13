@@ -426,9 +426,10 @@ class RabbitHole:
 
         ``invalidate``: phases to run again even if their diary says they are up to date (e.g. the embedding, once the
         collections were recreated); their dependents run again too (their entries are reset with them: a worker dying
-        in between leaves them to do). It waits for a worker holding the source, unless
-        ``blocking=False``. Returns the row of the source, or None when the source is gone (deleted, canceled) or held by
-        a live worker (``blocking=False``)."""
+        in between leaves them to do). A diary that names a phase no longer installed (a plugin uninstalled) is pruned
+        and every phase of the source runs again, so the source is re-ingested from scratch. It waits for a worker
+        holding the source, unless ``blocking=False``. Returns the row of the source, or None when the source is gone
+        (deleted, canceled) or held by a live worker (``blocking=False``)."""
         rabbit_hole = copy.copy(self)
         await rabbit_hole.setup(cat)
         ccat = rabbit_hole.cat
@@ -441,13 +442,40 @@ class RabbitHole:
                 if row is not None and row["status"] == IngestionStatus.DELETING.value:
                     await engine.delete_source(rabbit_hole, ccat, source)
                     return None
-                if row is not None and invalidate:
-                    await crud_ingestions.reset_phase_entries(
-                        source.agent_id, chat_id, name, await self._with_dependents(rabbit_hole, ccat, invalidate),
-                    )
+                if row is not None:
+                    removed = await self._removed_phases(rabbit_hole, ccat, row)
+                    if removed:
+                        # their classes are gone, so their delete cannot run and their points linger: the source is
+                        # re-ingested from scratch (its new points replace what the phases still installed produce)
+                        log.warning(
+                            f"Agent id: {source.agent_id}. The source {name} was ingested with phases no longer "
+                            f"installed: {', '.join(removed)}. It is re-ingested from scratch."
+                        )
+                        invalidate = sorted(await self._current_phase_ids(rabbit_hole, ccat))
+                    if invalidate or removed:
+                        reset_ids = (
+                            await self._with_dependents(rabbit_hole, ccat, invalidate) if invalidate else []
+                        )
+                        await crud_ingestions.reset_phase_entries(
+                            source.agent_id, chat_id, name, sorted({*reset_ids, *removed}),
+                        )
                 return await engine.run_phases(rabbit_hole, ccat, source)
         except (engine.LockError, engine.IngestionCanceled, engine.LockLost):
             return None
+
+    @staticmethod
+    async def _current_phase_ids(rabbit_hole, ccat) -> List[str]:
+        """The ids of the phases the agent has now; none when the graph of phases is invalid (``run_phases`` records
+        the error)."""
+        try:
+            return [phase.id for phase in await engine.collect_phases(rabbit_hole, ccat)]
+        except PhaseGraphError:
+            return []
+
+    async def _removed_phases(self, rabbit_hole, ccat, row: Dict) -> List[str]:
+        """The diary ids of the row that are no longer in the set of phases (a plugin installed or uninstalled)."""
+        current = set(await self._current_phase_ids(rabbit_hole, ccat))
+        return sorted(set(row.get("completed_phases") or {}) - current)
 
     async def invalidate_source(
         self,
@@ -514,7 +542,7 @@ class RabbitHole:
                     phases = await engine.collect_phases(rabbit_hole, ccat)
                     recorded = set(row.get("completed_phases") or {}) | {phase.id for phase in phases}
                     await crud_ingestions.reset_phase_entries(ccat.agent_key, chat_id, name, sorted(recorded))
-                return await engine.run_phases(rabbit_hole, ccat, source)
+                return await engine.run_phases(rabbit_hole, ccat, source, reindexing=True)
         except (engine.IngestionCanceled, engine.LockLost):
             return None
 
