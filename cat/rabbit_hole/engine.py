@@ -307,16 +307,11 @@ async def _run_ordered(ordered, tags, diary, ran, source, cat, write, record, *,
         await record(phase.id, diary[phase.id])
 
 
-async def delete_source(rabbit_hole, cat, source: IngestionSource) -> None:
-    """Remove the source from the memory of the agent: what every phase produced (in reverse order), the points still
-    tagged with it in every collection (also of a phase no longer installed), the files kept by the RabbitHole and the
-    row. An interrupted deletion resumes from the phases not yet removed (the row stays ``deleting`` meanwhile). The
-    lock of the source must be held."""
-    agent, chat, name = source.agent_id, source.chat_id, source.name
-    row = await crud_ingestions.get_status(agent, chat, name)
-    deleted = list(row.get("deleted_phases") or []) if row else []
-    if row is not None:
-        await crud_ingestions.update_status(agent, chat, name, status=IngestionStatus.DELETING, phase=None)
+async def _delete_phase_artifacts(rabbit_hole, cat, source: IngestionSource, deleted: List[str], persist) -> List[str]:
+    """Run the delete of every phase in reverse order, skipping the ones already removed (``deleted``).
+
+    ``persist(deleted)``, when given, records the phases removed so far: an interrupted deletion resumes from there.
+    """
     try:
         ordered = await collect_phases(rabbit_hole, cat)
     except PhaseGraphError:
@@ -326,17 +321,42 @@ async def delete_source(rabbit_hole, cat, source: IngestionSource) -> None:
             continue
         await phase.delete(source, cat)  # a failure leaves the row deleting, resumable
         deleted.append(phase.id)
-        if row is not None:
-            await crud_ingestions.update_status(agent, chat, name, deleted_phases=deleted)
+        if persist is not None:
+            await persist(deleted)
     # A phase that is no longer installed cannot run its own delete: purge what it left behind, in every collection a
     # phase writes sources to. Scoped by ``metadata.source`` so no other source (and no shared graph entity) is touched.
     for collection in (str(VectorMemoryType.DECLARATIVE), str(VectorMemoryType.EPISODIC)):
-        await cat.vector_memory_handler.delete_tenant_points(collection, {"source": name})
+        await cat.vector_memory_handler.delete_tenant_points(collection, {"source": source.name})
+    return deleted
+
+
+async def purge_source_artifacts(rabbit_hole, cat, source: IngestionSource) -> None:
+    """Remove what every phase produced for the source (in reverse order), keeping its status row.
+
+    Reusable by a reindex, which repopulates the row and the artifacts instead of deleting the source. The lock of the
+    source must be held."""
+    await _delete_phase_artifacts(rabbit_hole, cat, source, [], None)
+
+
+async def delete_source(rabbit_hole, cat, source: IngestionSource) -> None:
+    """Remove the source from the memory of the agent: what every phase produced (in reverse order), the files kept by
+    the RabbitHole and the row. An interrupted deletion resumes from the phases not yet removed (the row stays
+    ``deleting`` meanwhile). The lock of the source must be held."""
+    agent, chat, name = source.agent_id, source.chat_id, source.name
+    row = await crud_ingestions.get_status(agent, chat, name)
+    deleted = list(row.get("deleted_phases") or []) if row else []
+    if row is not None:
+        await crud_ingestions.update_status(agent, chat, name, status=IngestionStatus.DELETING, phase=None)
+
+    async def persist(removed: List[str]) -> None:
+        await crud_ingestions.update_status(agent, chat, name, deleted_phases=removed)
+
+    await _delete_phase_artifacts(rabbit_hole, cat, source, deleted, persist if row is not None else None)
     await crud_ingestions.delete_status(agent, chat, name)
 
 
 __all__ = [
     "BOOT_ID", "OWNER", "IngestionCanceled", "LockError", "LockLost", "agent_exists", "collect_phases",
-    "delete_source",
+    "delete_source", "purge_source_artifacts",
     "heartbeat_seconds", "lock_timeout_seconds", "run_phases", "source_lock",
 ]
