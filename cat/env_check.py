@@ -58,6 +58,15 @@ def _check_number(
         report.errors.append(f"{name} is out of range (got {raw!r})")
 
 
+def _check_bool(report: EnvReport, name: str) -> None:
+    raw = get_env(name)
+    if raw is None or str(raw).strip() == "":
+        report.errors.append(f"{name} is not set")
+        return
+    if str(raw).strip() not in ("true", "false", "1", "0"):
+        report.errors.append(f"{name} must be a boolean value (true/false/1/0, got {raw!r})")
+
+
 def _check_required(report: EnvReport, name: str) -> None:
     value = get_env(name)
     if value is None or not str(value).strip():
@@ -106,6 +115,10 @@ def validate_env() -> EnvReport:
     _check_required(report, "CAT_CRYPTO_KEY")
     _check_required(report, "CAT_CRYPTO_SALT")
     _check_required(report, "CAT_ADMIN_DEFAULT_PASSWORD")
+
+    # --- ingestion ------------------------------------------------------------------------------------------------
+    _check_bool(report, "CAT_INGESTION_SPLIT_OVERSIZED")
+    _check_number(report, "CAT_INGESTION_SPLIT_MAX_TOKENS", int, min_value=1)
 
     # --- CORS / Origin allow-list ---------------------------------------------------------------------------------
     for origin in parse_allowed_origins() or []:
