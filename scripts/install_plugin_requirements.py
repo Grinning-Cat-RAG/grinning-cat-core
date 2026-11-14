@@ -65,8 +65,15 @@ def compile_and_install(pyproject_file: str, constraints: list) -> None:
     with open(pyproject_file, "r") as f:
         pyproject_text = f.read()
 
+    # Resolve only the current platform: a universal lock also spans platforms the
+    # image never runs on (e.g. win32), where unrelated plugins' dependencies can
+    # be unsatisfiable and abort the whole install. uv's own hint is to limit the
+    # environments; `sys.platform` is linux/darwin/win32, the same values the
+    # `sys_platform` marker uses.
     constraint_block = (
-        "\n[tool.uv]\nconstraint-dependencies = [\n"
+        "\n[tool.uv]\n"
+        f'environments = ["sys_platform == \'{sys.platform}\'"]\n'
+        "constraint-dependencies = [\n"
         + "".join(f'    "{c}",\n' for c in constraints)
         + "]\n"
     )
