@@ -27,9 +27,6 @@ def get_supported_env_variables():
         "CAT_AUTH_MAX_FAILURES_PER_USER": "10",  # failed logins per username per window
         "CAT_AUTH_MAX_REFRESH_PER_IP": "120",  # refresh calls per IP per window
         "CAT_HTTPS_PROXY_MODE": "false",
-        # when false, the remote plugins registry is never contacted for either
-        # search or download (air-gapped / privacy deployments)
-        "CAT_PLUGINS_REGISTRY_SEARCH_ENABLED": "true",
         "CAT_HISTORY_EXPIRATION": None,  # in minutes
         "CAT_CRYPTO_KEY": None, # REQUIRED: no default, the app refuses to start without a strong secret
         "CAT_CRYPTO_SALT": None, # REQUIRED: no default, the app refuses to start without a strong secret
