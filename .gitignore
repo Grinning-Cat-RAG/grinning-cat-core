@@ -4,6 +4,11 @@ __pycache__
 *mypy_cache
 *.pytest_cache
 
+# OpenCode
+.omo
+.opencode
+AGENTS.md
+
 # python local dev
 venv
 .venv
@@ -37,6 +42,12 @@ static/*
 cat/plugins/*
 # plugins readme can stay
 !cat/plugins/how-to-write-a-plugin.md
+
+# dev-only symlinks into external plugin repos / tmp test fixtures (never commit)
+cat/core_plugins/cat_efficient_ingestion
+cat/core_plugins/cat_multimodal_ingestion
+cat/core_plugins/effing_test_base
+tests/core_plugins/__pycache__/
 
 # per-plugin dependency lock artifacts: compiled fresh on every install
 cat/core_plugins/*/uv.lock
