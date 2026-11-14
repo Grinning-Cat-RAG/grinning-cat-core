@@ -4,6 +4,7 @@ One row per source, in the knowledge base of the agent (``chat_id=None``) or in 
 """
 import asyncio
 import hashlib
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -596,3 +597,118 @@ async def test_the_record_of_a_vector_transfer_lives_until_it_is_ended():
     assert await crud_ingestions.get_vector_transfer("a1") is None
     await crud_ingestions.beat_vector_transfer("a1", since)  # a late heartbeat does not bring it back
     assert await crud_ingestions.get_vector_transfer("a1") is None
+
+
+# --- optional service metadata and the canonical-source reconcile -----------------------------------------------
+
+class FakeFileManager:
+    def __init__(self, files=()):
+        self.files = set(files)
+
+    def file_exists(self, filename, remote_root_dir=None):
+        return filename in self.files
+
+
+class FakeVectorMemory:
+    def __init__(self, urls=()):
+        self.urls = set(urls)
+
+    async def get_all_tenant_points_from_web(self, collection_name):
+        return [SimpleNamespace(payload={"metadata": {"source": url}}) for url in self.urls], None
+
+
+def fake_ccat(files=(), urls=()):
+    return SimpleNamespace(file_manager=FakeFileManager(files), vector_memory_handler=FakeVectorMemory(urls))
+
+
+async def test_the_embedder_and_chunker_names_round_trip():
+    row = await _create(source="named.pdf")
+    assert "embedder_name" not in row and "chunker_name" not in row
+
+    row = await crud_ingestions.create_status(
+        "a1", KB, "named.pdf", type_="file", embedder_name="embedder-x", chunker_name="chunker-y",
+    )
+    stored = await crud_ingestions.get_status("a1", KB, "named.pdf")
+    assert (stored["embedder_name"], stored["chunker_name"]) == ("embedder-x", "chunker-y")
+
+    await crud_ingestions.update_status("a1", KB, "named.pdf", embedder_name="embedder-z")
+    stored = await crud_ingestions.get_status("a1", KB, "named.pdf")
+    assert (stored["embedder_name"], stored["chunker_name"]) == ("embedder-z", "chunker-y")
+
+
+async def test_reconcile_purges_a_completed_file_whose_file_vanished():
+    await _create(source="gone.pdf")
+    await crud_ingestions.update_status("a1", KB, "gone.pdf", status="completed")
+
+    purged = await crud_ingestions.reconcile_statuses("a1", fake_ccat(), KB)
+
+    assert [row["source"] for row in purged] == ["gone.pdf"]
+    assert await crud_ingestions.get_status("a1", KB, "gone.pdf") is None
+
+
+async def test_reconcile_keeps_a_completed_file_that_is_still_there():
+    await _create(source="here.pdf")
+    await crud_ingestions.update_status("a1", KB, "here.pdf", status="completed")
+
+    purged = await crud_ingestions.reconcile_statuses("a1", fake_ccat(files={"here.pdf"}), KB)
+
+    assert purged == []
+    assert await crud_ingestions.get_status("a1", KB, "here.pdf") is not None
+
+
+async def test_reconcile_never_touches_in_flight_or_failed_rows():
+    for source, status in (("run.pdf", "processing"), ("bad.pdf", "error"), ("up.pdf", "uploaded")):
+        await _create(source=source)
+        await crud_ingestions.update_status("a1", KB, source, status=status)
+
+    purged = await crud_ingestions.reconcile_statuses("a1", fake_ccat(), KB)
+
+    assert purged == []
+    for source in ("run.pdf", "bad.pdf", "up.pdf"):
+        assert await crud_ingestions.get_status("a1", KB, source) is not None
+
+
+async def test_reconcile_purges_a_completed_url_without_web_points_and_keeps_one_with_them():
+    await _create(source="https://gone.org/page", type_="url")
+    await crud_ingestions.update_status("a1", KB, "https://gone.org/page", status="completed")
+    await _create(source="https://kept.org/page", type_="url")
+    await crud_ingestions.update_status("a1", KB, "https://kept.org/page", status="completed")
+
+    purged = await crud_ingestions.reconcile_statuses(
+        "a1", fake_ccat(urls={"https://kept.org/page"}), KB,
+    )
+
+    assert [row["source"] for row in purged] == ["https://gone.org/page"]
+    assert await crud_ingestions.get_status("a1", KB, "https://kept.org/page") is not None
+
+
+async def test_reconcile_purges_a_chat_row_whose_conversation_is_gone():
+    await _create(chat_id="c1", source="chat.pdf")
+    await crud_ingestions.update_status("a1", "c1", "chat.pdf", status="completed")
+
+    purged = await crud_ingestions.reconcile_statuses("a1", fake_ccat(files={"chat.pdf"}), "c1")
+
+    assert [row["source"] for row in purged] == ["chat.pdf"]
+    assert await crud_ingestions.get_status("a1", "c1", "chat.pdf") is None
+
+
+def test_source_warnings_are_aggregated_and_normalized():
+    row = {
+        "completed_phases": {
+            "parsing_chunking": {"state": "complete", "warnings": [{"code": " MiXeD Code! ", "detail": "x"}]},
+            "graph": {
+                "state": "complete",
+                "warnings": [{"code": ""}, {"code": None}, {"detail": "no code"}, "Some Thing"],
+            },
+            "embedding": {"state": "complete"},
+        }
+    }
+
+    warnings = crud_ingestions.source_warnings(row)
+
+    assert [warning["code"] for warning in warnings] == [
+        "mixed_code", "unknown", "unknown", "unknown", "some_thing",
+    ]
+    assert warnings[0]["detail"] == "x"
+    assert crud_ingestions.normalize_warning_code("A--B") == "a_b"
+    assert crud_ingestions.normalize_warning_code(42) == crud_ingestions.WARNING_CODE_UNKNOWN

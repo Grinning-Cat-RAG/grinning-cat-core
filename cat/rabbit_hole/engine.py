@@ -22,7 +22,10 @@ from cat.db.cruds.ingestions import PHASE_ID, IngestionStatus
 from cat.db.database import get_async_db
 from cat.env import get_env_int
 from cat.log import log
+from cat.services.memory.models import VectorMemoryType
 from cat.rabbit_hole.phases import (
+    PHASE_EMBEDDING,
+    PHASE_PARSING_CHUNKING,
     EmbeddingPhase,
     IngestionPhase,
     IngestionSource,
@@ -156,9 +159,20 @@ def _entry(state: str, tag: str | None, result: PhaseResult | None = None, reaso
     return entry
 
 
+def phase_not_ready_budget(phase: IngestionPhase) -> float:
+    """The budget of ``not_ready`` for a phase: its environment override, its own seconds, or the generic budget."""
+    if phase.not_ready_budget_env:
+        value = get_env_int(phase.not_ready_budget_env)
+        if value is not None:
+            return value
+    if phase.not_ready_budget_seconds is not None:
+        return phase.not_ready_budget_seconds
+    return not_ready_budget_seconds()
+
+
 async def _run_phase(phase: IngestionPhase, source: IngestionSource, cat) -> PhaseResult:
     """Run the phase until it is done, skipped or failed: ``not_ready`` is retried within the budget of the phase."""
-    budget = phase.not_ready_budget_seconds if phase.not_ready_budget_seconds is not None else not_ready_budget_seconds()
+    budget = phase_not_ready_budget(phase)
     started = time.monotonic()
     while True:
         try:
@@ -176,8 +190,51 @@ async def _run_phase(phase: IngestionPhase, source: IngestionSource, cat) -> Pha
         await asyncio.sleep(retry_after)
 
 
-async def run_phases(rabbit_hole, cat, source: IngestionSource) -> Dict | None:
+async def _stored_points(cat, source: IngestionSource) -> int | None:
+    """The points stored for the source (``None`` when the store cannot be read: never force a re-processing on it)."""
+    collection = str(VectorMemoryType.DECLARATIVE if source.chat_id is None else VectorMemoryType.EPISODIC)
+    metadata = {"source": source.name}
+    if source.chat_id is not None:
+        metadata["chat_id"] = source.chat_id
+    try:
+        points, _ = await cat.vector_memory_handler.get_all_tenant_points(
+            collection, metadata=metadata, with_vectors=False,
+        )
+    except Exception as e:  # noqa: BLE001 - a store failure is not proof that the points are gone
+        log.warning(f"Agent id: {source.agent_id}. Cannot check the stored points of {source.name}: {e}")
+        return None
+    return len(points)
+
+
+async def store_grounded_freshness(ordered, tags, diary, cat, source: IngestionSource) -> bool:
+    """Ground the freshness of a source in the store: a fresh diary over zero stored points is stale.
+
+    When every phase is up to date (no work) and the two producing phases completed, but the source has no stored
+    point, their entries are dropped so ``parsing_chunking`` and ``embedding`` run again. Returns whether it forced
+    them.
+    """
+    if any(_decide(phase, tags, diary, set()) is not None for phase in ordered):
+        return False
+    producing = (PHASE_PARSING_CHUNKING, PHASE_EMBEDDING)
+    if any((diary.get(phase_id) or {}).get("state") != STATE_COMPLETE for phase_id in producing):
+        return False
+    stored = await _stored_points(cat, source)
+    if stored == 0:
+        log.warning(
+            f"Agent id: {source.agent_id}. The source {source.name} is up to date but has no stored points: "
+            f"processing it again"
+        )
+        for phase_id in producing:
+            diary.pop(phase_id, None)
+        return True
+    return False
+
+
+async def run_phases(rabbit_hole, cat, source: IngestionSource, *, reindexing: bool = False) -> Dict | None:
     """Run the stale phases of the source (the lock of the source must be held) and write its final state.
+
+    With ``reindexing`` the source is marked ``reindexing`` while its phases run (a full in-place reindex, e.g.
+    ``RabbitHole.reingest_source``), and back to ``completed``/``error`` when they end.
 
     Returns the final row, or None when the row does not exist anymore (the source was deleted meanwhile).
     """
@@ -216,9 +273,13 @@ async def run_phases(rabbit_hole, cat, source: IngestionSource) -> Dict | None:
     ran: set = set()
     terminal = row["status"] in (IngestionStatus.COMPLETED.value, IngestionStatus.ERROR.value)
     if terminal and not _has_work(ordered, tags, diary):
-        return row  # nothing changed: nothing is written (the periodic checks run on every finished source)
+        # the diary may be fresh while the store lost the source (e.g. its collection was recreated): the producing
+        # phases are forced again, so a source never looks up to date without its points
+        await store_grounded_freshness(ordered, tags, diary, cat, source)
+        if not _has_work(ordered, tags, diary):
+            return row  # nothing changed: nothing is written (the periodic checks run on every finished source)
     try:
-        await _run_ordered(ordered, tags, diary, ran, source, cat, write, record)
+        await _run_ordered(ordered, tags, diary, ran, source, cat, write, record, reindexing=reindexing)
         # the error of the source is the one of its first failed phase in execution order: the cause, not the
         # dependents failing after it
         errors = [diary[p.id] for p in ordered if diary.get(p.id, {}).get("state") == STATE_ERROR]
@@ -257,9 +318,26 @@ def _has_work(ordered: List[IngestionPhase], tags: Dict[str, str], diary: Dict[s
     return any(_decide(phase, tags, diary, set()) is not None for phase in ordered)
 
 
-async def _run_ordered(ordered, tags, diary, ran, source, cat, write, record) -> None:
+async def _phase_metadata(phase: IngestionPhase, cat) -> Dict:
+    """The service name that produces the artifacts of a phase, recorded on the row at the start of the phase."""
+    if phase.id == PHASE_PARSING_CHUNKING:
+        name = getattr(getattr(cat, "chunker", None), "name", None)
+        return {"chunker_name": str(name)} if name else {}
+    if phase.id == PHASE_EMBEDDING:
+        try:
+            embedder = await cat.lizard.embedder()
+        except Exception:  # noqa: BLE001 - the metadata is optional, the phase decides about a real failure
+            return {}
+        name = getattr(embedder, "name", None) or embedder.__class__.__name__
+        return {"embedder_name": str(name)} if name else {}
+    return {}
+
+
+async def _run_ordered(ordered, tags, diary, ran, source, cat, write, record, *, reindexing: bool = False) -> None:
     """Run the stale phases in order, recording each one when it ends (``diary`` and ``ran`` are updated)."""
-    await write(status=IngestionStatus.PROCESSING, owner=OWNER, error=None)
+    await write(
+        status=IngestionStatus.REINDEXING if reindexing else IngestionStatus.PROCESSING, owner=OWNER, error=None,
+    )
     for phase in ordered:
         decision = _decide(phase, tags, diary, ran)
         if decision is None:
@@ -272,7 +350,7 @@ async def _run_ordered(ordered, tags, diary, ran, source, cat, write, record) ->
             ran.add(phase.id)
             continue
 
-        await write(phase=phase.id)
+        await write(phase=phase.id, **await _phase_metadata(phase, cat))
         applies, reason = await phase.applies_to(source, cat)
         if not applies:
             result = PhaseResult(status="skipped", reason=reason)
@@ -284,15 +362,11 @@ async def _run_ordered(ordered, tags, diary, ran, source, cat, write, record) ->
         await record(phase.id, diary[phase.id])
 
 
-async def delete_source(rabbit_hole, cat, source: IngestionSource) -> None:
-    """Remove the source from the memory of the agent: what every phase produced (in reverse order), the files kept by
-    the RabbitHole and the row. An interrupted deletion resumes from the phases not yet removed (the row stays
-    ``deleting`` meanwhile). The lock of the source must be held."""
-    agent, chat, name = source.agent_id, source.chat_id, source.name
-    row = await crud_ingestions.get_status(agent, chat, name)
-    deleted = list(row.get("deleted_phases") or []) if row else []
-    if row is not None:
-        await crud_ingestions.update_status(agent, chat, name, status=IngestionStatus.DELETING, phase=None)
+async def _delete_phase_artifacts(rabbit_hole, cat, source: IngestionSource, deleted: List[str], persist) -> List[str]:
+    """Run the delete of every phase in reverse order, skipping the ones already removed (``deleted``).
+
+    ``persist(deleted)``, when given, records the phases removed so far: an interrupted deletion resumes from there.
+    """
     try:
         ordered = await collect_phases(rabbit_hole, cat)
     except PhaseGraphError:
@@ -302,13 +376,42 @@ async def delete_source(rabbit_hole, cat, source: IngestionSource) -> None:
             continue
         await phase.delete(source, cat)  # a failure leaves the row deleting, resumable
         deleted.append(phase.id)
-        if row is not None:
-            await crud_ingestions.update_status(agent, chat, name, deleted_phases=deleted)
+        if persist is not None:
+            await persist(deleted)
+    # A phase that is no longer installed cannot run its own delete: purge what it left behind, in every collection a
+    # phase writes sources to. Scoped by ``metadata.source`` so no other source (and no shared graph entity) is touched.
+    for collection in (str(VectorMemoryType.DECLARATIVE), str(VectorMemoryType.EPISODIC)):
+        await cat.vector_memory_handler.delete_tenant_points(collection, {"source": source.name})
+    return deleted
+
+
+async def purge_source_artifacts(rabbit_hole, cat, source: IngestionSource) -> None:
+    """Remove what every phase produced for the source (in reverse order), keeping its status row.
+
+    Reusable by a reindex, which repopulates the row and the artifacts instead of deleting the source. The lock of the
+    source must be held."""
+    await _delete_phase_artifacts(rabbit_hole, cat, source, [], None)
+
+
+async def delete_source(rabbit_hole, cat, source: IngestionSource) -> None:
+    """Remove the source from the memory of the agent: what every phase produced (in reverse order), the files kept by
+    the RabbitHole and the row. An interrupted deletion resumes from the phases not yet removed (the row stays
+    ``deleting`` meanwhile). The lock of the source must be held."""
+    agent, chat, name = source.agent_id, source.chat_id, source.name
+    row = await crud_ingestions.get_status(agent, chat, name)
+    deleted = list(row.get("deleted_phases") or []) if row else []
+    if row is not None:
+        await crud_ingestions.update_status(agent, chat, name, status=IngestionStatus.DELETING, phase=None)
+
+    async def persist(removed: List[str]) -> None:
+        await crud_ingestions.update_status(agent, chat, name, deleted_phases=removed)
+
+    await _delete_phase_artifacts(rabbit_hole, cat, source, deleted, persist if row is not None else None)
     await crud_ingestions.delete_status(agent, chat, name)
 
 
 __all__ = [
     "BOOT_ID", "OWNER", "IngestionCanceled", "LockError", "LockLost", "agent_exists", "collect_phases",
-    "delete_source",
-    "heartbeat_seconds", "lock_timeout_seconds", "run_phases", "source_lock",
+    "delete_source", "purge_source_artifacts",
+    "heartbeat_seconds", "lock_timeout_seconds", "run_phases", "source_lock", "store_grounded_freshness",
 ]

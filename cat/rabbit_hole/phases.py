@@ -45,7 +45,8 @@ class PhaseResult:
 
     - ``done``: completed (``processed``/``expected``/``warnings`` are kept in the diary);
     - ``not_ready``: retriable, not runnable yet: the RabbitHole retries after ``retry_after`` seconds, within the budget
-      of the phase (``IngestionPhase.not_ready_budget_seconds`` or ``CAT_INGESTION_NOT_READY_MAX_SECONDS``);
+      of the phase (``IngestionPhase.not_ready_budget_env`` when set and present in the environment,
+      ``IngestionPhase.not_ready_budget_seconds``, or ``CAT_INGESTION_NOT_READY_MAX_SECONDS``);
     - ``skipped``: nothing to do for this source (its dependents are skipped too);
     - ``error``: failed (its dependents fail too). An exception raised by the phase is an error.
     """
@@ -67,6 +68,8 @@ class IngestionPhase(ABC):
     label: str = ""
     depends_on: Tuple[str, ...] = ()
     not_ready_budget_seconds: float | None = None
+    #: The environment variable that overrides ``not_ready_budget_seconds`` for this phase (when set and present).
+    not_ready_budget_env: str | None = None
 
     async def settings(self, cat) -> Any:
         """The material settings of the phase: when they change, the phase (and its dependents) run again."""

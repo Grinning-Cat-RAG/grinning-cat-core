@@ -20,9 +20,10 @@ from cat.db.cruds import ingestions as crud_ingestions
 from cat.db.cruds.ingestions import IngestionStatus
 from cat.rabbit_hole import chunks, engine
 from cat.rabbit_hole.phases import PHASE_EMBEDDING, IngestionSource, PhaseGraphError, PhaseResult
+from cat.rabbit_hole.split import embedder_token_budget, split_oversized
 from cat.services.factory.embedder import embedding_size
 from cat.core_plugins.base_plugin.parsers import MimeTypeBasedParser
-from cat.env import get_env_int
+from cat.env import get_env_bool, get_env_int
 from cat.log import log
 from cat.services.factory.chunker import BaseChunker
 from cat.services.memory.models import PointStruct, VectorMemoryType
@@ -102,6 +103,21 @@ async def run_in_ingestion_executor(func, *args, **kwargs):
     return await asyncio.get_running_loop().run_in_executor(
         _get_ingestion_pool(), functools.partial(func, *args, **kwargs)
     )
+
+
+def _strip_image_payload(docs) -> None:
+    """Remove every ``image_base64`` key from each document metadata, at any depth."""
+    def walk(value) -> None:
+        if isinstance(value, dict):
+            value.pop("image_base64", None)
+            for item in value.values():
+                walk(item)
+        elif isinstance(value, list):
+            for item in value:
+                walk(item)
+    for doc in docs:
+        if isinstance(getattr(doc, "metadata", None), dict):
+            walk(doc.metadata)
 
 
 #: Seconds an HTTP deletion waits for an ingestion of the same source to end, before answering 409 (retry later)
@@ -425,9 +441,10 @@ class RabbitHole:
 
         ``invalidate``: phases to run again even if their diary says they are up to date (e.g. the embedding, once the
         collections were recreated); their dependents run again too (their entries are reset with them: a worker dying
-        in between leaves them to do). It waits for a worker holding the source, unless
-        ``blocking=False``. Returns the row of the source, or None when the source is gone (deleted, canceled) or held by
-        a live worker (``blocking=False``)."""
+        in between leaves them to do). A diary that names a phase no longer installed (a plugin uninstalled) is pruned
+        and every phase of the source runs again, so the source is re-ingested from scratch. It waits for a worker
+        holding the source, unless ``blocking=False``. Returns the row of the source, or None when the source is gone
+        (deleted, canceled) or held by a live worker (``blocking=False``)."""
         rabbit_hole = copy.copy(self)
         await rabbit_hole.setup(cat)
         ccat = rabbit_hole.cat
@@ -440,13 +457,40 @@ class RabbitHole:
                 if row is not None and row["status"] == IngestionStatus.DELETING.value:
                     await engine.delete_source(rabbit_hole, ccat, source)
                     return None
-                if row is not None and invalidate:
-                    await crud_ingestions.reset_phase_entries(
-                        source.agent_id, chat_id, name, await self._with_dependents(rabbit_hole, ccat, invalidate),
-                    )
+                if row is not None:
+                    removed = await self._removed_phases(rabbit_hole, ccat, row)
+                    if removed:
+                        # their classes are gone, so their delete cannot run and their points linger: the source is
+                        # re-ingested from scratch (its new points replace what the phases still installed produce)
+                        log.warning(
+                            f"Agent id: {source.agent_id}. The source {name} was ingested with phases no longer "
+                            f"installed: {', '.join(removed)}. It is re-ingested from scratch."
+                        )
+                        invalidate = sorted(await self._current_phase_ids(rabbit_hole, ccat))
+                    if invalidate or removed:
+                        reset_ids = (
+                            await self._with_dependents(rabbit_hole, ccat, invalidate) if invalidate else []
+                        )
+                        await crud_ingestions.reset_phase_entries(
+                            source.agent_id, chat_id, name, sorted({*reset_ids, *removed}),
+                        )
                 return await engine.run_phases(rabbit_hole, ccat, source)
         except (engine.LockError, engine.IngestionCanceled, engine.LockLost):
             return None
+
+    @staticmethod
+    async def _current_phase_ids(rabbit_hole, ccat) -> List[str]:
+        """The ids of the phases the agent has now; none when the graph of phases is invalid (``run_phases`` records
+        the error)."""
+        try:
+            return [phase.id for phase in await engine.collect_phases(rabbit_hole, ccat)]
+        except PhaseGraphError:
+            return []
+
+    async def _removed_phases(self, rabbit_hole, ccat, row: Dict) -> List[str]:
+        """The diary ids of the row that are no longer in the set of phases (a plugin installed or uninstalled)."""
+        current = set(await self._current_phase_ids(rabbit_hole, ccat))
+        return sorted(set(row.get("completed_phases") or {}) - current)
 
     async def invalidate_source(
         self,
@@ -513,7 +557,7 @@ class RabbitHole:
                     phases = await engine.collect_phases(rabbit_hole, ccat)
                     recorded = set(row.get("completed_phases") or {}) | {phase.id for phase in phases}
                     await crud_ingestions.reset_phase_entries(ccat.agent_key, chat_id, name, sorted(recorded))
-                return await engine.run_phases(rabbit_hole, ccat, source)
+                return await engine.run_phases(rabbit_hole, ccat, source, reindexing=True)
         except (engine.IngestionCanceled, engine.LockLost):
             return None
 
@@ -823,6 +867,12 @@ class RabbitHole:
             "rabbithole_collects_document_images", [], super_docs, caller=self._resolve_caller(False),
         ) or []
 
+        # The hook dispatcher deep-copies its arguments, so a plugin stripping the transient
+        # image payload only mutates its own copy. Strip it from the core's own documents
+        # here (right after the hook, before chunking) so it never reaches the chunker, the
+        # vector DB metadata or the LLM context on recall. The collected images are kept.
+        _strip_image_payload(super_docs)
+
         # Split
         await self._send_notification_message("Parsing completed. Now let's go with reading process...")
         docs = await self._split_text(docs=super_docs)
@@ -840,7 +890,7 @@ class RabbitHole:
             # saved as files separately, so their content must never reach the vector
             # DB metadata (and from there the LLM context on recall). This also covers
             # direct callers that pass documents still carrying image_base64.
-            doc.metadata.pop("image_base64", None)
+            _strip_image_payload([doc])
             doc.metadata = (
                     doc.metadata
                     | metadata
@@ -877,6 +927,12 @@ class RabbitHole:
 
         log.info(f"Agent id: {self.cat.agent_key}. Preparing to memorize {len(docs)} vectors for {source}.")
         embedder = await self.cat.lizard.embedder()
+
+        # Opt-in token-budget split, after the plugin hook above and right before embedding: the tokenizer depends on
+        # the embedder. Idempotent, so a re-embedding (e.g. after a change of embedder) is harmless.
+        if get_env_bool("CAT_INGESTION_SPLIT_OVERSIZED"):
+            budget = embedder_token_budget()
+            docs = split_oversized(docs, budget, getattr(embedder, "_estimate_tokens", None))
 
         # embed the non-empty docs, 1:1 with the stored points
         valid_documents = list(filter(lambda doc_: doc_.page_content.strip(), docs))

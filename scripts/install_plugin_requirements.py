@@ -1,26 +1,29 @@
 #!/usr/bin/env python3
 """
-Install every core/user plugin's declared dependencies from its `pyproject.toml`
+Install every plugin's declared dependencies from its `pyproject.toml`
 (`requirements.txt` is not supported: plugins install exclusively through
 pyproject.toml + uv).
 
-Each plugin's pyproject.toml is compiled into a fresh `uv.lock` — replacing any
-existing one — constrained against the root project's own `uv.lock`, so uv
-refuses to resolve a dangerous upgrade or downgrade of a system library the
-core app depends on, and against the `uv.lock` of the plugins compiled before it
-in this run, so it never replaces a library another plugin installed. Dependencies are then installed strictly from that lock
-into the active virtual environment, without removing packages unrelated to
-this plugin (`--inexact`).
+All the plugin dependencies are resolved in ONE `uv.lock`, together with the
+root project's dependencies and constrained against the root project's own
+`uv.lock`. A single resolution is required: resolving each plugin on its own,
+constrained by the plugins compiled before it, is order-dependent and fails
+when two plugins need different versions of the same library, even though a
+common set exists. The merged resolution finds that common set.
 
-Used at image build time (Dockerfile) and by `make install`; mirrors the
-runtime install logic in `cat.looking_glass.mad_hatter.plugin.Plugin`.
+The dependencies are then installed strictly from that lock into the active
+virtual environment, without removing packages unrelated to the plugins
+(`--inexact`).
+
+Used at image build time (Dockerfile) and by `make install`; the runtime
+reinstall mirrors this logic only for newly installed plugins.
 
 Usage:
     python3 scripts/install_plugin_requirements.py
 """
 import glob
+import json
 import os
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -30,8 +33,8 @@ PLUGIN_GLOBS = [
     "cat/core_plugins/*/pyproject.toml",
     "cat/plugins/*/pyproject.toml",
 ]
+ROOT_PYPROJECT = "pyproject.toml"
 ROOT_LOCK = "uv.lock"
-VENV_DIR = os.path.join(os.getcwd(), ".venv")
 
 
 def root_lock_constraints():
@@ -46,36 +49,68 @@ def root_lock_constraints():
     ]
 
 
-def lock_pins(lock_file: str, pinned: set) -> list:
-    """Pins of the libraries in a plugin's uv.lock, except the ones in *pinned*
-    (mirrors Plugin._other_plugins_constraints)."""
-    with open(lock_file, "rb") as f:
-        packages = tomllib.load(f).get("package", [])
-    return [
-        f"{pkg['name']}=={pkg['version']}"
-        for pkg in packages
-        if "version" in pkg
-        and not {"virtual", "editable"} & set(pkg.get("source", {}))
-        and pkg["name"] not in pinned
+def plugin_dependencies():
+    deps = []
+    for pattern in PLUGIN_GLOBS:
+        for path in sorted(glob.glob(pattern)):
+            with open(path, "rb") as f:
+                data = tomllib.load(f)
+            deps.extend(data.get("project", {}).get("dependencies", []))
+    # stable de-duplication: the same requirement declared twice is one constraint
+    return list(dict.fromkeys(deps))
+
+
+def root_requires_python():
+    if not os.path.exists(ROOT_PYPROJECT):
+        return ">=3.11,<3.14"
+    with open(ROOT_PYPROJECT, "rb") as f:
+        return tomllib.load(f).get("project", {}).get("requires-python", ">=3.11,<3.14")
+
+
+def merged_pyproject(dependencies, constraints, requires_python):
+    platform_marker = json.dumps(f"sys_platform == '{sys.platform}'")
+    lines = [
+        "[project]",
+        'name = "unified-plugin-dependencies"',
+        'version = "0.0.0"',
+        f"requires-python = {json.dumps(requires_python)}",
+        "dependencies = [",
     ]
+    lines += [f"    {json.dumps(dep)}," for dep in dependencies]
+    lines += [
+        "]",
+        "",
+        "[tool.uv]",
+        # Resolve only the current platform: a universal lock also spans platforms the
+        # image never runs on (e.g. win32), where unrelated plugins' dependencies can
+        # be unsatisfiable and abort the whole install.
+        f"environments = [{platform_marker}]",
+        "constraint-dependencies = [",
+    ]
+    lines += [f"    {json.dumps(c)}," for c in constraints]
+    lines += ["]", ""]
+    return "\n".join(lines)
 
 
-def compile_and_install(pyproject_file: str, constraints: list) -> None:
-    plugin_dir = os.path.dirname(pyproject_file)
-    with open(pyproject_file, "r") as f:
-        pyproject_text = f.read()
+def main():
+    dependencies = plugin_dependencies()
+    if not dependencies:
+        print("  (no plugin pyproject.toml with dependencies found)", file=sys.stderr)
+        return
 
-    constraint_block = (
-        "\n[tool.uv]\nconstraint-dependencies = [\n"
-        + "".join(f'    "{c}",\n' for c in constraints)
-        + "]\n"
-    )
-    env = {**os.environ, "VIRTUAL_ENV": VENV_DIR}
+    constraints = root_lock_constraints()
+    text = merged_pyproject(dependencies, constraints, root_requires_python())
+    env = {**os.environ, "VIRTUAL_ENV": os.path.join(os.getcwd(), ".venv")}
 
     with tempfile.TemporaryDirectory() as tmp_dir:
         with open(os.path.join(tmp_dir, "pyproject.toml"), "w") as f:
-            f.write(pyproject_text + constraint_block)
+            f.write(text)
 
+        print(
+            f"Resolving {len(dependencies)} plugin dependencies in one lock "
+            f"({len(constraints)} core constraints)",
+            file=sys.stderr,
+        )
         subprocess.check_call(["uv", "lock", "--project", tmp_dir, "--no-cache"], env=env)
         subprocess.check_call(
             [
@@ -86,27 +121,6 @@ def compile_and_install(pyproject_file: str, constraints: list) -> None:
             env=env,
         )
 
-        # Persist the compiled lock next to the plugin's pyproject.toml,
-        # replacing any existing one
-        shutil.copyfile(os.path.join(tmp_dir, "uv.lock"), os.path.join(plugin_dir, "uv.lock"))
 
-
-constraints = root_lock_constraints()
-found = 0
-for pattern in PLUGIN_GLOBS:
-    for path in sorted(glob.glob(pattern)):
-        with open(path, "rb") as f:
-            data = tomllib.load(f)
-        if not data.get("project", {}).get("dependencies"):
-            continue
-        print(f"Compiling and installing dependencies for {path}", file=sys.stderr)
-        compile_and_install(path, constraints)
-        # the next plugins can never replace what this one installed (only the locks of this run: a stale uv.lock
-        # left in the folder may come from another root uv.lock)
-        constraints = constraints + lock_pins(
-            os.path.join(os.path.dirname(path), "uv.lock"), {c.split("==")[0] for c in constraints},
-        )
-        found += 1
-
-if found == 0:
-    print("  (no plugin pyproject.toml with dependencies found)", file=sys.stderr)
+if __name__ == "__main__":
+    main()

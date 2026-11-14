@@ -12,6 +12,7 @@ from cat.auth.permissions import AuthPermission, AuthResource, check_permissions
 from cat.db.cruds import ingestions as crud_ingestions
 from cat.db.cruds.ingestions import STATUS_LABELS, IngestionStatus
 from cat.exceptions import CustomConflictException, CustomNotFoundException, CustomValidationException
+from cat.log import log
 from cat.rabbit_hole import DELETE_WAIT_SECONDS, chunks, engine
 from cat.rabbit_hole.phases import IngestionPhase, IngestionSource, PhaseGraphError
 from cat.routes.routes_utils import run_background_task
@@ -31,7 +32,12 @@ class IngestionStatusResponse(BaseModel):
     phase: str | None = None
     phase_label: str | None = None
     error: str | None = None
+    embedder_name: str | None = None
+    chunker_name: str | None = None
     completed_phases: Dict[str, Dict[str, Any]] = {}
+    warnings: List[Dict[str, Any]] = []
+    warning_count: int = 0
+    has_warnings: bool = False
     created_at: float
     updated_at: float
 
@@ -80,16 +86,28 @@ async def get_ingestion_statuses(
     info: AuthorizedInfo = check_permissions(AuthResource.MEMORY, AuthPermission.READ),
 ) -> List[IngestionStatusResponse]:
     """The ingestion states of the sources of the knowledge base, or of the chat of the request."""
+    ccat = info.cheshire_cat
+    chat_id = _chat_id(info)
+    try:
+        await crud_ingestions.reconcile_statuses(ccat.agent_key, ccat, chat_id)
+    except Exception as e:  # noqa: BLE001 - a reconcile failure must not hide the states
+        log.error(f"Ingestion status reconcile failed: {e}")
     labels = {phase.id: phase.display_label for phase in await _phases(info)}
-    rows = await crud_ingestions.list_statuses(info.cheshire_cat.agent_key, _chat_id(info))
-    return [
-        IngestionStatusResponse(
-            **{k: v for k, v in row.items() if k in IngestionStatusResponse.model_fields},
-            status_label=STATUS_LABELS.get(row["status"], row["status"]),
-            phase_label=labels.get(row["phase"], row["phase"]) if row.get("phase") else None,
+    rows = await crud_ingestions.list_statuses(ccat.agent_key, chat_id)
+    response = []
+    for row in sorted(rows, key=lambda r: r["created_at"]):
+        warnings = crud_ingestions.source_warnings(row)
+        response.append(
+            IngestionStatusResponse(
+                **{k: v for k, v in row.items() if k in IngestionStatusResponse.model_fields},
+                status_label=STATUS_LABELS.get(row["status"], row["status"]),
+                phase_label=labels.get(row["phase"], row["phase"]) if row.get("phase") else None,
+                warnings=warnings,
+                warning_count=len(warnings),
+                has_warnings=bool(warnings),
+            )
         )
-        for row in sorted(rows, key=lambda r: r["created_at"])
-    ]
+    return response
 
 
 @router.get("/phases", response_model=PhasesResponse)
