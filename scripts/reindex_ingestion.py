@@ -11,7 +11,7 @@ again. When it is missing, ``reingest_source`` does not raise ``SourceNotKept`` 
 re-downloads the URL (the content is the current one, not the one indexed before).
 
 Usage:
-    python3 scripts/reindex_ingestion.py --agent <id> [--agent <id> ...] [--source <name>] [--yes]
+    python3 scripts/reindex_ingestion.py --agent <id> [--agent <id> ...] [--source <name>] [--from-phase <id>] [--yes]
     python3 scripts/reindex_ingestion.py --all [--yes]
 
 Dry-run is the default: it prints the plan and exits 2. Pass --yes to execute.
@@ -26,7 +26,7 @@ import sys
 from cat import BillTheLizard
 from cat.db.cruds import ingestions as crud
 from cat.db.cruds import settings as crud_settings
-from cat.rabbit_hole import RabbitHole, SourceNotKept
+from cat.rabbit_hole import RabbitHole, SourceNotKept, engine
 
 _DERIVED_IMAGE = re.compile(r"_img_\d+_[0-9a-f]+\.\w+$", re.IGNORECASE)
 _PROTECTED = ("system",)
@@ -92,8 +92,7 @@ async def _enumerate(ccat, agent_id: str):
     ]
 
 
-async def reindex_agent(agent_id: str, source: str | None, dry_run: bool) -> int:
-    lizard = BillTheLizard()
+async def reindex_agent(lizard, agent_id: str, source: str | None, dry_run: bool, from_phase: str | None = None) -> int:
     ccat = await lizard.get_cheshire_cat(agent_id)
     if ccat is None:
         print(f"agent {agent_id} not found", file=sys.stderr)
@@ -107,6 +106,12 @@ async def reindex_agent(agent_id: str, source: str | None, dry_run: bool) -> int
         return 1
 
     rabbit_hole = await _rabbit_hole(ccat)
+    if from_phase is not None:
+        phases = await engine.collect_phases(rabbit_hole, ccat)
+        valid = {phase.id for phase in phases}
+        if from_phase not in valid:
+            print(f"unknown phase {from_phase!r}; valid: {sorted(valid)}", file=sys.stderr)
+            return 1
     failures = 0
     for name, chat_id, origin in sources:
         print(
@@ -116,7 +121,7 @@ async def reindex_agent(agent_id: str, source: str | None, dry_run: bool) -> int
         if dry_run:
             continue
         try:
-            result = await rabbit_hole.reingest_source(ccat, name, chat_id)
+            result = await rabbit_hole.reingest_source(ccat, name, chat_id, from_phase=from_phase)
             print(f"  -> {result.get('status') if result else 'gone'}")
         except SourceNotKept as e:
             print(f"  -> skipped: {e}", file=sys.stderr)
@@ -137,10 +142,13 @@ async def main(args) -> int:
         print("no agents selected", file=sys.stderr)
         return 1
 
+    lizard = BillTheLizard()
+    await lizard.bootstrap()
+
     failures = 0
     for agent_id in agents:
         print(f"== agent {agent_id}")
-        failures += await reindex_agent(agent_id, args.source, not args.yes)
+        failures += await reindex_agent(lizard, agent_id, args.source, not args.yes, args.from_phase)
     return 0 if failures == 0 else 1
 
 
@@ -149,6 +157,11 @@ def main_cli() -> None:
     parser.add_argument("--agent", action="append", help="agent id (repeatable)")
     parser.add_argument("--all", action="store_true", help="every agent except system/__*__")
     parser.add_argument("--source", help="only this source")
+    parser.add_argument(
+        "--from-phase",
+        help="re-run from this phase and its dependents "
+             "(parsing_chunking, embedding, catalog_cards, graph_spacy_extraction, graph_llm_extraction)",
+    )
     parser.add_argument("--yes", action="store_true", help="execute (default: dry-run)")
     args = parser.parse_args()
     if not args.all and not args.agent:

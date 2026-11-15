@@ -528,7 +528,7 @@ class RabbitHole:
         return wanted
 
     async def reingest_source(
-        self, cat: "CheshireCat", name: str, chat_id: str | None = None,  # type: ignore[name-defined]
+        self, cat: "CheshireCat", name: str, chat_id: str | None = None, from_phase: str | None = None,  # type: ignore[name-defined]
     ) -> Dict | None:
         """Process a source again from scratch: every phase runs again (each one replaces what it produced before), from
         the bytes kept for it (a URL may be downloaded again). A source ingested before the states existed gets its
@@ -551,12 +551,21 @@ class RabbitHole:
                 if row is not None and row["status"] == IngestionStatus.DELETING.value:
                     await engine.delete_source(rabbit_hole, ccat, source)
                     return None
+                phases = await engine.collect_phases(rabbit_hole, ccat)
+                if from_phase is None:
+                    wanted = set((row or {}).get("completed_phases") or {}) | {phase.id for phase in phases}
+                else:
+                    wanted = {from_phase}
+                    changed = True
+                    while changed:
+                        changed = False
+                        for phase in phases:
+                            if phase.id not in wanted and any(dep in wanted for dep in phase.depends_on):
+                                wanted.add(phase.id)
+                                changed = True
                 if row is None:
                     await rabbit_hole._adopt(source, require_points=False)
-                else:
-                    phases = await engine.collect_phases(rabbit_hole, ccat)
-                    recorded = set(row.get("completed_phases") or {}) | {phase.id for phase in phases}
-                    await crud_ingestions.reset_phase_entries(ccat.agent_key, chat_id, name, sorted(recorded))
+                await crud_ingestions.reset_phase_entries(ccat.agent_key, chat_id, name, sorted(wanted))
                 return await engine.run_phases(rabbit_hole, ccat, source, reindexing=True)
         except (engine.IngestionCanceled, engine.LockLost):
             return None

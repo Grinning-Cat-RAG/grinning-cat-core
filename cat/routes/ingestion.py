@@ -97,9 +97,17 @@ async def get_ingestion_statuses(
     response = []
     for row in sorted(rows, key=lambda r: r["created_at"]):
         warnings = crud_ingestions.source_warnings(row)
+        # A row may carry a legacy top-level ``warnings`` field: the response computes the aggregate from the diary, so
+        # drop the stored one from the expansion to avoid passing ``warnings`` twice.
+        computed = {"warnings", "warning_count", "has_warnings"}
+        payload = {
+            k: v
+            for k, v in row.items()
+            if k in IngestionStatusResponse.model_fields and k not in computed
+        }
         response.append(
             IngestionStatusResponse(
-                **{k: v for k, v in row.items() if k in IngestionStatusResponse.model_fields},
+                **payload,
                 status_label=STATUS_LABELS.get(row["status"], row["status"]),
                 phase_label=labels.get(row["phase"], row["phase"]) if row.get("phase") else None,
                 warnings=warnings,
