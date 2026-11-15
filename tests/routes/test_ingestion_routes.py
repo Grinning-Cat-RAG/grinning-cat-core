@@ -486,3 +486,18 @@ async def test_the_source_warnings_are_aggregated_and_normalized(secure_client, 
     row = response.json()[0]
     assert row["warnings"] == [{"code": "odd_code"}]
     assert (row["warning_count"], row["has_warnings"]) == (1, True)
+
+
+async def test_a_legacy_top_level_warnings_does_not_break_the_status(secure_client, secure_client_headers, cheshire_cat):
+    await crud_ingestions.create_status(cheshire_cat.agent_key, None, "legacy.txt", type_="file")
+    # A row written by the old engine carries a top-level `warnings`: the response must compute the aggregate from
+    # the diary and ignore the stored field (it used to be passed twice to the response model).
+    from cat.db.database import get_async_db
+    key = crud_ingestions.format_key(cheshire_cat.agent_key, None, "legacy.txt")
+    await get_async_db().json().set(key, "$.warnings", [{"code": "legacy"}])
+
+    response = await secure_client.get("/ingestion/status", headers=secure_client_headers)
+
+    assert response.status_code == 200
+    row = response.json()[0]
+    assert row["warnings"] == []
