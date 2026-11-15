@@ -742,7 +742,7 @@ class RabbitHole:
         # The images are extracted in this phase and only stored by the active multimodal plugin: let it remove them
         # even when the embedding points that name them were already purged (a reindex from a phase).
         await self.cat.plugin_manager.execute_hook(
-            "rabbithole_deletes_source_images", None, source.name, source.chat_id, caller=self._resolve_caller(False),
+            "rabbithole_deletes_source_images", source.name, source.chat_id, caller=self._resolve_caller(False),
         )
 
     async def run_embedding(self, source: IngestionSource, cat) -> PhaseResult:
