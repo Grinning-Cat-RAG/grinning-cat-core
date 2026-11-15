@@ -12,7 +12,13 @@ re-downloads the URL (the content is the current one, not the one indexed before
 
 Usage:
     python3 scripts/reindex_ingestion.py --agent <id> [--agent <id> ...] [--source <name>] [--from-phase <id>] [--yes]
+    python3 scripts/reindex_ingestion.py --agent <id> [--agent <id> ...] --errored [--yes]
     python3 scripts/reindex_ingestion.py --all [--yes]
+    python3 scripts/reindex_ingestion.py --all --errored [--yes]
+
+``--errored``: only the sources with at least one phase in ``error`` state; for each, the artifacts of the earliest
+errored phase (and of its dependents) are purged, their diary entries reset, and the phases run again. The phases
+before it keep their artifacts.
 
 Dry-run is the default: it prints the plan and exits 2. Pass --yes to execute.
 Exit codes: 0 ok, 1 partial failure, 2 aborted/dry-run.
@@ -92,7 +98,9 @@ async def _enumerate(ccat, agent_id: str):
     ]
 
 
-async def reindex_agent(lizard, agent_id: str, source: str | None, dry_run: bool, from_phase: str | None = None) -> int:
+async def reindex_agent(
+    lizard, agent_id: str, source: str | None, dry_run: bool, from_phase: str | None = None, errored: bool = False,
+) -> int:
     ccat = await lizard.get_cheshire_cat(agent_id)
     if ccat is None:
         print(f"agent {agent_id} not found", file=sys.stderr)
@@ -106,22 +114,44 @@ async def reindex_agent(lizard, agent_id: str, source: str | None, dry_run: bool
         return 1
 
     rabbit_hole = await _rabbit_hole(ccat)
-    if from_phase is not None:
+    try:
         phases = await engine.collect_phases(rabbit_hole, ccat)
-        valid = {phase.id for phase in phases}
-        if from_phase not in valid:
-            print(f"unknown phase {from_phase!r}; valid: {sorted(valid)}", file=sys.stderr)
-            return 1
+    except Exception as e:  # noqa: BLE001 - the CLI reports the invalid phase graph
+        print(f"agent {agent_id}: cannot collect the phases: {e}", file=sys.stderr)
+        return 1
+    valid = {phase.id for phase in phases}
+    if from_phase is not None and from_phase not in valid:
+        print(f"unknown phase {from_phase!r}; valid: {sorted(valid)}", file=sys.stderr)
+        return 1
+    order = {phase.id: index for index, phase in enumerate(phases)}
+
     failures = 0
     for name, chat_id, origin in sources:
-        print(
-            f"{'[dry-run] ' if dry_run else ''}reindex {name!r} "
-            f"(chat={chat_id!r}, origin={origin})"
-        )
+        restart = from_phase
+        if errored:
+            row = await crud.get_status(agent_id, chat_id, name)
+            failed = [
+                phase_id for phase_id, entry in ((row or {}).get("completed_phases") or {}).items()
+                if entry.get("state") == engine.STATE_ERROR
+            ]
+            if not failed:
+                continue
+            # The earliest errored phase: purging it (and its dependents) is what makes the later errored phases
+            # run again too; the phases before it keep their artifacts.
+            restart = min(failed, key=lambda phase_id: order.get(phase_id, len(order)))
+            print(
+                f"{'[dry-run] ' if dry_run else ''}reindex {name!r} "
+                f"(chat={chat_id!r}, origin={origin}, errored={sorted(failed)}, from={restart})"
+            )
+        else:
+            print(
+                f"{'[dry-run] ' if dry_run else ''}reindex {name!r} "
+                f"(chat={chat_id!r}, origin={origin})"
+            )
         if dry_run:
             continue
         try:
-            result = await rabbit_hole.reingest_source(ccat, name, chat_id, from_phase=from_phase)
+            result = await rabbit_hole.reingest_source(ccat, name, chat_id, from_phase=restart)
             print(f"  -> {result.get('status') if result else 'gone'}")
         except SourceNotKept as e:
             print(f"  -> skipped: {e}", file=sys.stderr)
@@ -148,7 +178,9 @@ async def main(args) -> int:
     failures = 0
     for agent_id in agents:
         print(f"== agent {agent_id}")
-        failures += await reindex_agent(lizard, agent_id, args.source, not args.yes, args.from_phase)
+        failures += await reindex_agent(
+            lizard, agent_id, args.source, not args.yes, args.from_phase, args.errored,
+        )
     return 0 if failures == 0 else 1
 
 
@@ -157,10 +189,17 @@ def main_cli() -> None:
     parser.add_argument("--agent", action="append", help="agent id (repeatable)")
     parser.add_argument("--all", action="store_true", help="every agent except system/__*__")
     parser.add_argument("--source", help="only this source")
-    parser.add_argument(
+    phase_group = parser.add_mutually_exclusive_group()
+    phase_group.add_argument(
         "--from-phase",
         help="re-run from this phase and its dependents "
              "(parsing_chunking, embedding, catalog_cards, graph_spacy_extraction, graph_llm_extraction)",
+    )
+    phase_group.add_argument(
+        "--errored",
+        action="store_true",
+        help="only the sources with a phase in error: purge the earliest errored phase and its dependents, "
+             "reset their entries and run them again",
     )
     parser.add_argument("--yes", action="store_true", help="execute (default: dry-run)")
     args = parser.parse_args()
