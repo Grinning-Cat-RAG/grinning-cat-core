@@ -317,7 +317,8 @@ async def get_agents_main_keys(pattern: str | None = None) -> List[str]:
     Get all unique agent IDs from Redis keys.
 
     Args:
-        pattern: Pattern to match keys (default: None, all agent keys).
+        pattern: Pattern to match keys (default: None, only master agent settings keys,
+            i.e. ``agents:*:agent``).
 
     Returns:
         List of unique agent IDs.
@@ -325,11 +326,20 @@ async def get_agents_main_keys(pattern: str | None = None) -> List[str]:
     Raises:
         RedisError: If Redis connection fails.
     """
-    pattern = f"{DEFAULT_AGENTS_KEY}:*" if pattern is None else pattern
+    pattern = (
+        f"{DEFAULT_AGENTS_KEY}:*:{DEFAULT_AGENT_KEY}" if pattern is None else pattern
+    )
 
     try:
         return sorted(
-            list({k.split(":")[1] async for k in get_async_db().scan_iter(pattern)})
+            list(
+                {
+                    k.removeprefix(f"{DEFAULT_AGENTS_KEY}:").removesuffix(
+                        f":{DEFAULT_AGENT_KEY}"
+                    )
+                    async for k in get_async_db().scan_iter(pattern)
+                }
+            )
         )
     except RedisError as e:
         log.error(f"Redis error in get_agents_main_keys: {e}")

@@ -63,6 +63,26 @@ docker run --rm -it -p 1865:80 \
 - Chat with the Grinning Cat by downloading the [Admin Panel](https://www.github.com/Grinning-Cat-RAG/grinning-cat-admin).
 - Try out the REST API on [localhost:1865/docs](http://localhost:1865/docs).
 
+### Building an image with host plugin dependencies
+Plugins are usually bind-mounted at runtime, so their dependencies are not part of the image. To bake them in, build
+with a named BuildKit context pointing at the host plugins directory:
+
+```bash
+make build-with-plugins PLUGINS_DIR=/path/to/plugins   # Dockerfile, tag grinning-cat-core:dev-full
+make dev-with-plugins                                  # Dockerfile:dhi (hardened, the compose image)
+```
+
+> [!WARNING]
+> If the container mounts a venv volume (e.g. `./data/grinning/venv:/app/.venv` in `grinning.yml`), that mount
+> **shadows** the image's `/app/.venv`: the baked dependencies stay invisible until the volume is re-seeded from the
+> new image (or the mount is removed). From the compose directory:
+> ```bash
+> docker rm -f gc-venv-seed 2>/dev/null
+> docker create --name gc-venv-seed grinning-cat-core:dev-full
+> docker cp gc-venv-seed:/app/.venv/. ./data/grinning/venv/
+> docker rm gc-venv-seed
+> ```
+
 This fork is intended as a microservice.
 
 As a first thing, set the **Embedder** for the Grinning Cat. A favourite **LLM** must be set for each chatbot; each

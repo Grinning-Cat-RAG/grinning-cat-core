@@ -39,6 +39,17 @@ ARG HTTP_PROXY
 ARG HTTPS_PROXY
 ARG NO_PROXY
 
+# ---------------------------------------------------------------------------
+# OPTIONAL plugin-dependency source (see `make dev-with-plugins`).
+# `--build-context plugins=<dir>` passes the host plugins directory (outside the
+# repo build context) and `--build-arg PLUGINS_CTX=plugins` selects it here.
+# Without the named context PLUGINS_CTX defaults to an empty stage, so the COPY
+# below copies nothing and the build is unaffected.
+# ---------------------------------------------------------------------------
+ARG PLUGINS_CTX=plugins-empty
+FROM scratch AS plugins-empty
+FROM ${PLUGINS_CTX} AS plugin-src
+
 FROM ${UV_IMAGE} AS uv
 
 # ---------------------------------------------------------------------------
@@ -123,6 +134,22 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     python3 scripts/install_plugin_requirements.py && \
     python3 scripts/hash_plugin_requirements.py && \
     find ./ -type d -name __pycache__ -exec rm -rf {} +
+
+# 4) OPTIONAL host plugins layer: dependencies of the plugins bind-mounted at
+#    runtime (enabled only with --build-arg INSTALL_PLUGIN_DEPS=1). They are
+#    copied into /app/cat/plugins (the installer's second glob), compiled against
+#    the root uv.lock and installed into the same /app/.venv. The copied sources
+#    are shadowed at runtime by the bind mount; only the venv deps matter.
+ARG INSTALL_PLUGIN_DEPS=0
+COPY --from=plugin-src / /app/cat/plugins/
+RUN --mount=type=cache,target=/root/.cache/uv \
+    if [ "$INSTALL_PLUGIN_DEPS" = "1" ]; then \
+        python3 scripts/install_plugin_requirements.py && \
+        python3 scripts/hash_plugin_requirements.py && \
+        find ./ -type d -name __pycache__ -exec rm -rf {} + ; \
+    else \
+        echo "INSTALL_PLUGIN_DEPS=0: skipping host plugin dependencies"; \
+    fi
 
 # ---------------------------------------------------------------------------
 # Stage 2 — RUNTIME (final)

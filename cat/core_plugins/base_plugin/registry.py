@@ -1,3 +1,4 @@
+import os
 import random
 from typing import List
 import httpx
@@ -7,6 +8,8 @@ from cat.log import log
 from cat.looking_glass.models import PluginManifest
 from cat.utils import write_temp_file
 
+_registry_search_disabled_logged = False
+
 
 class CheshireCatPluginRegistry(PluginRegistry):
     @property
@@ -14,6 +17,19 @@ class CheshireCatPluginRegistry(PluginRegistry):
         return "https://grinning-cat-plugins-backend-latest.onrender.com"
 
     async def search_plugins(self, query: str = None) -> List[PluginManifest]:
+        global _registry_search_disabled_logged
+
+        raw = os.getenv("CAT_PLUGINS_REGISTRY_SEARCH_ENABLED")
+        enabled = True if raw is None else raw.strip().lower() in ("1", "true", "yes", "on")
+        if not enabled:
+            if not _registry_search_disabled_logged:
+                log.info(
+                    "Remote plugins registry search is disabled (CAT_PLUGINS_REGISTRY_SEARCH_ENABLED): "
+                    "only local plugins will be listed"
+                )
+                _registry_search_disabled_logged = True
+            return []
+
         try:
             async with httpx.AsyncClient(timeout=10) as client:
                 # search plugins if a query is provided, list plugins (no search) otherwise

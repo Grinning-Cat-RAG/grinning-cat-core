@@ -74,3 +74,44 @@ dev:  ## Build the hardened image (Dockerfile:dhi) tagged for development, pulli
 		--build-arg HTTPS_PROXY=$(BUILD_PROXY) \
 		--build-arg NO_PROXY=$(BUILD_NO_PROXY)
 
+##@ Plugin-enabled images
+
+# Host directory with the plugins bind-mounted at runtime. It is outside the
+# repo build context, so it is passed to BuildKit as a named build context.
+PLUGINS_DIR ?= /root/DEV/data/grinning/plugins
+# Image tag produced by `build-with-plugins` (the tag the compose file deploys).
+IMAGE ?= grinning-cat-core:dev-full
+# Dockerfile used by `build-with-plugins` (override to build the hardened variant).
+DOCKERFILE_WITH_PLUGINS ?= Dockerfile
+
+# Both targets pass:
+#   --build-context plugins=$(PLUGINS_DIR)  read-only access to the host plugins dir;
+#   --build-arg PLUGINS_CTX=plugins         select it as the COPY source in the Dockerfile;
+#   --build-arg INSTALL_PLUGIN_DEPS=1       enable the optional dependency install.
+# Without the named context (plain `make build`), PLUGINS_CTX defaults to an empty
+# stage, so nothing is copied and no plugin dependencies are installed.
+#
+# WARNING — the venv volume SHADOWS the baked venv:
+#   compose mounts ./data/grinning/venv:/app/.venv over the image's /app/.venv, so
+#   the dependencies installed by these targets are invisible at runtime until the
+#   volume is re-seeded from the new image (or the mount is removed). From /root/DEV:
+#     docker rm -f gc-venv-seed 2>/dev/null; \
+#     docker create --name gc-venv-seed $(IMAGE) && \
+#     docker cp gc-venv-seed:/app/.venv/. ./data/grinning/venv/ && \
+#     docker rm gc-venv-seed
+build-with-plugins:  ## Build an image from Dockerfile with host plugin deps (requires re-seeding ./data/grinning/venv:/app/.venv).
+	docker buildx build --load \
+		--build-context plugins=$(PLUGINS_DIR) \
+		--build-arg PLUGINS_CTX=plugins \
+		--build-arg INSTALL_PLUGIN_DEPS=1 \
+		-f $(DOCKERFILE_WITH_PLUGINS) -t $(IMAGE) .
+
+dev-with-plugins:  ## Build $(IMAGE) (Dockerfile:dhi) installing host plugin deps (matches the compose image).
+	docker buildx build --load . -f Dockerfile:dhi -t $(IMAGE) --pull \
+		--build-context plugins=$(PLUGINS_DIR) \
+		--build-arg PLUGINS_CTX=plugins \
+		--build-arg INSTALL_PLUGIN_DEPS=1 \
+		--build-arg HTTP_PROXY=$(BUILD_PROXY) \
+		--build-arg HTTPS_PROXY=$(BUILD_PROXY) \
+		--build-arg NO_PROXY=$(BUILD_NO_PROXY)
+

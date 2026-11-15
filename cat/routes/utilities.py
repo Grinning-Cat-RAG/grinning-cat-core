@@ -9,6 +9,7 @@ from cat.auth.permissions import AuthPermission, AuthResource, check_permissions
 import cat.db.cruds.settings as crud_settings
 from cat.db.database import get_async_db
 from cat.db.models import Setting
+from cat.exceptions import UnknownAgentException
 from cat.log import log
 from cat.routes.routes_utils import startup_app, shutdown_app
 import cat.utils as utils
@@ -63,7 +64,12 @@ async def factory_reset(
     cheshire_cats_ids = await crud_settings.get_agents_main_keys()
     deleted_memories = False
     for agent_id in cheshire_cats_ids:
-        ccat = await info.lizard.get_cheshire_cat(agent_id)
+        try:
+            ccat = await info.lizard.get_cheshire_cat(agent_id)
+        except UnknownAgentException:
+            # a ghost namespace (peripheral keys, no master key): nothing to reset
+            log.warning(f"Skipping ghost agent {agent_id} during factory reset")
+            continue
         if not ccat:
             continue
         try:

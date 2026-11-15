@@ -10,6 +10,7 @@ of the agent (contended: another pod is passing, the agent is left to it), a sou
   worker is dead (a live worker holds it);
 - it completed, but a tag of its diary is not the current one: the chunker, the embedder or the settings of a phase
   changed, or a phase was added;
+- its diary names a phase no longer installed (a plugin was uninstalled): the source is re-ingested from scratch;
 - it failed in a phase whose tag is not the current one anymore: the settings of that phase, or of a phase it depends on
   (a tag includes the tags of the phases it depends on), changed since, e.g. to fix the failure. The failed phase runs
   again, with the ones depending on it;
@@ -31,13 +32,15 @@ import time
 from typing import Dict
 
 from cat.db import crud
+from cat.db.cruds import conversations as crud_conversations
 from cat.db.cruds import ingestions as crud_ingestions
 from cat.db.cruds import settings as crud_settings
 from cat.db.cruds.ingestions import IngestionStatus
 from cat.env import get_env_int
 from cat.log import log
-from cat.rabbit_hole import engine
+from cat.rabbit_hole import chunks, engine
 from cat.rabbit_hole.phases import compute_tags
+from cat.services.memory.models import VectorMemoryType
 
 IN_FLIGHT = {
     IngestionStatus.UPLOADED.value,
@@ -52,6 +55,8 @@ def _needs_attention(row: dict, tags: Dict[str, str], depends_on: Dict[str, tupl
     if row.get("status") in IN_FLIGHT:
         return True
     diary = row.get("completed_phases") or {}
+    if set(diary) - set(tags):
+        return True  # its diary names a phase no longer installed: rerun_source prunes it and re-ingests the source
     if row.get("status") == IngestionStatus.ERROR.value:
         # the phase that failed itself, not the ones inheriting its failure: its tag includes the tags of the phases it
         # depends on, so a change upstream shows there too
@@ -78,6 +83,24 @@ def _needs_attention(row: dict, tags: Dict[str, str], depends_on: Dict[str, tupl
     return any((diary.get(phase_id) or {}).get("tag") != tag for phase_id, tag in tags.items())
 
 
+async def _purge_orphaned_chat_source(ccat, row: Dict) -> None:
+    """Remove the points, the kept files and the row of a source whose chat no longer exists."""
+    chat_id, name = row["chat_id"], row["source"]
+    try:
+        await ccat.vector_memory_handler.delete_tenant_points(
+            str(VectorMemoryType.EPISODIC), {"source": name, "chat_id": chat_id},
+        )
+    except Exception as e:  # noqa: BLE001 - the row is kept so the next pass retries
+        log.warning(f"Agent id: {ccat.agent_key}. Cannot remove the points of the orphaned chat source {name}: {e}")
+        raise
+    try:
+        await asyncio.to_thread(chunks.delete_all, ccat.file_manager, ccat.agent_key, chat_id, name)
+    except Exception as e:  # noqa: BLE001 - the points are gone; the row is kept so the next pass retries
+        log.warning(f"Agent id: {ccat.agent_key}. Cannot remove the files of the orphaned chat source {name}: {e}")
+        raise
+    await crud_ingestions.delete_status(ccat.agent_key, chat_id, name)
+
+
 async def resume_agent(lizard, agent_id: str) -> None:
     """One pass on the sources of an agent (see the module)."""
     if await crud_ingestions.is_in_maintenance(agent_id):
@@ -95,12 +118,33 @@ async def resume_agent(lizard, agent_id: str) -> None:
                     return  # the vector database is being changed (on any pod), even if its marker was cleared
                 await ccat.take_over_dead_vector_transfer(transfer["since"])
                 rows = await crud_ingestions.list_statuses(agent_id)
+            try:
+                purged = await crud_ingestions.reconcile_statuses(agent_id, ccat)
+            except Exception as e:  # noqa: BLE001 - a reconcile failure must not stop the resume
+                log.error(f"Agent id: {agent_id}. Reconcile of the ingestion states failed: {e}")
+                purged = []
+            if purged:
+                rows = await crud_ingestions.list_statuses(agent_id)
             rabbit_hole = copy.copy(lizard.rabbit_hole)
             await rabbit_hole.setup(ccat)
             phases = await engine.collect_phases(rabbit_hole, ccat)
             tags = await compute_tags(phases, ccat)
             depends_on = {phase.id: phase.depends_on for phase in phases}
             for row in rows:
+                if row.get("chat_id") is not None and not await crud_conversations.get_user_id_from_conversation_keys(
+                    agent_id, row["chat_id"],
+                ):
+                    # the chat was destroyed but its source lingers (e.g. a worker died before the chat teardown): its
+                    # artifacts and row go, without reviving a chat that no longer exists
+                    try:
+                        await _purge_orphaned_chat_source(ccat, row)
+                        log.warning(
+                            f"Agent id: {agent_id}. Removed the orphaned chat source {row['source']} "
+                            f"({row['chat_id']})"
+                        )
+                    except Exception as e:  # noqa: BLE001 - the next pass retries
+                        log.error(f"Agent id: {agent_id}. Cleanup of the orphaned source {row['source']} failed: {e}")
+                    continue
                 if not _needs_attention(row, tags, depends_on):
                     continue
                 if await crud_ingestions.is_in_maintenance(agent_id):

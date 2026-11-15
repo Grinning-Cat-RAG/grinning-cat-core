@@ -1,9 +1,17 @@
 from typing import Dict
-from fastapi import APIRouter, Body
+from fastapi import APIRouter, BackgroundTasks, Body
 
 from cat.auth.connection import AuthorizedInfo
 from cat.auth.permissions import AuthPermission, AuthResource, check_permissions
-from cat.routes.routes_utils import GetSettingsResponse, GetSettingResponse, UpsertSettingResponse, has_write_permission
+from cat.rabbit_hole.phases import service_settings
+from cat.rabbit_hole.recovery import resume_agent
+from cat.routes.routes_utils import (
+    GetSettingsResponse,
+    GetSettingResponse,
+    UpsertSettingResponse,
+    has_write_permission,
+    run_background_task,
+)
 from cat.services.service_factory import ServiceFactory
 
 router = APIRouter(tags=["Chunking"], prefix="/chunking")
@@ -45,6 +53,7 @@ async def get_chunker_setting(
 @router.put("/settings/{chunker_name}", response_model=UpsertSettingResponse)
 async def upsert_chunker_setting(
     chunker_name: str,
+    background_tasks: BackgroundTasks,
     info: AuthorizedInfo = check_permissions(AuthResource.AUTH_HANDLER, AuthPermission.WRITE),
     payload: Dict = Body(default={}),
 ) -> UpsertSettingResponse:
@@ -58,5 +67,9 @@ async def upsert_chunker_setting(
         schema_name="chunkerName",
     )
 
+    previous = await service_settings(ccat.agent_key, "chunker")
     result = await sf.upsert_service(chunker_name, payload)
+    current = await service_settings(ccat.agent_key, "chunker")
+    if previous != current:
+        run_background_task(background_tasks, resume_agent, info.lizard, ccat.agent_key)
     return UpsertSettingResponse(**result)
