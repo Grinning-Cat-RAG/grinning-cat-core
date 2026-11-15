@@ -362,16 +362,20 @@ async def _run_ordered(ordered, tags, diary, ran, source, cat, write, record, *,
         await record(phase.id, diary[phase.id])
 
 
-async def _delete_phase_artifacts(rabbit_hole, cat, source: IngestionSource, deleted: List[str], persist) -> List[str]:
+async def _delete_phase_artifacts(rabbit_hole, cat, source: IngestionSource, deleted: List[str], persist, phase_ids: set[str] | None = None) -> List[str]:
     """Run the delete of every phase in reverse order, skipping the ones already removed (``deleted``).
 
     ``persist(deleted)``, when given, records the phases removed so far: an interrupted deletion resumes from there.
+    With ``phase_ids`` only those phases are removed, still in reverse execution order: the earlier phases' artifacts
+    are kept (a reindex from a phase keeps what it depends on).
     """
     try:
         ordered = await collect_phases(rabbit_hole, cat)
     except PhaseGraphError:
         ordered = execution_order([ParsingChunkingPhase(rabbit_hole), EmbeddingPhase(rabbit_hole)])
     for phase in reversed(ordered):
+        if phase_ids is not None and phase.id not in phase_ids:
+            continue
         if phase.id in deleted:
             continue
         await phase.delete(source, cat)  # a failure leaves the row deleting, resumable
@@ -380,17 +384,20 @@ async def _delete_phase_artifacts(rabbit_hole, cat, source: IngestionSource, del
             await persist(deleted)
     # A phase that is no longer installed cannot run its own delete: purge what it left behind, in every collection a
     # phase writes sources to. Scoped by ``metadata.source`` so no other source (and no shared graph entity) is touched.
-    for collection in (str(VectorMemoryType.DECLARATIVE), str(VectorMemoryType.EPISODIC)):
-        await cat.vector_memory_handler.delete_tenant_points(collection, {"source": source.name})
+    # This unscoped purge belongs to a FULL deletion only: a partial (from-phase) purge keeps the earlier phases.
+    if phase_ids is None:
+        for collection in (str(VectorMemoryType.DECLARATIVE), str(VectorMemoryType.EPISODIC)):
+            await cat.vector_memory_handler.delete_tenant_points(collection, {"source": source.name})
     return deleted
 
 
-async def purge_source_artifacts(rabbit_hole, cat, source: IngestionSource) -> None:
+async def purge_source_artifacts(rabbit_hole, cat, source: IngestionSource, phase_ids: set[str] | None = None) -> None:
     """Remove what every phase produced for the source (in reverse order), keeping its status row.
 
     Reusable by a reindex, which repopulates the row and the artifacts instead of deleting the source. The lock of the
-    source must be held."""
-    await _delete_phase_artifacts(rabbit_hole, cat, source, [], None)
+    source must be held. With ``phase_ids`` only those phases are removed (in reverse execution order), so a reindex
+    from a phase keeps the artifacts of the phases it depends on."""
+    await _delete_phase_artifacts(rabbit_hole, cat, source, [], None, phase_ids)
 
 
 async def delete_source(rabbit_hole, cat, source: IngestionSource) -> None:

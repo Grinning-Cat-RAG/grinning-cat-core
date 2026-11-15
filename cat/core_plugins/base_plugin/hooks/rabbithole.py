@@ -174,3 +174,13 @@ def rabbithole_stores_image_points(
     returns it unchanged (upstream parity: no image points).
     """
     return image_points
+
+
+@hook(priority=0)
+async def rabbithole_deletes_source_images(source: str, chat_id: str | None, cat) -> None:
+    """Hook to remove the image files extracted for a source (no-op without a multimodal plugin).
+
+    Fired by the RabbitHole when the ``parsing_chunking`` phase is deleted (a reindex from a phase): the images are
+    extracted in that phase, so its delete owns them. With no plugin the no-op touches nothing.
+    """
+    return None

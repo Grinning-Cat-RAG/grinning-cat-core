@@ -67,6 +67,8 @@ class IngestionPhase(ABC):
     id: str = ""
     label: str = ""
     depends_on: Tuple[str, ...] = ()
+    #: Phases that write to the same artifact store: re-running one re-runs the whole group (the delete is shared).
+    artifacts_group: str | None = None
     not_ready_budget_seconds: float | None = None
     #: The environment variable that overrides ``not_ready_budget_seconds`` for this phase (when set and present).
     not_ready_budget_env: str | None = None

@@ -563,8 +563,19 @@ class RabbitHole:
                             if phase.id not in wanted and any(dep in wanted for dep in phase.depends_on):
                                 wanted.add(phase.id)
                                 changed = True
+                groups = {getattr(phase, "artifacts_group", None) for phase in phases if phase.id in wanted}
+                groups.discard(None)
+                for phase in phases:
+                    if getattr(phase, "artifacts_group", None) in groups:
+                        wanted.add(phase.id)
                 if row is None:
                     await rabbit_hole._adopt(source, require_points=False)
+                # Delete the artifacts of the phases this run will re-execute, in reverse execution order. The phases
+                # before the chosen one keep their artifacts (a reindex from a phase keeps what it depends on).
+                await engine.purge_source_artifacts(
+                    rabbit_hole, ccat, source,
+                    phase_ids=None if from_phase is None else wanted,
+                )
                 await crud_ingestions.reset_phase_entries(ccat.agent_key, chat_id, name, sorted(wanted))
                 return await engine.run_phases(rabbit_hole, ccat, source, reindexing=True)
         except (engine.IngestionCanceled, engine.LockLost):
@@ -728,6 +739,11 @@ class RabbitHole:
 
     async def delete_parsing_chunking(self, source: IngestionSource, cat) -> None:
         await asyncio.to_thread(chunks.delete_all, self.cat.file_manager, source.agent_id, source.chat_id, source.name)
+        # The images are extracted in this phase and only stored by the active multimodal plugin: let it remove them
+        # even when the embedding points that name them were already purged (a reindex from a phase).
+        await self.cat.plugin_manager.execute_hook(
+            "rabbithole_deletes_source_images", None, source.name, source.chat_id, caller=self._resolve_caller(False),
+        )
 
     async def run_embedding(self, source: IngestionSource, cat) -> PhaseResult:
         """The ``embedding`` phase: embed the stored chunks and replace the points of the source with the new ones
