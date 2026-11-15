@@ -11,10 +11,12 @@ again. When it is missing, ``reingest_source`` does not raise ``SourceNotKept`` 
 re-downloads the URL (the content is the current one, not the one indexed before).
 
 Usage:
-    python3 scripts/reindex_ingestion.py --agent <id> [--agent <id> ...] [--source <name>] [--from-phase <id>] [--yes]
-    python3 scripts/reindex_ingestion.py --agent <id> [--agent <id> ...] --errored [--yes]
+    python3 scripts/reindex_ingestion.py --agent <id|substring> [--agent ...] [--source <name>] [--from-phase <id>] [--yes]
+    python3 scripts/reindex_ingestion.py --agent <id|substring> [--agent ...] --errored [--yes]
     python3 scripts/reindex_ingestion.py --all [--yes]
     python3 scripts/reindex_ingestion.py --all --errored [--yes]
+
+``--agent`` accepts an id or a substring of it (case-insensitive): every matching agent is selected.
 
 ``--errored``: only the sources with at least one phase in ``error`` state; for each, the artifacts of the earliest
 errored phase (and of its dependents) are purged, their diary entries reset, and the phases run again. The phases
@@ -163,11 +165,19 @@ async def reindex_agent(
 
 
 async def main(args) -> int:
+    known = [a["agent_id"] for a in await crud_settings.get_agents()]
     if args.all:
-        agents = [a["agent_id"] for a in await crud_settings.get_agents()]
-        agents = [a for a in agents if not _is_protected(a)]
+        agents = [agent_id for agent_id in known if not _is_protected(agent_id)]
     else:
-        agents = args.agent or []
+        # Each --agent value is an id OR a substring of it (case-insensitive): every matching agent is selected.
+        agents = []
+        for wanted in args.agent or []:
+            matches = [agent_id for agent_id in known if wanted.lower() in agent_id.lower()]
+            if not matches:
+                print(f"no agent matches {wanted!r}", file=sys.stderr)
+                return 1
+            agents.extend(matches)
+        agents = list(dict.fromkeys(agents))
     if not agents:
         print("no agents selected", file=sys.stderr)
         return 1
@@ -186,7 +196,7 @@ async def main(args) -> int:
 
 def main_cli() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--agent", action="append", help="agent id (repeatable)")
+    parser.add_argument("--agent", action="append", help="agent id or a substring of it, case-insensitive (repeatable)")
     parser.add_argument("--all", action="store_true", help="every agent except system/__*__")
     parser.add_argument("--source", help="only this source")
     phase_group = parser.add_mutually_exclusive_group()
