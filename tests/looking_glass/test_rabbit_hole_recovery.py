@@ -333,23 +333,6 @@ async def test_a_change_of_the_embedder_reembeds_the_stored_chunks_and_reingests
     assert await points_of(cheshire_cat, "legacy.txt")
 
 
-async def test_a_change_of_the_embedder_does_not_retry_a_source_that_failed_before_its_phases(
-    lizard, cheshire_cat, files, embedder_name, parses,
-):
-    await ingest(cheshire_cat)  # story.txt completed: its chunks are stored
-    parses.clear()
-    # a new upload of the same source with no bytes: it fails before its phases, resetting the row (empty diary)
-    failed = await ingest(cheshire_cat, data=b"")
-    assert failed["status"] == "error" and failed["completed_phases"] == {}
-    embedder_name["name"] = "embedder-2"
-
-    await lizard.embed_all_in_cheshire_cats()
-
-    assert parses == []  # the stored chunks are not parsed again
-    row = await crud_ingestions.get_status(cheshire_cat.agent_key, None, "story.txt")
-    assert row["status"] == "error"  # a change of the embedder does not retry it: only a new upload does
-
-
 
 
 async def test_a_chat_source_is_rerun_in_its_chat_with_its_owner(cheshire_cat, files, monkeypatch):

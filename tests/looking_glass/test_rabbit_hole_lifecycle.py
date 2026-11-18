@@ -349,9 +349,7 @@ async def test_the_lifecycle_of_the_sources(lizard, cheshire_cat, monkeypatch, o
             assert world.transfer_hook[transfers_before:] == []
             await asyncio.sleep(engine.lock_timeout_seconds() + 0.2)  # the marker and the heartbeat expire
         else:
-            # a copy that fails while written fails only if there is something to write: with no points it succeeds
-            copied = fault is None or (fault == "copy_fails" and not old_points)
-            assert world.transfer_hook[transfers_before:] == [(copied, True)]
+            assert world.transfer_hook[transfers_before:] == [(fault is None, True)]
         assert not await crud_ingestions.is_in_maintenance(agent)
         # the next pass of the resume brings the sources up to date (embedded again after a failed copy)
         await restart(lizard, cheshire_cat, expected)
