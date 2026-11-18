@@ -10,6 +10,7 @@ of the agent (contended: another pod is passing, the agent is left to it), a sou
   worker is dead (a live worker holds it);
 - it completed, but a tag of its diary is not the current one: the chunker, the embedder or the settings of a phase
   changed, or a phase was added;
+- its diary names a phase no longer installed (a plugin was uninstalled): the source is re-ingested from scratch;
 - it failed in a phase whose tag is not the current one anymore: the settings of that phase, or of a phase it depends on
   (a tag includes the tags of the phases it depends on), changed since, e.g. to fix the failure. The failed phase runs
   again, with the ones depending on it;
@@ -52,6 +53,8 @@ def _needs_attention(row: dict, tags: Dict[str, str], depends_on: Dict[str, tupl
     if row.get("status") in IN_FLIGHT:
         return True
     diary = row.get("completed_phases") or {}
+    if set(diary) - set(tags):
+        return True  # its diary names a phase no longer installed: rerun_source prunes it and re-ingests the source
     if row.get("status") == IngestionStatus.ERROR.value:
         # the phase that failed itself, not the ones inheriting its failure: its tag includes the tags of the phases it
         # depends on, so a change upstream shows there too

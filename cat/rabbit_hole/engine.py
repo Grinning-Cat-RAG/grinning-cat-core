@@ -32,6 +32,7 @@ from cat.rabbit_hole.phases import (
     compute_tags,
     execution_order,
 )
+from cat.services.memory.models import VectorMemoryType
 
 #: Identity of this process: the owner written in the rows it works on.
 BOOT_ID = uuid.uuid4().hex
@@ -176,8 +177,11 @@ async def _run_phase(phase: IngestionPhase, source: IngestionSource, cat) -> Pha
         await asyncio.sleep(retry_after)
 
 
-async def run_phases(rabbit_hole, cat, source: IngestionSource) -> Dict | None:
+async def run_phases(rabbit_hole, cat, source: IngestionSource, *, reindexing: bool = False) -> Dict | None:
     """Run the stale phases of the source (the lock of the source must be held) and write its final state.
+
+    With ``reindexing`` the source is marked ``reindexing`` while its phases run (a full in-place reindex, e.g.
+    ``RabbitHole.reingest_source``), and back to ``completed``/``error`` when they end.
 
     Returns the final row, or None when the row does not exist anymore (the source was deleted meanwhile).
     """
@@ -218,7 +222,7 @@ async def run_phases(rabbit_hole, cat, source: IngestionSource) -> Dict | None:
     if terminal and not _has_work(ordered, tags, diary):
         return row  # nothing changed: nothing is written (the periodic checks run on every finished source)
     try:
-        await _run_ordered(ordered, tags, diary, ran, source, cat, write, record)
+        await _run_ordered(ordered, tags, diary, ran, source, cat, write, record, reindexing=reindexing)
         # the error of the source is the one of its first failed phase in execution order: the cause, not the
         # dependents failing after it
         errors = [diary[p.id] for p in ordered if diary.get(p.id, {}).get("state") == STATE_ERROR]
@@ -257,9 +261,11 @@ def _has_work(ordered: List[IngestionPhase], tags: Dict[str, str], diary: Dict[s
     return any(_decide(phase, tags, diary, set()) is not None for phase in ordered)
 
 
-async def _run_ordered(ordered, tags, diary, ran, source, cat, write, record) -> None:
+async def _run_ordered(ordered, tags, diary, ran, source, cat, write, record, *, reindexing: bool = False) -> None:
     """Run the stale phases in order, recording each one when it ends (``diary`` and ``ran`` are updated)."""
-    await write(status=IngestionStatus.PROCESSING, owner=OWNER, error=None)
+    await write(
+        status=IngestionStatus.REINDEXING if reindexing else IngestionStatus.PROCESSING, owner=OWNER, error=None,
+    )
     for phase in ordered:
         decision = _decide(phase, tags, diary, ran)
         if decision is None:
@@ -285,9 +291,10 @@ async def _run_ordered(ordered, tags, diary, ran, source, cat, write, record) ->
 
 
 async def delete_source(rabbit_hole, cat, source: IngestionSource) -> None:
-    """Remove the source from the memory of the agent: what every phase produced (in reverse order), the files kept by
-    the RabbitHole and the row. An interrupted deletion resumes from the phases not yet removed (the row stays
-    ``deleting`` meanwhile). The lock of the source must be held."""
+    """Remove the source from the memory of the agent: what every phase produced (in reverse order), the points still
+    tagged with it in every collection (also of a phase no longer installed), the files kept by the RabbitHole and the
+    row. An interrupted deletion resumes from the phases not yet removed (the row stays ``deleting`` meanwhile). The
+    lock of the source must be held."""
     agent, chat, name = source.agent_id, source.chat_id, source.name
     row = await crud_ingestions.get_status(agent, chat, name)
     deleted = list(row.get("deleted_phases") or []) if row else []
@@ -304,6 +311,10 @@ async def delete_source(rabbit_hole, cat, source: IngestionSource) -> None:
         deleted.append(phase.id)
         if row is not None:
             await crud_ingestions.update_status(agent, chat, name, deleted_phases=deleted)
+    # A phase that is no longer installed cannot run its own delete: purge what it left behind, in every collection a
+    # phase writes sources to. Scoped by ``metadata.source`` so no other source (and no shared graph entity) is touched.
+    for collection in (str(VectorMemoryType.DECLARATIVE), str(VectorMemoryType.EPISODIC)):
+        await cat.vector_memory_handler.delete_tenant_points(collection, {"source": name})
     await crud_ingestions.delete_status(agent, chat, name)
 
 

@@ -15,7 +15,7 @@ from cat.db.cruds import ingestions as crud_ingestions
 from cat.db.cruds import users as crud_users
 from cat.looking_glass import CheshireCat
 from cat.rabbit_hole import RabbitHole, chunks, engine, recovery
-from cat.rabbit_hole.phases import IngestionSource
+from cat.rabbit_hole.phases import IngestionPhase, IngestionSource, PhaseResult
 from cat.services.memory.models import PointStruct, VectorMemoryType
 
 TEXT = ("Curiouser and curiouser! cried Alice, she was so much surprised. " * 30).encode()
@@ -1405,3 +1405,81 @@ async def test_the_procedures_are_embedded_again_not_copied(cheshire_cat, monkey
     assert calls == [None]
     points, _ = await handler.get_all_tenant_points(procedural, with_vectors=False)
     assert not old_ids & {str(p.id) for p in points}
+
+
+# --- a change of the phase set (a plugin installed or uninstalled) -----------------------------------------------
+
+class ExtraPhase(IngestionPhase):
+    """A plugin phase that writes its own point, tagged with the source, in a collection the built-in phases do not
+    delete on their own: the blanket purge of a deletion is what must remove it once the phase is gone."""
+
+    id = "extra"
+    depends_on = ("embedding",)
+
+    async def process(self, source, cat):
+        point = await a_point(cat, source.name)
+        await cat.vector_memory_handler.add_points_to_tenant(str(VectorMemoryType.EPISODIC), [point])
+        return PhaseResult(status="done")
+
+    async def delete(self, source, cat):
+        raise AssertionError("a removed phase cannot be called")
+
+
+def install_phase(monkeypatch, cheshire_cat, phase_class):
+    """Install ``phase_class`` in the set of phases; ``state["installed"] = False`` uninstalls it (its diary may remain)."""
+    manager_class = type(cheshire_cat.plugin_manager)
+    original = manager_class.execute_hook
+    state = {"installed": True}
+
+    async def execute_hook(self, name, *args, caller):
+        if name == "rabbithole_ingestion_phases" and state["installed"]:
+            return list(args[0]) + [phase_class]
+        return await original(self, name, *args, caller=caller)
+
+    monkeypatch.setattr(manager_class, "execute_hook", execute_hook)
+    return state
+
+
+async def test_delete_source_purges_the_points_of_a_removed_phase(cheshire_cat, files, monkeypatch):
+    state = install_phase(monkeypatch, cheshire_cat, ExtraPhase)
+    await ingest(cheshire_cat)
+    assert await points_of(cheshire_cat, "story.txt", VectorMemoryType.EPISODIC)  # the removed phase left a point
+
+    state["installed"] = False  # the plugin is uninstalled: its class, and so its delete, is gone
+    await cheshire_cat.rabbit_hole.delete_source(cheshire_cat, "story.txt")
+
+    assert await points_of(cheshire_cat, "story.txt", VectorMemoryType.DECLARATIVE) == []
+    assert await points_of(cheshire_cat, "story.txt", VectorMemoryType.EPISODIC) == []
+
+
+async def test_a_diary_naming_a_removed_phase_reingests_the_source(
+    lizard, cheshire_cat, files, monkeypatch, parses,
+):
+    await ingest(cheshire_cat)
+    # a phase was installed, ran, then uninstalled: its diary entry remains
+    await crud_ingestions.record_phase(
+        cheshire_cat.agent_key, None, "story.txt", "removed_phase", {"state": "complete", "tag": "old"},
+    )
+    warnings = []
+    from cat.rabbit_hole import core as rabbit_hole_core
+
+    real_log = rabbit_hole_core.log
+
+    class RecordingLog:
+        def warning(self, msg):
+            warnings.append(msg)
+
+        def __getattr__(self, name):
+            return getattr(real_log, name)
+
+    monkeypatch.setattr("cat.rabbit_hole.core.log", RecordingLog())
+    parses.clear()
+
+    await recovery.resume_agent(lizard, cheshire_cat.agent_key)
+
+    row = await crud_ingestions.get_status(cheshire_cat.agent_key, None, "story.txt")
+    assert row["status"] == "completed"
+    assert "removed_phase" not in row["completed_phases"]  # the stale diary entry is pruned
+    assert set(row["completed_phases"]) == {"parsing_chunking", "embedding"}  # every phase ran again
+    assert parses == ["story.txt"]  # re-ingested from scratch
+    assert any("removed_phase" in w and "no longer installed" in w for w in warnings)

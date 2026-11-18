@@ -51,6 +51,7 @@ class IngestionStatus(str, Enum):
     COMPLETED = "completed"
     ERROR = "error"
     DELETING = "deleting"
+    REINDEXING = "reindexing"
 
 
 #: Display labels of the states (English defaults: a client localizes them by the state id)
@@ -62,6 +63,7 @@ STATUS_LABELS = {
     IngestionStatus.COMPLETED.value: "Completed",
     IngestionStatus.ERROR.value: "Error",
     IngestionStatus.DELETING.value: "Deleting",
+    IngestionStatus.REINDEXING.value: "Reindexing",
 }
 
 
