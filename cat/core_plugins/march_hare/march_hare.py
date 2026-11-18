@@ -1,6 +1,8 @@
 import asyncio
 import json
+import os
 import random
+import time
 import redis.asyncio as aioredis
 from typing import Dict, Callable, Optional
 
@@ -31,6 +33,11 @@ class MarchHareConfig:
 class MarchHare:
     def __init__(self):
         self.pod_id = pod_id()
+        # Identity of this process inside the pod. Every uvicorn worker of a
+        # container shares pod_id, so the pod alone cannot tell "I published
+        # this event" from "a sibling worker published it". In memory only: a
+        # restarted process is a new worker and must not skip older events.
+        self.worker_id = f"{os.getpid()}:{time.time_ns()}"
         self._async_redis_client = get_async_db()
         self._stop_event = asyncio.Event()
 
@@ -115,6 +122,7 @@ class MarchHare:
                 "event_type": event_type,
                 "payload": json.dumps(payload),
                 "source_pod": self.pod_id,
+                "source_worker": self.worker_id,
             }
 
             await self._async_redis_client.xadd(
@@ -253,9 +261,13 @@ async def _handle_plugin_event(lizard, data: dict) -> None:
     try:
         event_type = data.get("event_type")
         source_pod = data.get("source_pod")
+        source_worker = data.get("source_worker")
         payload = json.loads(data.get("payload", "{}"))
 
-        if source_pod == _march_hare.pod_id:
+        # Skip only the event this very process published: the other workers of
+        # the same pod must apply it too. An event without source_worker (sent
+        # by an older version) cannot be proven to be ours, so it is applied.
+        if source_pod == _march_hare.pod_id and source_worker == _march_hare.worker_id:
             log.debug(f"[March Hare] Ignoring self-originated event: '{event_type}'.")
             return
 

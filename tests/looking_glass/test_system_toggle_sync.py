@@ -33,10 +33,11 @@ async def toggled_by_another_pod(active: bool) -> None:
     await crud_settings.upsert_setting_by_name(DEFAULT_SYSTEM_KEY, Setting(name="active_plugins", value=plugins))
 
 
-async def deliver(lizard, source_pod: str = "another-pod") -> None:
+async def deliver(lizard, source_pod: str = "another-pod", source_worker: str = "another-worker") -> None:
     await mh._handle_plugin_event(lizard, {
         "event_type": mh.MarchHareConfig.events["PLUGIN_SYSTEM_TOGGLE"],
         "source_pod": source_pod,
+        "source_worker": source_worker,
         "payload": json.dumps({"plugin_id": PLUGIN}),
     })
 
@@ -99,8 +100,28 @@ async def test_activated_by_another_pod(lizard, plugin_manager):
 async def test_an_event_of_the_pod_itself_is_ignored(lizard, plugin_manager):
     await toggled_by_another_pod(active=False)
     with mock.patch.object(lizard, "sync_system_plugins", mock.AsyncMock()) as sync:
-        await deliver(lizard, source_pod=mh._march_hare.pod_id)
+        await deliver(
+            lizard,
+            source_pod=mh._march_hare.pod_id,
+            source_worker=mh._march_hare.worker_id,
+        )
     sync.assert_not_awaited()
+
+
+async def test_an_event_of_a_sibling_worker_is_applied(lizard, plugin_manager):
+    """The pod id is shared by every worker of the container: only the publishing worker skips its own event."""
+    endpoints = list(lizard.plugin_manager.plugins[PLUGIN].endpoints)
+    await toggled_by_another_pod(active=False)
+    with mock.patch.object(
+        lizard, "sync_system_plugins", mock.AsyncMock(wraps=lizard.sync_system_plugins)
+    ) as sync:
+        await deliver(
+            lizard,
+            source_pod=mh._march_hare.pod_id,
+            source_worker="other-worker",
+        )
+    sync.assert_awaited_once()
+    await assert_aligned(lizard, endpoints)
 
 
 async def test_duplicated_events_change_nothing(lizard, plugin_manager):
