@@ -69,9 +69,11 @@ class ConnectionAuth(ABC):
         has_cat_custom_endpoint = ccat.has_custom_endpoint(url_path, method=method) if ccat is not None else False
 
         # if the request comes from a custom endpoint, and it is not available in the picked CheshireCat, block it and
-        # return a 404-HTTP error
+        # return a 404-HTTP error. A system-only plugin provides its services to every agent (like the embedder): its
+        # endpoints are instance-level, and the handler scopes the response to the picked agent.
         if is_custom_endpoint and is_triggered_by_cat and not has_cat_custom_endpoint:
-            raise CustomNotFoundException("Not Found")
+            if not lizard.is_system_custom_endpoint(url_path, method=method):
+                raise CustomNotFoundException("Not Found")
 
         # always try core auth first (less costly, in general)
         user = None
