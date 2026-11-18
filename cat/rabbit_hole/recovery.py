@@ -35,6 +35,7 @@ from cat.db.cruds import ingestions as crud_ingestions
 from cat.db.cruds import settings as crud_settings
 from cat.db.cruds.ingestions import IngestionStatus
 from cat.env import get_env_int
+from cat.exceptions import UnknownAgentException
 from cat.log import log
 from cat.rabbit_hole import engine
 from cat.rabbit_hole.phases import compute_tags
@@ -88,7 +89,12 @@ async def resume_agent(lizard, agent_id: str) -> None:
         ):
             rows = await crud_ingestions.list_statuses(agent_id)
             transfer = await crud_ingestions.get_vector_transfer(agent_id)
-            if (not rows and transfer is None) or (ccat := await lizard.get_cheshire_cat(agent_id)) is None:
+            try:
+                ccat = await lizard.get_cheshire_cat(agent_id)
+            except UnknownAgentException:
+                # the agent is gone between enumeration and resume: nothing to resume
+                return
+            if (not rows and transfer is None) or ccat is None:
                 return
             if transfer is not None:
                 if time.time() - transfer["beat"] <= engine.lock_timeout_seconds():
