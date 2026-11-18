@@ -1405,3 +1405,15 @@ async def test_the_procedures_are_embedded_again_not_copied(cheshire_cat, monkey
     assert calls == [None]
     points, _ = await handler.get_all_tenant_points(procedural, with_vectors=False)
     assert not old_ids & {str(p.id) for p in points}
+
+
+async def test_the_resume_purges_the_sources_of_a_destroyed_chat(lizard, cheshire_cat, files):
+    stray = await chat_of_a_user(cheshire_cat)
+    await ingest(stray, "kept.txt")
+    await crud_ingestions.create_status(cheshire_cat.agent_key, "gone-chat", "orphan.txt", type_="file")
+    await crud_ingestions.update_status(cheshire_cat.agent_key, "gone-chat", "orphan.txt", status="processing")
+
+    await recovery.resume_agent(lizard, cheshire_cat.agent_key)
+
+    assert await crud_ingestions.get_status(cheshire_cat.agent_key, "gone-chat", "orphan.txt") is None
+    assert await crud_ingestions.get_status(cheshire_cat.agent_key, "chat-1", "kept.txt") is not None

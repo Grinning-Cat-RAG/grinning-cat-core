@@ -22,7 +22,10 @@ from cat.db.cruds.ingestions import PHASE_ID, IngestionStatus
 from cat.db.database import get_async_db
 from cat.env import get_env_int
 from cat.log import log
+from cat.services.memory.models import VectorMemoryType
 from cat.rabbit_hole.phases import (
+    PHASE_EMBEDDING,
+    PHASE_PARSING_CHUNKING,
     EmbeddingPhase,
     IngestionPhase,
     IngestionSource,
@@ -176,6 +179,46 @@ async def _run_phase(phase: IngestionPhase, source: IngestionSource, cat) -> Pha
         await asyncio.sleep(retry_after)
 
 
+async def _stored_points(cat, source: IngestionSource) -> int | None:
+    """The points stored for the source (``None`` when the store cannot be read: never force a re-processing on it)."""
+    collection = str(VectorMemoryType.DECLARATIVE if source.chat_id is None else VectorMemoryType.EPISODIC)
+    metadata = {"source": source.name}
+    if source.chat_id is not None:
+        metadata["chat_id"] = source.chat_id
+    try:
+        points, _ = await cat.vector_memory_handler.get_all_tenant_points(
+            collection, metadata=metadata, with_vectors=False,
+        )
+    except Exception as e:  # noqa: BLE001 - a store failure is not proof that the points are gone
+        log.warning(f"Agent id: {source.agent_id}. Cannot check the stored points of {source.name}: {e}")
+        return None
+    return len(points)
+
+
+async def store_grounded_freshness(ordered, tags, diary, cat, source: IngestionSource) -> bool:
+    """Ground the freshness of a source in the store: a fresh diary over zero stored points is stale.
+
+    When every phase is up to date (no work) and the two producing phases completed, but the source has no stored
+    point, their entries are dropped so ``parsing_chunking`` and ``embedding`` run again. Returns whether it forced
+    them.
+    """
+    if any(_decide(phase, tags, diary, set()) is not None for phase in ordered):
+        return False
+    producing = (PHASE_PARSING_CHUNKING, PHASE_EMBEDDING)
+    if any((diary.get(phase_id) or {}).get("state") != STATE_COMPLETE for phase_id in producing):
+        return False
+    stored = await _stored_points(cat, source)
+    if stored == 0:
+        log.warning(
+            f"Agent id: {source.agent_id}. The source {source.name} is up to date but has no stored points: "
+            f"processing it again"
+        )
+        for phase_id in producing:
+            diary.pop(phase_id, None)
+        return True
+    return False
+
+
 async def run_phases(rabbit_hole, cat, source: IngestionSource) -> Dict | None:
     """Run the stale phases of the source (the lock of the source must be held) and write its final state.
 
@@ -216,7 +259,11 @@ async def run_phases(rabbit_hole, cat, source: IngestionSource) -> Dict | None:
     ran: set = set()
     terminal = row["status"] in (IngestionStatus.COMPLETED.value, IngestionStatus.ERROR.value)
     if terminal and not _has_work(ordered, tags, diary):
-        return row  # nothing changed: nothing is written (the periodic checks run on every finished source)
+        # the diary may be fresh while the store lost the source (e.g. its collection was recreated): the producing
+        # phases are forced again, so a source never looks up to date without its points
+        await store_grounded_freshness(ordered, tags, diary, cat, source)
+        if not _has_work(ordered, tags, diary):
+            return row  # nothing changed: nothing is written (the periodic checks run on every finished source)
     try:
         await _run_ordered(ordered, tags, diary, ran, source, cat, write, record)
         # the error of the source is the one of its first failed phase in execution order: the cause, not the
@@ -310,5 +357,5 @@ async def delete_source(rabbit_hole, cat, source: IngestionSource) -> None:
 __all__ = [
     "BOOT_ID", "OWNER", "IngestionCanceled", "LockError", "LockLost", "agent_exists", "collect_phases",
     "delete_source",
-    "heartbeat_seconds", "lock_timeout_seconds", "run_phases", "source_lock",
+    "heartbeat_seconds", "lock_timeout_seconds", "run_phases", "source_lock", "store_grounded_freshness",
 ]
