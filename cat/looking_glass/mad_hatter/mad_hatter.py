@@ -2,12 +2,12 @@ import glob
 from graphlib import TopologicalSorter, CycleError
 from inspect import iscoroutinefunction
 import os
-import shutil
 from pathlib import Path
 from typing import List, Dict, Any
 from pydantic import BaseModel, Field, ConfigDict
 
 from cat import utils
+from cat.db.crud import distributed_lock
 from cat.db.cruds import plugins as crud_plugins, settings as crud_settings
 from cat.db.database import DEFAULT_SYSTEM_KEY
 from cat.db.models import Setting
@@ -18,6 +18,7 @@ from cat.looking_glass.mad_hatter.decorators.hook import CatHook
 from cat.looking_glass.mad_hatter.plugin import Plugin
 from cat.looking_glass.mad_hatter.plugin_extractor import PluginExtractor
 from cat.looking_glass.mad_hatter.procedures import CatProcedure
+from cat.services.atomic_fs import trash_then_delete
 
 
 class LoadedPlugin(BaseModel):
@@ -33,7 +34,9 @@ class MadHatter:
     """
     def __init__(self, agent_key: str):
         self._agent_key = agent_key
-        self._skip_folders = ["__pycache__", "lost+found"]
+        # ".tmp"/".trash": the staging and trash folders of the atomic plugin install (see cat.services.atomic_fs);
+        # ".git": never a plugin. None of them may ever be discovered as a plugin id.
+        self._skip_folders = ["__pycache__", "lost+found", ".tmp", ".trash", ".git"]
 
         self.plugins: Dict[str, Plugin] = {}
         # a unified registry for all procedures (local tools, forms, remote clients)
@@ -91,18 +94,31 @@ class MadHatter:
         Returns:
             str: The ID of the installed plugin.
         """
-        # extract zip/tar file into plugin folder
+        # only the filesystem mutations are serialized: the extraction/validation and the missing-deps cleanup.
+        # `load_plugin` may run `uv sync` for minutes and the activation touches the database, so both stay outside
+        # the lock: holding it there would block every other worker installing or uninstalling the same plugin.
         extractor = PluginExtractor(package_plugin)
-        plugin_path = extractor.extract(utils.get_plugins_path())
         plugin_id = extractor.id
+        trash_root = os.path.join(utils.get_plugins_path(), ".trash")
+
+        async with distributed_lock(f"plugin-fs:{plugin_id}", timeout=300, blocking_timeout=60):
+            # extract zip/tar file into plugin folder
+            plugin_path = extractor.extract(utils.get_plugins_path())
 
         if missing_deps := (await self.load_plugin(plugin_id, with_deactivation=False)).missing_dependencies:
             # remove plugin folder
-            shutil.rmtree(plugin_path)
+            async with distributed_lock(f"plugin-fs:{plugin_id}", timeout=300, blocking_timeout=60):
+                trash_then_delete(plugin_path, trash_root)
             raise Exception(f"Cannot install plugin {plugin_id} because of missing dependencies: {missing_deps}")
 
-        # install the extracted plugin
-        return await self.install_extracted_plugin(plugin_id)
+        # install the extracted plugin. Race: another worker may uninstall the plugin between the extraction and
+        # this activation; `activate_plugin` then raises "not present in plugins folder", the failure is logged and
+        # the database stays the source of truth (the plugin is not in `active_plugins`).
+        try:
+            return await self.install_extracted_plugin(plugin_id)
+        except Exception as e:
+            log.error(f"Could not activate plugin {plugin_id} after extraction: {e}")
+            raise
 
     async def install_extracted_plugin(self, plugin_id: str, persist: bool = True) -> str:
         """
@@ -141,30 +157,33 @@ class MadHatter:
         if plugin_id in self.get_core_plugins_ids:
             return
 
-        if not self.plugin_exists(plugin_id):
-            # another instance already uninstalled it (folder and database): this one only forgets it
-            await self._forget_plugin(plugin_id)
-            return
+        # the folder removal and the database cleanup are one operation: another worker must not install the same
+        # plugin between the two
+        async with distributed_lock(f"plugin-fs:{plugin_id}", timeout=60, blocking_timeout=30):
+            if not self.plugin_exists(plugin_id):
+                # another instance already uninstalled it (folder and database): this one only forgets it
+                await self._forget_plugin(plugin_id)
+                return
 
-        # if the plugin is within the dependencies of other plugins, raise an exception
-        dependent_plugins = self._get_plugins_depending_on(plugin_id)
-        if dependent_plugins:
-            raise Exception(
-                f"Cannot uninstall plugin {plugin_id} because it is a dependency of the following plugins: "
-                f"{', '.join(dependent_plugins)}"
-            )
+            # if the plugin is within the dependencies of other plugins, raise an exception
+            dependent_plugins = self._get_plugins_depending_on(plugin_id)
+            if dependent_plugins:
+                raise Exception(
+                    f"Cannot uninstall plugin {plugin_id} because it is a dependency of the following plugins: "
+                    f"{', '.join(dependent_plugins)}"
+                )
 
-        # from the folder: an installed but inactive plugin is not among the loaded ones
-        plugin_path = self._get_plugin_folder_path(plugin_id)
+            # from the folder: an installed but inactive plugin is not among the loaded ones
+            plugin_path = self._get_plugin_folder_path(plugin_id)
 
-        # deactivate plugin if it is active (will sync cache)
-        if plugin_id in self.active_plugins:
-            await self.deactivate_plugin(plugin_id)
+            # deactivate plugin if it is active (will sync cache)
+            if plugin_id in self.active_plugins:
+                await self.deactivate_plugin(plugin_id)
 
-        # remove plugin folder
-        shutil.rmtree(plugin_path)
+            # remove plugin folder
+            trash_then_delete(plugin_path, os.path.join(os.path.dirname(plugin_path), ".trash"))
 
-        await crud_plugins.destroy_plugin(plugin_id)
+            await crud_plugins.destroy_plugin(plugin_id)
 
     async def _forget_plugin(self, plugin_id: str):
         """Deactivate in memory a plugin whose folder is gone, without touching the database: another instance

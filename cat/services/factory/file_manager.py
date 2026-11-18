@@ -25,7 +25,8 @@ class BaseFileManager(ABC):
     """
     def __init__(self):
         # ".rabbithole": the files kept by the RabbitHole for the sources (chunks, images, bytes of the URLs)
-        self._excluded_dirs = ["__pycache__", ".rabbithole"]
+        # ".trash": where the atomic removals park a folder before deleting it (see cat.services.atomic_fs)
+        self._excluded_dirs = ["__pycache__", ".rabbithole", ".trash"]
         self._excluded_files = [".gitignore", ".DS_Store", ".gitkeep", ".git", ".dockerignore"]
         self._root_dir = utils.get_file_manager_root_storage_path()
 
@@ -268,7 +269,9 @@ class BaseFileManager(ABC):
         # RabbitHole), keeping its place under the folder; skipping excluded files
         for file in self._walk_files(remote_dir):
             relative = os.path.relpath(file.path, remote_dir) if file.path.startswith(remote_dir + os.sep) else file.name
-            if file.name in self._excluded_files or "__pycache__" in Path(relative).parts:
+            parts = set(Path(relative).parts)
+            # ".rabbithole" is intentionally downloaded (the chunks/images of the sources); ".trash" is internal
+            if file.name in self._excluded_files or bool(parts & {"__pycache__", ".trash"}):
                 continue
             local_path = os.path.join(local_dir, relative)
             os.makedirs(os.path.dirname(local_path), exist_ok=True)

@@ -6,6 +6,7 @@ from pathlib import Path
 from slugify import slugify
 
 from cat.log import log
+from cat.services.atomic_fs import atomic_replace_dir
 from cat.services.python_security import ast_scan, SecurityError
 from cat.utils import get_allowed_plugins_mime_types
 
@@ -76,8 +77,11 @@ class PluginExtractor:
         return True
 
     def extract(self, to: str) -> str:
-        # create tmp directory
-        tmp_folder_name = f"/tmp/{uuid.uuid1()}"
+        # extract into a temporary folder on the SAME filesystem as the target: the final rename must be atomic,
+        # and os.replace cannot move a directory across devices
+        tmp_root = os.path.join(to, ".tmp")
+        os.makedirs(tmp_root, exist_ok=True)
+        tmp_folder_name = os.path.join(tmp_root, uuid.uuid4().hex)
         os.makedirs(tmp_folder_name)
 
         # extract into tmp directory
@@ -97,13 +101,10 @@ class PluginExtractor:
                 raise ValueError("Plugin contains unsafe Python files")
 
             # proceed with installation if checks pass
-            # move plugin folder to cat plugins folder
+            # swap the plugin folder in with an atomic rename: a concurrent reader sees the old version or the new
+            # one, never a missing or half-written folder
             folder_to = os.path.join(to, self._id)
-
-            # if `folder_to` exists, delete it as it will be replaced
-            if os.path.exists(folder_to):
-                shutil.rmtree(folder_to)
-            shutil.move(tmp_folder_to, folder_to)
+            atomic_replace_dir(tmp_folder_to, folder_to, os.path.join(to, ".trash"))
 
             return folder_to
         except Exception as e:
@@ -112,7 +113,7 @@ class PluginExtractor:
         finally:
             # Cleanup temporary directory
             if os.path.exists(tmp_folder_name):
-                shutil.rmtree(tmp_folder_name)
+                shutil.rmtree(tmp_folder_name, ignore_errors=True)
 
             # Remove zip after extraction
             if os.path.exists(self._path):

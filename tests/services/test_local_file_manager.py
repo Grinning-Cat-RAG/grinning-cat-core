@@ -93,3 +93,19 @@ def test_a_file_removed_while_listing_is_skipped(manager, monkeypatch):
 
     monkeypatch.setattr(os, "stat", stat)
     assert [f.name for f in manager.list_files("agent")] == ["kept.bin"]
+
+
+def test_download_folder_keeps_the_rabbithole_files_and_skips_the_trash(manager):
+    # regression: download_folder must keep the RabbitHole files (chunks/images); only __pycache__ and .trash are
+    # internal. list_files is the one that hides .rabbithole.
+    manager.write_file(b"pdf", "doc.pdf", "agent")
+    manager.write_file(b"notes", "c1/notes.txt", "agent")
+    manager.write_file(b'{"x": 1}', ".rabbithole/x.json", "agent")
+    manager.write_file(b"y", ".trash/y", "agent")
+
+    downloaded = manager.download_folder("local", "agent")
+
+    local_root = os.path.join(manager._root_dir, "local")
+    assert sorted(os.path.relpath(path, local_root) for path in downloaded) == [
+        ".rabbithole/x.json", "c1/notes.txt", "doc.pdf",
+    ]
