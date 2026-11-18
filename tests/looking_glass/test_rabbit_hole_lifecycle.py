@@ -90,6 +90,7 @@ class World:
         self.parsed = []
         self.embedder = "embedder-1"
         self.transfer_hook = []  # (success, in maintenance) of every after_vector_memory_transfer_on_agent
+        self.crash_started = {}  # source -> event set when its embedding starts, so the crash lands there
 
 
 CURRENT = {}  # the world of the running example: the hypothesis examples share the monkeypatch of the test
@@ -127,7 +128,11 @@ def install(world: World, cheshire_cat, monkeypatch):
         return parsed
 
     async def embed(self, docs, source, *args):
-        await asyncio.sleep(0)  # the crash lands here
+        started = CURRENT["world"].crash_started.get(source)
+        if started is not None:  # the worker dies here: the upload is canceled while it waits
+            started.set()
+            await asyncio.Event().wait()
+        await asyncio.sleep(0)  # the embedding awaits, as a real one would (and the crash can land here)
         if CURRENT["world"].faults.get(source) == "embed":
             raise ConnectionError("embedder down")
         return await real_embed(self, docs, source, *args)
@@ -259,18 +264,19 @@ async def test_the_lifecycle_of_the_sources(lizard, cheshire_cat, monkeypatch, o
         return await call("DELETE", "/ingestion/status", name)
 
     async def crash_source(name):
-        """An upload whose worker dies during the embedding: its lock is never released (it expires)."""
+        """An upload whose worker dies during the embedding: its lock is never released (it expires). The embedding
+        waits for the cancel: no polling of a transient phase (it may be missed, the upload finishing before it)."""
         world.faults[name] = None
-        task = asyncio.create_task(upload(name))
-        for _ in range(500):  # until the embedding starts (the upload may wait for the lock of an earlier crash)
-            row = await crud_ingestions.get_status(agent, None, name)
-            if row and row.get("phase") == "embedding":
-                break
-            await asyncio.sleep(0.01)
-        with patch.object(Lock, "release", side_effect=LockError("the worker is dead")):
-            task.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await task
+        started = world.crash_started[name] = asyncio.Event()
+        try:
+            task = asyncio.create_task(upload(name))  # it may wait for the lock of an earlier crash
+            await asyncio.wait_for(started.wait(), 10)
+            with patch.object(Lock, "release", side_effect=LockError("the worker is dead")):
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+        finally:
+            world.crash_started.pop(name, None)
         row = await crud_ingestions.get_status(agent, None, name)
         assert row["status"] == "processing" and row["owner"] is not None
 
@@ -284,6 +290,14 @@ async def test_the_lifecycle_of_the_sources(lizard, cheshire_cat, monkeypatch, o
         collection = str(VectorMemoryType.DECLARATIVE)
         # the old database keeps its points
         old_points, _ = await cheshire_cat.vector_memory_handler.get_all_tenant_points(collection, with_vectors=True)
+        if fault == "copy_fails" and not old_points:
+            # the copy fails while it writes: with no point to copy the failure is never injected and the copy
+            # legitimately succeeds. A previous database holds old knowledge: give it one point to fail on.
+            size = await embedding_size(await cheshire_cat.embedder())
+            old_points = [PointStruct(
+                id=uuid.uuid4().hex, vector=[0.1] * size,
+                payload={"page_content": "old knowledge", "metadata": {"source": "old.txt"}},
+            )]
         embedded = {  # the sources with their points: they keep them, in error too
             row["source"] for row in await crud_ingestions.list_statuses(agent)
             if (row["completed_phases"].get("embedding") or {}).get("state") == engine.STATE_COMPLETE
@@ -392,13 +406,32 @@ async def test_the_lifecycle_of_the_sources(lizard, cheshire_cat, monkeypatch, o
             world.faults[uploaded] = None
             parsed_before = len(world.parsed)
             legacy = set(world.legacy)
+            statuses = await crud_ingestions.list_statuses(agent)
+            with_chunks = {
+                row["source"] for row in statuses
+                if (row["completed_phases"].get("parsing_chunking") or {}).get("state") == engine.STATE_COMPLETE
+            }
+            without_chunks = {row["source"] for row in statuses} - with_chunks
+            with_bytes = {
+                row["source"] for row in statuses
+                if cheshire_cat.file_manager.file_exists(row["source"], chunks.owner_folder(agent, None))
+            }
             await asyncio.gather(lizard.embed_all_in_cheshire_cats(), upload(uploaded))
             restarted(expected)
             expected[uploaded] = "completed"
             expected.update({source: "completed" for source in legacy})  # the old sources got their state
             world.legacy.clear()
+            # every source runs again: one in error completes when its failure does not outlive the re-run and it has
+            # something to run from (its stored chunks, or the file an earlier upload kept). An empty re-upload resets
+            # the row but leaves the file: the source parses again and completes.
+            for source, state in list(expected.items()):
+                if state == "error" and source in with_chunks | with_bytes \
+                        and world.faults.get(source) not in ("parse", "embed", "plugin_error"):
+                    expected[source] = "completed"
             parsed = world.parsed[parsed_before:]
-            assert set(parsed) <= {uploaded} | legacy  # the sources with a state reuse their chunks
+            # the sources with stored chunks reuse them; the others have none to reuse and are parsed again (the one
+            # uploaded now, the legacy ones, and those whose row was reset by an empty re-upload)
+            assert set(parsed) <= {uploaded} | legacy | without_chunks
             assert all(parsed.count(source) == 1 for source in legacy - {uploaded})
         elif kind == "legacy":
             # a source ingested before the states existed
