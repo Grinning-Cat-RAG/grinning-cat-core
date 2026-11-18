@@ -9,6 +9,7 @@ from stat import S_ISREG
 from typing import List, Tuple
 
 from cat.log import log
+from cat.services.atomic_fs import atomic_move_file, trash_then_delete
 from cat.services.factory.file_manager import BaseFileManager, FileResponse
 
 #: SHA-256 of the files listed by this instance, by (path, size, modification time, inode): a file is read again only
@@ -55,9 +56,8 @@ class LocalFileManager(BaseFileManager):
 
     def _upload_file(self, file_path: str, destination_path: str) -> str:
         if file_path != destination_path:
-            os.makedirs(os.path.dirname(destination_path), exist_ok=True)
-            # move the file from file_path to destination_path
-            shutil.move(file_path, destination_path)
+            # move the file from file_path to destination_path, never exposing a partially written destination
+            atomic_move_file(file_path, destination_path)
         return destination_path
 
     def _download_file_to_local(self, file_path: str, local_path: str) -> str:
@@ -78,7 +78,8 @@ class LocalFileManager(BaseFileManager):
     def _remove_folder(self, remote_root_dir: str) -> bool:
         if os.path.exists(remote_root_dir) and os.path.isdir(remote_root_dir):
             try:
-                shutil.rmtree(remote_root_dir)
+                # rename into the trash first: a concurrent reader sees the whole folder or nothing
+                trash_then_delete(remote_root_dir, os.path.join(self._root_dir, ".trash"))
             except Exception as e:
                 log.error(f"Error while removing storage: {e}")
                 return False
