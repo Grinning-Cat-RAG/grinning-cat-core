@@ -424,3 +424,18 @@ async def test_rerunning_an_agent_retries_the_failed_phases_on_request(cheshire_
 
     assert plain == {"completed": 1, "error": 1, "skipped": 1}  # a failure stays, the deletion completes
     assert retried == {"completed": 2, "error": 0, "skipped": 0}
+
+
+async def test_the_service_names_are_exposed(secure_client, secure_client_headers, cheshire_cat, files):
+    files.write_file(b"the source bytes", "named.txt", cheshire_cat.agent_key)
+    await crud_ingestions.create_status(
+        cheshire_cat.agent_key, None, "named.txt", type_="file",
+        embedder_name="embedder-x", chunker_name="chunker-y",
+    )
+    await crud_ingestions.update_status(cheshire_cat.agent_key, None, "named.txt", status="completed")
+
+    response = await secure_client.get("/ingestion/status", headers=secure_client_headers)
+
+    assert response.status_code == 200
+    row = response.json()[0]
+    assert (row["embedder_name"], row["chunker_name"]) == ("embedder-x", "chunker-y")
