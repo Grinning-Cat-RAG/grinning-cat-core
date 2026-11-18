@@ -20,7 +20,7 @@ from cat.looking_glass.cheshire_cat import CheshireCat
 from cat.looking_glass.mad_hatter.mad_hatter import MadHatter
 from cat.looking_glass.mad_hatter.registry import PluginRegistry
 from cat.mixins import NonCopyableMixin, OrchestratorMixin
-from cat.rabbit_hole import RabbitHole
+from cat.rabbit_hole import RabbitHole, engine
 from cat.rabbit_hole.phases import PHASE_EMBEDDING
 from cat.services.memory.models import VectorMemoryType
 from cat.rabbit_hole import recovery as ingestion_recovery
@@ -31,6 +31,12 @@ from cat.utils import safe_deepcopy, sanitize_permissions, singleton
 
 #: TTL of the maintenance marker set on every agent while the embedder changes (cleared at the end of each agent)
 EMBED_ALL_MAINTENANCE_SECONDS = 2 * 3600
+
+
+def _has_embeddings(row: Dict) -> bool:
+    """Whether the source of the row has points to re-embed: its embedding phase completed. A source that failed
+    before it (e.g. an upload that kept no bytes) has none, and only a new upload or a reingest retries it."""
+    return ((row.get("completed_phases") or {}).get(PHASE_EMBEDDING) or {}).get("state") == engine.STATE_COMPLETE
 
 
 @singleton
@@ -257,9 +263,11 @@ class BillTheLizard(OrchestratorMixin, NonCopyableMixin):
         Changing the embedder recreates the collections (``initialize``), shared by every agent. First, every source
         without an ingestion state (ingested before the states existed) is adopted (it gets its state, holding its
         lock): from then on a deletion removes it as any other source. Then every database is initialized (serialized),
-        then the re-embeds run under the concurrency cap: every source runs its embedding again (the stored chunks are
-        reused; an adopted source runs every phase, from its file), whatever its diary says: the collections were
-        recreated. Meanwhile every agent is in maintenance, so the automatic resume leaves it alone.
+        then the re-embeds run under the concurrency cap: every source with points runs its embedding again (the stored
+        chunks are reused; an adopted source runs every phase, from its file), whatever its diary says: the collections
+        were recreated. A source in error that failed before its embedding has no point to re-embed: it is left alone
+        (only a new upload or a reingest retries it). Meanwhile every agent is in maintenance, so the automatic resume
+        leaves it alone.
         """
 
         async def embed_with_limit(entry_):
@@ -268,6 +276,10 @@ class BillTheLizard(OrchestratorMixin, NonCopyableMixin):
                 await ccat.embed_procedures()
                 # every source: its embedding again (and the phases depending on it)
                 for row in entry_["rows"]:
+                    if row.get("status") == crud_ingestions.IngestionStatus.ERROR.value and not _has_embeddings(row):
+                        # it failed before its embedding produced any point: there is nothing to re-embed, and only a
+                        # new upload (or a reingest) retries it, not a change of the embedder
+                        continue
                     await self.rabbit_hole.rerun_source(ccat, row["source"], row["chat_id"], invalidate=[PHASE_EMBEDDING])
                 await crud_ingestions.clear_maintenance(ccat.agent_key)
 
