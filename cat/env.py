@@ -32,8 +32,11 @@ def get_supported_env_variables():
         "CAT_CRYPTO_SALT": None, # REQUIRED: no default, the app refuses to start without a strong secret
         "CAT_INGESTION_MAX_CONCURRENCY": "2",
         "CAT_INGESTION_WORKERS": "2",
+        "CAT_DELETE_COMPLETION_ON_BOOT": "true",
         "CAT_INGESTION_NICENESS": "5",
         "CAT_INGESTION_HEARTBEAT_SECONDS": "30",
+        "CAT_INGESTION_DELETE_QUIESCE_SECONDS": "180",
+        "CAT_INGESTION_DELETE_POLL_SECONDS": "5",
         "CAT_INGESTION_LOCK_TIMEOUT_SECONDS": "300",
         "CAT_INGESTION_NOT_READY_MAX_SECONDS": "3600",
         "CAT_INGESTION_RESUME_INTERVAL_SECONDS": "60",
