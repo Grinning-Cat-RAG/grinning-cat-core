@@ -596,3 +596,25 @@ async def test_the_record_of_a_vector_transfer_lives_until_it_is_ended():
     assert await crud_ingestions.get_vector_transfer("a1") is None
     await crud_ingestions.beat_vector_transfer("a1", since)  # a late heartbeat does not bring it back
     assert await crud_ingestions.get_vector_transfer("a1") is None
+
+
+def test_source_warnings_are_aggregated_and_normalized():
+    row = {
+        "completed_phases": {
+            "parsing_chunking": {"state": "complete", "warnings": [{"code": " MiXeD Code! ", "detail": "x"}]},
+            "graph": {
+                "state": "complete",
+                "warnings": [{"code": ""}, {"code": None}, {"detail": "no code"}, "Some Thing"],
+            },
+            "embedding": {"state": "complete"},
+        }
+    }
+
+    warnings = crud_ingestions.source_warnings(row)
+
+    assert [warning["code"] for warning in warnings] == [
+        "mixed_code", "unknown", "unknown", "unknown", "some_thing",
+    ]
+    assert warnings[0]["detail"] == "x"
+    assert crud_ingestions.normalize_warning_code("A--B") == "a_b"
+    assert crud_ingestions.normalize_warning_code(42) == crud_ingestions.WARNING_CODE_UNKNOWN

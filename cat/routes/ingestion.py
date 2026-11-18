@@ -32,6 +32,9 @@ class IngestionStatusResponse(BaseModel):
     phase_label: str | None = None
     error: str | None = None
     completed_phases: Dict[str, Dict[str, Any]] = {}
+    warnings: List[Dict[str, Any]] = []
+    warning_count: int = 0
+    has_warnings: bool = False
     created_at: float
     updated_at: float
 
@@ -82,14 +85,20 @@ async def get_ingestion_statuses(
     """The ingestion states of the sources of the knowledge base, or of the chat of the request."""
     labels = {phase.id: phase.display_label for phase in await _phases(info)}
     rows = await crud_ingestions.list_statuses(info.cheshire_cat.agent_key, _chat_id(info))
-    return [
-        IngestionStatusResponse(
-            **{k: v for k, v in row.items() if k in IngestionStatusResponse.model_fields},
-            status_label=STATUS_LABELS.get(row["status"], row["status"]),
-            phase_label=labels.get(row["phase"], row["phase"]) if row.get("phase") else None,
+    response = []
+    for row in sorted(rows, key=lambda r: r["created_at"]):
+        warnings = crud_ingestions.source_warnings(row)
+        response.append(
+            IngestionStatusResponse(
+                **{k: v for k, v in row.items() if k in IngestionStatusResponse.model_fields},
+                status_label=STATUS_LABELS.get(row["status"], row["status"]),
+                phase_label=labels.get(row["phase"], row["phase"]) if row.get("phase") else None,
+                warnings=warnings,
+                warning_count=len(warnings),
+                has_warnings=bool(warnings),
+            )
         )
-        for row in sorted(rows, key=lambda r: r["created_at"])
-    ]
+    return response
 
 
 @router.get("/phases", response_model=PhasesResponse)

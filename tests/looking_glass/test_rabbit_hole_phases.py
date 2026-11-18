@@ -25,13 +25,17 @@ from cat.services.memory.models import VectorMemoryType
 TEXT = ("The rabbit hole went straight on like a tunnel for some way, and then dipped suddenly down. " * 30).encode()
 
 
-def Phase(phase_id, depends_on=("embedding",), outcomes=("done",), settings_value=None, applies=True, budget=None):
+def Phase(
+    phase_id, depends_on=("embedding",), outcomes=("done",), settings_value=None, applies=True, budget=None,
+    budget_env=None,
+):
     """A plugin phase class whose outcomes are scripted: one result (or exception) per call, the last one repeated.
     The plugins pass classes; the counters live on the class, since the RabbitHole instantiates it for every run."""
 
     class ScriptedPhase(IngestionPhase):
         id = phase_id
         not_ready_budget_seconds = budget
+        not_ready_budget_env = budget_env
         calls = 0
         deleted: list = []
 
@@ -284,6 +288,24 @@ async def test_the_budget_of_not_ready_comes_from_the_environment(cheshire_cat, 
     row = await ingest(cheshire_cat)
 
     assert row["completed_phases"]["graph"]["state"] == "error"
+
+
+async def test_the_not_ready_budget_of_a_phase_comes_from_its_environment_variable(
+    cheshire_cat, local_files, monkeypatch,
+):
+    monkeypatch.setenv("CAT_INGESTION_GRAPH_NOT_READY_MAX_SECONDS", "0")
+    plug(
+        cheshire_cat, monkeypatch,
+        Phase(
+            "graph", outcomes=["not_ready"], budget=3600,
+            budget_env="CAT_INGESTION_GRAPH_NOT_READY_MAX_SECONDS",
+        ),
+    )
+
+    row = await ingest(cheshire_cat)
+
+    assert row["status"] == "error"
+    assert "Not ready" in row["completed_phases"]["graph"]["reason"]
 
 
 async def test_a_phase_that_does_not_apply_is_skipped_without_running(cheshire_cat, local_files, monkeypatch):

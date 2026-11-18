@@ -156,9 +156,20 @@ def _entry(state: str, tag: str | None, result: PhaseResult | None = None, reaso
     return entry
 
 
+def phase_not_ready_budget(phase: IngestionPhase) -> float:
+    """The budget of ``not_ready`` for a phase: its environment override, its own seconds, or the generic budget."""
+    if phase.not_ready_budget_env:
+        value = get_env_int(phase.not_ready_budget_env)
+        if value is not None:
+            return value
+    if phase.not_ready_budget_seconds is not None:
+        return phase.not_ready_budget_seconds
+    return not_ready_budget_seconds()
+
+
 async def _run_phase(phase: IngestionPhase, source: IngestionSource, cat) -> PhaseResult:
     """Run the phase until it is done, skipped or failed: ``not_ready`` is retried within the budget of the phase."""
-    budget = phase.not_ready_budget_seconds if phase.not_ready_budget_seconds is not None else not_ready_budget_seconds()
+    budget = phase_not_ready_budget(phase)
     started = time.monotonic()
     while True:
         try:
