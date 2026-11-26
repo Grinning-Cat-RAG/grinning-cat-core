@@ -113,6 +113,7 @@ class BotMixin(ContextMixin, ABC):
     _file_manager = None
     _large_language_model = None
     _vector_memory_handler = None
+    _closed = False
 
     @property
     def lizard(self) -> "BillTheLizard":  # type: ignore[name-defined]
@@ -210,19 +211,22 @@ class BotMixin(ContextMixin, ABC):
             return
 
         try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                loop.create_task(self.shutdown())
-            else:
-                loop.run_until_complete(self.shutdown())
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # No running loop (e.g. an AnyIO worker thread): the explicit per-request lifecycle owns the cleanup.
+            log.debug(f"Skipping async shutdown of {self.__class__.__name__}: no running event loop")
+            return
+
+        try:
+            loop.create_task(self.shutdown())
         except Exception:
-            message = f"Error while shutting down {self.__class__.__name__} '{self.agent_key}'"
-            if hasattr(self, "id"):
-                message += f" - id '{getattr(self, 'id')}'"
-            log.warning(message)
-            pass
+            log.debug(f"Error while scheduling shutdown of {self.__class__.__name__}")
 
     async def shutdown(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+
         setattr(self, "plugin_manager", None)
         self._agentic_workflow = None
         self._chunker = None

@@ -1,5 +1,6 @@
 from typing import Dict, List, Set
-from fastapi import Depends
+from fastapi import BackgroundTasks, Depends
+from fastapi.requests import HTTPConnection
 from pydantic import Field, BaseModel
 
 from cat.utils import Enum
@@ -59,6 +60,9 @@ def check_permissions(resource: AuthResource, permission: AuthPermission, is_cha
     """
     Helper function to inject cat and stray into endpoints after checking for required permissions.
 
+    The returned dependency is a teardown dependency: the per-request ``CheshireCat`` (created by
+    ``BillTheLizard.get_cheshire_cat``) is closed once the response and its background tasks have been sent.
+
     Args:
         resource (AuthResource): The resource that the user must have permission for.
         permission (AuthPermission): The permission that the user must have for the resource.
@@ -68,7 +72,22 @@ def check_permissions(resource: AuthResource, permission: AuthPermission, is_cha
         AuthorizedInfo: an instance of CheshireCat and the identified user
     """
     from cat.auth.connection import HTTPAuth
-    return Depends(HTTPAuth(resource=resource, permission=permission, is_chat=is_chat))
+
+    auth = HTTPAuth(resource=resource, permission=permission, is_chat=is_chat)
+
+    async def dependency(connection: HTTPConnection, background_tasks: BackgroundTasks):
+        info = await auth(connection)
+        try:
+            yield info
+        finally:
+            # A yield-dependency's teardown runs before the response is sent, so closing the cat here would break
+            # streaming responses and background tasks that still use it. Scheduling the close as a background task
+            # makes it run last: after the response body and after the endpoint's own background tasks.
+            ccat = info.cheshire_cat
+            if ccat is not None:
+                background_tasks.add_task(ccat.shutdown)
+
+    return Depends(dependency)
 
 
 def check_websocket_permissions(resource: AuthResource, permission: AuthPermission) -> "AuthorizedInfo":  # type: ignore[name-defined]
