@@ -40,6 +40,7 @@ dependencies = [
     "pytest-asyncio",
     "python-multipart",
     "python-slugify",
+    "packaging",
     "pandas",
     "qdrant_client",
     "rapidfuzz",
@@ -49,6 +50,7 @@ dependencies = [
     "scikit-learn",
     "tiktoken",
     "tomli",
+    "tomlkit",
     "uvicorn[standard]",
     "websockets",
 ]

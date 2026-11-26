@@ -8,12 +8,18 @@ import os
 import shutil
 import subprocess
 import sys
+import re
 import tempfile
 import time
+from collections import defaultdict
 from inspect import getmembers, isabstract, isawaitable
 from pathlib import Path
 from typing import Dict, List, Tuple, Any, Type
 import tomli
+import tomlkit
+from packaging.markers import Marker, default_environment
+from packaging.requirements import Requirement
+from packaging.specifiers import SpecifierSet
 from pydantic import BaseModel, ValidationError
 
 from cat.db.cruds import plugins as crud_plugins
@@ -30,6 +36,10 @@ from cat.looking_glass.models import PluginSettingsModel, PluginManifest
 from cat.utils import (
     inspect_calling_agent, get_base_path, get_core_plugins_path, get_plugins_path, get_project_path, to_camel_case,
 )
+
+# Records whether a plugin's uv.lock is the plugin's own ("shipped") or was compiled by the core
+# ("generated:<sha256 of the lock>"): see Plugin._shipped_lock
+LOCK_ORIGIN_FILE = ".uv.lock.origin"
 
 
 class Plugin:
@@ -360,14 +370,13 @@ class Plugin:
         current root uv.lock (not a lock shipped in a plugin's archive, nor one
         compiled against an older root uv.lock)."""
         own_lock = os.path.abspath(os.path.join(self.path, "uv.lock"))
-        root_lock = self._root_lock_path()
         locks = sorted(
             glob.glob(os.path.join(get_core_plugins_path(), "*", "uv.lock"))
             + glob.glob(os.path.join(get_plugins_path(), "*", "uv.lock"))
         )
         constraints: Dict[str, str] = {}
         for lock in locks:
-            if os.path.abspath(lock) == own_lock or not self._is_installed_here(os.path.dirname(lock), root_lock):
+            if os.path.abspath(lock) == own_lock or not self._is_installed_here(os.path.dirname(lock)):
                 continue
             try:
                 with open(lock, "rb") as f:
@@ -385,15 +394,138 @@ class Plugin:
         return list(constraints.values())
 
     @classmethod
-    def _is_installed_here(cls, plugin_dir: str, root_lock: str) -> bool:
-        """The plugin's dependencies were compiled and installed against the current root uv.lock."""
-        pyproject_file = os.path.join(plugin_dir, "pyproject.toml")
-        if not os.path.exists(pyproject_file):
+    def _is_installed_here(cls, plugin_dir: str) -> bool:
+        """The plugin's dependencies were installed against the current root uv.lock (and, when the plugin ships its own
+        uv.lock, from that very lock)."""
+        if not os.path.exists(os.path.join(plugin_dir, "pyproject.toml")):
             return False
-        inputs = [pyproject_file] + ([root_lock] if os.path.exists(root_lock) else [])
         return cls._should_exit_from_installing_requirements(
-            os.path.join(plugin_dir, ".requirements_hash"), cls._hash_files(inputs),
+            os.path.join(plugin_dir, ".requirements_hash"), cls._hash_files(cls._requirements_hash_inputs(plugin_dir)),
         )
+
+    @classmethod
+    def _requirements_hash_inputs(cls, plugin_dir: str) -> List[str]:
+        """The files whose change requires installing the plugin's dependencies again: its pyproject.toml, the uv.lock it
+        ships (if any) and the root uv.lock."""
+        inputs = [os.path.join(plugin_dir, "pyproject.toml")]
+        shipped_lock = cls._shipped_lock(plugin_dir)
+        if shipped_lock is not None:
+            inputs.append(shipped_lock)
+        if os.path.exists(cls._root_lock_path()):
+            inputs.append(cls._root_lock_path())
+        return inputs
+
+    @classmethod
+    def _shipped_lock(cls, plugin_dir: str) -> str | None:
+        """The uv.lock the plugin ships, or None when it ships none.
+
+        The core also writes a uv.lock in the plugin folder, the one it compiles for a plugin shipping none, and records
+        it in `.uv.lock.origin` as `generated:<sha256 of the lock>`. A uv.lock is the plugin's own when that record says
+        `shipped`, or when the lock no longer matches the recorded digest (e.g. a new version of the plugin brought its
+        own). With no record at all, a uv.lock next to a `.requirements_hash` was compiled by a core older than the
+        record, which always replaced the plugin's uv.lock with its own: it is not the plugin's."""
+        lock = os.path.join(plugin_dir, "uv.lock")
+        if not os.path.exists(lock):
+            return None
+        origin_file = os.path.join(plugin_dir, LOCK_ORIGIN_FILE)
+        if os.path.exists(origin_file):
+            with open(origin_file, "r") as f:
+                origin = f.read().strip()
+            if origin.startswith("generated:"):
+                return None if origin == f"generated:{cls._hash_files([lock])}" else lock
+            return lock
+        if os.path.exists(os.path.join(plugin_dir, ".requirements_hash")):
+            return None
+        return lock
+
+    @staticmethod
+    def _normalize_name(name: str) -> str:
+        return re.sub(r"[-_.]+", "-", name).lower()
+
+    @staticmethod
+    def _marker_applies(marker: str | None) -> bool:
+        """Whether a PEP 508 marker holds in this environment (an unreadable marker is assumed to)."""
+        if not marker:
+            return True
+        try:
+            return Marker(marker).evaluate({**default_environment(), "extra": ""})
+        except Exception:
+            return True
+
+    @classmethod
+    def _lock_root_package(cls, lock_data: Dict) -> Dict | None:
+        """The plugin project itself in a uv.lock (its virtual or editable source)."""
+        for pkg in lock_data.get("package", []):
+            source = pkg.get("source", {})
+            if source.get("virtual") == "." or source.get("editable") == ".":
+                return pkg
+        return None
+
+    @classmethod
+    def _stale_lock_reasons(cls, lock_data: Dict, project: Dict) -> List[str]:
+        """Why a shipped uv.lock does not match the plugin's pyproject.toml (empty when it does).
+
+        The dependencies the lock was resolved for (`requires-dist` of the plugin project) are compared with
+        `[project].dependencies`: same name, extras and version specifier, and the same outcome of their markers in this
+        environment (uv rewrites markers, e.g. `python_version` as `python_full_version`, so their text may differ)."""
+        root = cls._lock_root_package(lock_data)
+        if root is None:
+            return ["the lock does not contain the plugin project (no package with a virtual or editable source)"]
+        if cls._normalize_name(root.get("name", "")) != cls._normalize_name(project.get("name", "")):
+            return [f"the lock is for project {root.get('name')!r}, the pyproject.toml for {project.get('name')!r}"]
+
+        def key(name, extras, specifier, marker):
+            return cls._normalize_name(name), tuple(sorted(extras)), str(SpecifierSet(specifier or "")), cls._marker_applies(marker)
+
+        locked = sorted(
+            key(d["name"], d.get("extras", []), d.get("specifier"), d.get("marker"))
+            for d in root.get("metadata", {}).get("requires-dist", [])
+        )
+        declared = []
+        for dependency in project.get("dependencies", []):
+            req = Requirement(dependency)
+            declared.append(key(req.name, req.extras, str(req.specifier), str(req.marker) if req.marker else None))
+        declared.sort()
+        reasons = [f"declared in pyproject.toml, not locked: {d[0]}{d[2]}" for d in declared if d not in locked]
+        reasons += [f"locked, no longer declared in pyproject.toml: {d[0]}{d[2]}" for d in locked if d not in declared]
+        return reasons
+
+    @classmethod
+    def _locked_runtime_packages(cls, lock_data: Dict) -> Dict[str, set]:
+        """`{name: {versions}}` of the packages a uv.lock installs in this environment for the plugin project: its
+        dependencies and theirs (with the requested extras), skipping the ones whose markers do not hold here and every
+        dependency group (dev included)."""
+        root = cls._lock_root_package(lock_data)
+        if root is None:
+            return {}
+        by_name: Dict[str, List[Dict]] = defaultdict(list)
+        for pkg in lock_data.get("package", []):
+            by_name[cls._normalize_name(pkg.get("name", ""))].append(pkg)
+
+        installed: Dict[str, set] = defaultdict(set)
+        seen = set()
+        stack = [(root, ())]
+        while stack:
+            pkg, extras = stack.pop()
+            name = cls._normalize_name(pkg.get("name", ""))
+            node = (name, pkg.get("version"), extras)
+            if node in seen:
+                continue
+            seen.add(node)
+            if pkg is not root and "version" in pkg:
+                installed[name].add(pkg["version"])
+            edges = list(pkg.get("dependencies", []))
+            for extra in extras:
+                edges += pkg.get("optional-dependencies", {}).get(extra, [])
+            for edge in edges:
+                if not cls._marker_applies(edge.get("marker")):
+                    continue
+                targets = by_name.get(cls._normalize_name(edge["name"]), [])
+                if "version" in edge:
+                    targets = [t for t in targets if t.get("version") == edge["version"]]
+                for target in targets:
+                    stack.append((target, tuple(sorted(edge.get("extra", [])))))
+        return dict(installed)
 
     def _requirements_source(self) -> str | None:
         """Path to the plugin's pyproject.toml, or None if the plugin has no
@@ -417,10 +549,7 @@ class Plugin:
         if pyproject_file is None:
             return
 
-        hash_inputs = [pyproject_file]
-        if os.path.exists(self._root_lock_path()):
-            hash_inputs.append(self._root_lock_path())
-        current_hash = self._hash_files(hash_inputs)
+        current_hash = self._hash_files(self._requirements_hash_inputs(self.path))
         hash_file = os.path.join(self.path, ".requirements_hash")
 
         # Fast path: neither the plugin's dependencies nor the root project's
@@ -455,6 +584,83 @@ class Plugin:
             fcntl.flock(lf, fcntl.LOCK_UN)
             lf.close()
 
+    def _compile_and_install(self, pyproject_file: str, constraints: List[str], env: Dict[str, str]) -> None:
+        """Compile the plugin's pyproject.toml into a uv.lock constrained by *constraints*, install from it and keep it
+        next to the pyproject.toml, recorded as generated by the core."""
+        with open(pyproject_file, "r") as f:
+            document = tomlkit.parse(f.read())
+        # dependency groups (dev included) are never installed: they must not take part in the resolution either, or a
+        # test-only pin of the plugin could make it uninstallable next to the root project
+        document.pop("dependency-groups", None)
+        tool = document.setdefault("tool", tomlkit.table(is_super_table=True))
+        uv = tool.setdefault("uv", tomlkit.table())
+        uv.pop("dev-dependencies", None)
+        uv["constraint-dependencies"] = list(uv.get("constraint-dependencies", [])) + constraints
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with open(os.path.join(tmp_dir, "pyproject.toml"), "w") as f:
+                f.write(tomlkit.dumps(document))
+
+            lock_cmd = ["uv", "lock", "--project", tmp_dir, "--no-cache"]
+            if self._run_streamed(lock_cmd, env) != 0:
+                raise subprocess.CalledProcessError(1, lock_cmd)
+
+            sync_cmd = [
+                "uv", "sync", "--project", tmp_dir,
+                "--no-install-project", "--active", "--frozen", "--inexact", "--no-default-groups",
+                "--link-mode=copy", "--no-cache",
+            ]
+            if self._run_streamed(sync_cmd, env) != 0:
+                raise subprocess.CalledProcessError(1, sync_cmd)
+
+            # Persist the compiled lock next to the plugin's pyproject.toml, replacing any existing one (generated by the
+            # core: a uv.lock the plugin ships is never replaced, see _install_requirements_sync)
+            lock = os.path.join(self.path, "uv.lock")
+            shutil.copyfile(os.path.join(tmp_dir, "uv.lock"), lock)
+            with open(os.path.join(self.path, LOCK_ORIGIN_FILE), "w") as f:
+                f.write(f"generated:{self._hash_files([lock])}")
+
+    def _install_from_shipped_lock(
+        self, pyproject_file: str, lock: str, constraints: List[str], env: Dict[str, str]
+    ) -> None:
+        """Install the plugin's dependencies strictly from the uv.lock it ships, without regenerating it.
+
+        Refused, with the reasons, when the lock does not match the plugin's pyproject.toml or would install a version
+        of a library other than the one pinned in *constraints* (the root project's and the other plugins' locks). Its
+        dependency groups (dev included) are not installed."""
+        with open(lock, "rb") as f:
+            lock_data = tomli.load(f)
+        with open(pyproject_file, "rb") as f:
+            project = tomli.load(f).get("project", {})
+
+        problems = [f"uv.lock is out of date: {reason}" for reason in self._stale_lock_reasons(lock_data, project)]
+        pinned = {self._normalize_name(c.split("==")[0]): c.split("==")[1] for c in constraints}
+        for name, versions in sorted(self._locked_runtime_packages(lock_data).items()):
+            for version in sorted(versions - {pinned[name]} if name in pinned else set()):
+                problems.append(
+                    f"uv.lock installs {name}=={version}, but {name}=={pinned[name]} is pinned by the core "
+                    f"or by another installed plugin"
+                )
+        if problems:
+            log.error(
+                f"Plugin {self.id} ships a uv.lock that cannot be installed here; it is not regenerated, update it:\n"
+                + "\n".join(f"  - {p}" for p in problems)
+            )
+            raise subprocess.CalledProcessError(1, ["uv", "sync", "--frozen"])
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            shutil.copyfile(pyproject_file, os.path.join(tmp_dir, "pyproject.toml"))
+            shutil.copyfile(lock, os.path.join(tmp_dir, "uv.lock"))
+            sync_cmd = [
+                "uv", "sync", "--project", tmp_dir,
+                "--no-install-project", "--active", "--frozen", "--inexact", "--no-default-groups",
+                "--link-mode=copy", "--no-cache",
+            ]
+            if self._run_streamed(sync_cmd, env) != 0:
+                raise subprocess.CalledProcessError(1, sync_cmd)
+        with open(os.path.join(self.path, LOCK_ORIGIN_FILE), "w") as f:
+            f.write("shipped")
+
     @staticmethod
     def _run_streamed(cmd: List[str], env: Dict[str, str]) -> int:
         proc = subprocess.Popen(
@@ -474,16 +680,22 @@ class Plugin:
     def _install_requirements_sync(
         self, pyproject_file: str, current_hash: str, lock_fh=None
     ):
-        """Synchronous compile-then-install with cross-process serialization
-        via fcntl.flock.
+        """Synchronous install with cross-process serialization via fcntl.flock.
 
-        The plugin's pyproject.toml is compiled into a fresh uv.lock —
-        replacing any existing one — constrained against the root project's
-        own uv.lock, so uv refuses to resolve a dangerous upgrade or
-        downgrade of a system library, and against the uv.lock of the other
-        installed plugins, so it never replaces a library another plugin
-        installed. Dependencies are then installed strictly from that lock
-        into the active virtual environment.
+        A plugin that ships its own uv.lock is installed strictly from it,
+        which is never regenerated: the lock must match the plugin's
+        pyproject.toml and must not change the version of a library pinned by
+        the root project's uv.lock or by another installed plugin, otherwise
+        the installation fails and says why (see _install_from_shipped_lock).
+
+        Otherwise the plugin's pyproject.toml, without its dependency groups
+        (dev included: they are not installed), is compiled into a fresh
+        uv.lock constrained against the root project's own uv.lock, so uv
+        refuses to resolve a dangerous upgrade or downgrade of a system
+        library, and against the uv.lock of the other installed plugins, so it
+        never replaces a library another plugin installed. Dependencies are
+        then installed strictly from that lock into the active virtual
+        environment, and the lock is kept next to the pyproject.toml.
 
         If *lock_fh* is given the lock is already held by the caller;
         otherwise a blocking flock is acquired.
@@ -507,41 +719,18 @@ class Plugin:
             start_time = time.time()
             log.info(f"Compiling and installing requirements for plugin {self.id}")
 
-            with open(pyproject_file, "r") as f:
-                pyproject_text = f.read()
             constraints = self._root_lock_constraints()
             constraints += self._other_plugins_constraints({c.split("==")[0] for c in constraints})
-            constraint_block = (
-                "\n[tool.uv]\nconstraint-dependencies = [\n"
-                + "".join(f'    "{c}",\n' for c in constraints)
-                + "]\n"
-            )
 
             venv_dir = os.path.join(get_project_path(), ".venv")
             env = {**os.environ, "VIRTUAL_ENV": venv_dir}
 
             try:
-                with tempfile.TemporaryDirectory() as tmp_dir:
-                    with open(os.path.join(tmp_dir, "pyproject.toml"), "w") as f:
-                        f.write(pyproject_text + constraint_block)
-
-                    lock_cmd = ["uv", "lock", "--project", tmp_dir, "--no-cache"]
-                    if self._run_streamed(lock_cmd, env) != 0:
-                        raise subprocess.CalledProcessError(1, lock_cmd)
-
-                    sync_cmd = [
-                        "uv", "sync", "--project", tmp_dir,
-                        "--no-install-project", "--active", "--frozen", "--inexact",
-                        "--link-mode=copy", "--no-cache",
-                    ]
-                    if self._run_streamed(sync_cmd, env) != 0:
-                        raise subprocess.CalledProcessError(1, sync_cmd)
-
-                    # Persist the compiled lock next to the plugin's pyproject.toml,
-                    # replacing any existing one
-                    shutil.copyfile(
-                        os.path.join(tmp_dir, "uv.lock"), os.path.join(self.path, "uv.lock")
-                    )
+                shipped_lock = self._shipped_lock(self.path)
+                if shipped_lock is not None:
+                    self._install_from_shipped_lock(pyproject_file, shipped_lock, constraints, env)
+                else:
+                    self._compile_and_install(pyproject_file, constraints, env)
 
                 duration = time.time() - start_time
                 log.info(f"Installation of requirements for {self.id} completed in {duration:.2f}s")
