@@ -73,14 +73,19 @@ class BaseVectorDatabaseHandler(ABC):
             return
 
         try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                loop.create_task(self.close())
-            else:
-                loop.run_until_complete(self.close())
-        except Exception as e:
-            log.warning(f"Error while closing the vector database handler for the agent `{self.agent_id}`: {e}")
-            pass
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # No running loop (e.g. an AnyIO worker thread): the explicit lifecycle owns the cleanup.
+            log.debug(
+                f"Skipping async close of the vector database handler for the agent `{self.agent_id}`: "
+                "no running event loop"
+            )
+            return
+
+        try:
+            loop.create_task(self.close())
+        except Exception:
+            log.debug(f"Error while scheduling close of the vector database handler for the agent `{self.agent_id}`")
 
     @property
     def agent_id(self) -> str:
@@ -141,6 +146,7 @@ class BaseVectorDatabaseHandler(ABC):
         """
         Closes the connection to the vector database.
         This method should be overridden by subclasses if they maintain a connection.
+        Implementations must be idempotent: calling ``close`` more than once is a no-op.
         """
         pass
 
@@ -749,8 +755,11 @@ class QdrantHandler(BaseVectorDatabaseHandler):
                 log.error(f"Error when creating a schema index: {e}")
 
     async def close(self):
-        if self._client and not self._client._client.closed:
-            await self._client.close()
+        if self._client is None:
+            return
+        client, self._client = self._client, None
+        if not client._client.closed:
+            await client.close()
 
     async def delete_collection(self, collection_name: str, timeout: int | None = None):
         """
